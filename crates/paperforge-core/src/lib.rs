@@ -1,6 +1,6 @@
-//! lzt-wallcraft-core
+//! paperforge-core
 //!
-//! Core library for `lzt-wallcraft` — wallpaper inventory, LWE backend
+//! Core library for `paperforge` — wallpaper inventory, LWE backend
 //! IPC, playlists per monitor, and audio control via POSIX signals
 //! (SIGUSR1/SIGUSR2) sent to running `linux-wallpaperengine` instances.
 //!
@@ -46,4 +46,4 @@ pub use playlist::{Playlist, PlaylistStore};
 /// Crate version (matches `Cargo.toml` workspace version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Crate name.
-pub const NAME: &str = "lzt-wallcraft-core";
+pub const NAME: &str = "paperforge-core";

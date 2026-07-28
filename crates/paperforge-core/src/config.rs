@@ -1,8 +1,8 @@
 //! Runtime configuration: where to put state files, what backend to
 //! use, what default playlist to apply on startup.
 //!
-//! On-disk location: `$XDG_CONFIG_HOME/lzt-wallcraft/config.toml`
-//! (typically `~/.config/lzt-wallcraft/config.toml`).
+//! On-disk location: `$XDG_CONFIG_HOME/paperforge/config.toml`
+//! (typically `~/.config/paperforge/config.toml`).
 
 use std::path::{Path, PathBuf};
 
@@ -17,11 +17,11 @@ use crate::{
 /// Paths used at runtime for config, playlists, cache.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigPaths {
-    /// `$XDG_CONFIG_HOME/lzt-wallcraft/`.
+    /// `$XDG_CONFIG_HOME/paperforge/`.
     pub config_dir: PathBuf,
     /// `config_dir/playlists/`.
     pub playlists_dir: PathBuf,
-    /// `$XDG_CACHE_HOME/lzt-wallcraft/` (or `~/.cache/lzt-wallcraft/`).
+    /// `$XDG_CACHE_HOME/paperforge/` (or `~/.cache/paperforge/`).
     pub cache_dir: PathBuf,
     /// `cache_dir/thumbnails/`.
     pub thumbnails_dir: PathBuf,
@@ -34,11 +34,11 @@ impl ConfigPaths {
     pub fn defaults() -> Result<Self> {
         let config_dir = dirs::config_dir()
             .ok_or_else(|| Error::Config("no config_dir".to_string()))?
-            .join("lzt-wallcraft");
+            .join("paperforge");
         let playlists_dir = config_dir.join("playlists");
         let cache_dir = dirs::cache_dir()
             .ok_or_else(|| Error::Config("no cache_dir".to_string()))?
-            .join("lzt-wallcraft");
+            .join("paperforge");
         let thumbnails_dir = cache_dir.join("thumbnails");
         let inventory_cache = cache_dir.join("inventory.json");
 

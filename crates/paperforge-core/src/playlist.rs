@@ -1,5 +1,5 @@
 //! Playlists per monitor — JSON files in
-//! `~/.config/lzt-wallcraft/playlists/<name>.json`.
+//! `~/.config/paperforge/playlists/<name>.json`.
 //!
 //! A playlist is an ordered list of wallpaper paths plus a target
 //! set of Wayland outputs. Applying a playlist sets the wallpaper
@@ -8,7 +8,7 @@
 //! This is the killer feature that waypaper does NOT have. Waypaper
 //! treats each wallpaper as a one-off (path → monitor mapping only).
 //! With playlists, the operator can switch the entire vibe of their
-//! desktop with one command (`lzt-wallcraft playlist apply focus`).
+//! desktop with one command (`paperforge playlist apply focus`).
 
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -81,12 +81,12 @@ impl PlaylistStore {
         Ok(Self { root })
     }
 
-    /// Default location: `$XDG_CONFIG_HOME/lzt-wallcraft/playlists/`
-    /// (typically `~/.config/lzt-wallcraft/playlists/`).
+    /// Default location: `$XDG_CONFIG_HOME/paperforge/playlists/`
+    /// (typically `~/.config/paperforge/playlists/`).
     pub fn default_location() -> Result<Self> {
         let base = dirs::config_dir()
             .ok_or_else(|| Error::Config("could not determine config_dir".to_string()))?
-            .join("lzt-wallcraft")
+            .join("paperforge")
             .join("playlists");
         Self::new(base)
     }
@@ -190,7 +190,7 @@ impl PlaylistStore {
     }
 
     /// Report the runtime state of every LWE PID (running/paused).
-    /// Useful for `lzt-wallcraft playlist status` and for the TUI.
+    /// Useful for `paperforge playlist status` and for the TUI.
     pub async fn lwe_status(backend: &LweBackend) -> Result<BTreeMap<i32, BackendState>> {
         let pids = backend.list_pids().await?;
         let mut out = BTreeMap::new();

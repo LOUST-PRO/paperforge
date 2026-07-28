@@ -54,6 +54,6 @@ jobs:
       - run: cargo build --release --locked
       - name: Smoke test (binary runs)
         run: |
-          ./target/release/lzt-wallcraft --version
-          ./target/release/lzt-wallcraft --help
-          ./target/release/lzt-wallcraft paths
+          ./target/release/paperforge --version
+          ./target/release/paperforge --help
+          ./target/release/paperforge paths

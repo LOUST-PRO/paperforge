@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/lzt-wallcraft-core",
-    "crates/lzt-wallcraft-cli",
-    "crates/lzt-wallcraft-tui",
+    "crates/paperforge-core",
+    "crates/paperforge-cli",
+    "crates/paperforge-tui", "crates/paperforge-gui",
 ]
 
 [workspace.package]
@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Lou Mireles <davidmirelesll@outlook.com>"]
-repository = "https://github.com/louzt/lzt-wallcraft"
+repository = "https://github.com/louzt/paperforge"
 rust-version = "1.75"
 
 [workspace.dependencies]

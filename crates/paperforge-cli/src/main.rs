@@ -1,4 +1,4 @@
-//! lzt-wallcraft CLI entry point.
+//! paperforge CLI entry point.
 //!
 //! Subcommands (clap derive):
 //! - `set <PATH> [--output <NAME>]` — launch LWE with a wallpaper
@@ -12,7 +12,7 @@
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use lzt_wallcraft_core::{
+use paperforge_core::{
     audio::AudioCommand,
     backend::{BackendState, WallpaperBackend},
     config::{Config, ConfigPaths},
@@ -21,9 +21,9 @@ use lzt_wallcraft_core::{
     playlist::PlaylistStore,
 };
 
-/// `lzt-wallcraft` — Wallpaper Engine Workshop manager for Linux.
+/// `paperforge` — Wallpaper Engine Workshop manager for Linux.
 #[derive(Debug, Parser)]
-#[command(name = "lzt-wallcraft", version, about, long_about = None)]
+#[command(name = "paperforge", version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

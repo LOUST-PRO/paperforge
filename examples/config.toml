@@ -1,7 +1,7 @@
-# Example config.toml for `lzt-wallcraft`.
+# Example config.toml for `paperforge`.
 #
-# Place at: $XDG_CONFIG_HOME/lzt-wallcraft/config.toml
-# (typically `~/.config/lzt-wallcraft/config.toml`).
+# Place at: $XDG_CONFIG_HOME/paperforge/config.toml
+# (typically `~/.config/paperforge/config.toml`).
 #
 # All fields are optional. Omitting the file is equivalent to using
 # the defaults shown below.
@@ -10,7 +10,7 @@
 # Future: "swww", "hyprpaper", "mpvpaper".
 backend = "linux-wallpaperengine"
 
-# Optional: path to the backend binary. If unset, lzt-wallcraft
+# Optional: path to the backend binary. If unset, paperforge
 # resolves "linux-wallpaperengine" via $PATH.
 # backend_binary = "/opt/lwe/bin/linux-wallpaperengine"
 

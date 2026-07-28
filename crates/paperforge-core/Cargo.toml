@@ -1,12 +1,12 @@
 [package]
-name = "lzt-wallcraft-core"
+name = "paperforge-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Core library for lzt-wallcraft — wallpaper inventory, LWE backend IPC, playlists per monitor, audio control"
+description = "Core library for paperforge — wallpaper inventory, LWE backend IPC, playlists per monitor, audio control"
 
 [dependencies]
 tokio = { workspace = true }

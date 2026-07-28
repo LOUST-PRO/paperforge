@@ -1,35 +1,35 @@
-# Contributing to lzt-wallcraft
+# Contributing to paperforge
 
 Thanks for your interest. Quick orientation:
 
 ## Workspace layout
 
 ```
-crates/lzt-wallcraft-core/    # lib, MIT
-crates/lzt-wallcraft-cli/     # binary, depends on core
-crates/lzt-wallcraft-tui/     # placeholder
+crates/paperforge-core/    # lib, MIT
+crates/paperforge-cli/     # binary, depends on core
+crates/paperforge-tui/     # placeholder
 ```
 
-All public APIs live in `lzt-wallcraft-core`. Prefer extending the
+All public APIs live in `paperforge-core`. Prefer extending the
 trait surface (`WallpaperBackend`) over adding new top-level
 functions — it's how additional backends (swww, hyprpaper, mpvpaper)
 will plug in.
 
 ## Adding a new backend
 
-1. Add a variant to `BackendKind` in `crates/lzt-wallcraft-core/src/backend.rs`.
+1. Add a variant to `BackendKind` in `crates/paperforge-core/src/backend.rs`.
 2. Implement `WallpaperBackend` for your backend struct.
 3. Add a constructor (`MyBackend::new()`, optionally `with_binary()`).
 4. Add unit tests covering the trait method happy paths.
-5. Wire up the CLI subcommand in `crates/lzt-wallcraft-cli/src/main.rs`
+5. Wire up the CLI subcommand in `crates/paperforge-cli/src/main.rs`
    (or extend an existing subcommand).
 6. Update `README.md` with the new backend row in the comparison table.
 
 ## Adding a new subcommand to the CLI
 
-1. Add a variant to `Cmd` in `crates/lzt-wallcraft-cli/src/main.rs`.
+1. Add a variant to `Cmd` in `crates/paperforge-cli/src/main.rs`.
 2. Implement the handler in `match cli.cmd`.
-3. Add an integration test in `crates/lzt-wallcraft-cli/tests/cli.rs`.
+3. Add an integration test in `crates/paperforge-cli/tests/cli.rs`.
 
 ## Tests
 

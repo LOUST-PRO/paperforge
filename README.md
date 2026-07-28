@@ -1,18 +1,18 @@
-# lzt-wallcraft
+# paperforge
 Frontends Rust para `linux-wallpaperengine` Workshop en Linux.
 
 > **Status**: Pre-0.1.0 (Fase 6A in progress). API surface todavía puede cambiar.
 
 ## Que es?
 
-`lzt-wallcraft` gestiona los wallpapers animados de **Wallpaper Engine Workshop**
+`paperforge` gestiona los wallpapers animados de **Wallpaper Engine Workshop**
 sobre Linux. Hoy se enfoca en el backend `linux-wallpaperengine` (fork
 de Almamu mantenido por `louzt/`) que renderiza escenas Workshop.
 
 Stack:
-- **Workspace Rust** (3 crates: `lzt-wallcraft-core`, `lzt-wallcraft-cli`,
-  `lzt-wallcraft-tui`)
-- **MIT licensed** — `lzt-wallcraft-core` habla con LWE via subprocess
+- **Workspace Rust** (3 crates: `paperforge-core`, `paperforge-cli`,
+  `paperforge-tui`)
+- **MIT licensed** — `paperforge-core` habla con LWE via subprocess
   + POSIX signals (separación de procesos = licencia clean respecto al
   GPL-3.0 de LWE)
 - **Backend-friendly**: `WallpaperBackend` trait permite añadir swww,
@@ -21,9 +21,9 @@ Stack:
 ## Por que no waypaper?
 
 [`waypaper`](https://github.com/anufrievroman/waypaper) es excelente y
-OSS. `lzt-wallcraft` lo complementa (no lo reemplaza) con:
+OSS. `paperforge` lo complementa (no lo reemplaza) con:
 
-| Feature | waypaper | lzt-wallcraft |
+| Feature | waypaper | paperforge |
 |---|---|---|
 | GUI GTK | ✅ | 🚧 Fase 6C (Dioxus) |
 | CLI | basico | ✅ (set/pause/resume/list/scan/audio/playlist) |
@@ -44,37 +44,37 @@ waypaper cada wallpaper es one-off, con nosotros guardas listas
 cargo build --release
 
 # Smoke test
-./target/release/lzt-wallcraft paths
-./target/release/lzt-wallcraft list
-./target/release/lzt-wallcraft scan --max-depth 2
+./target/release/paperforge paths
+./target/release/paperforge list
+./target/release/paperforge scan --max-depth 2
 
 # Lanzar wallpaper (Workshop scene)
-./target/release/lzt-wallcraft set \
+./target/release/paperforge set \
   ~/.steam/root/steamapps/workshop/content/431960/1234567 \
   --output DP-1
 
 # Pausar todos los LWE (libera GPU/CPU)
-./target/release/lzt-wallcraft pause
+./target/release/paperforge pause
 
 # Reanudar
-./target/release/lzt-wallcraft resume
+./target/release/paperforge resume
 
 # Audio
-./target/release/lzt-wallcraft audio toggle
-./target/release/lzt-wallcraft audio mute
-./target/release/lzt-wallcraft audio unmute
+./target/release/paperforge audio toggle
+./target/release/paperforge audio mute
+./target/release/paperforge audio unmute
 
 # Playlists
-./target/release/lzt-wallcraft playlist list
-./target/release/lzt-wallcraft playlist show focus
-./target/release/lzt-wallcraft playlist apply focus
-./target/release/lzt-wallcraft playlist delete focus
+./target/release/paperforge playlist list
+./target/release/paperforge playlist show focus
+./target/release/paperforge playlist apply focus
+./target/release/paperforge playlist delete focus
 ```
 
 ## Subcomandos
 
 ```
-lzt-wallcraft <CMD>
+paperforge <CMD>
 
 Commands:
   set       Lanzar LWE con un scene directory o archivo
@@ -90,7 +90,7 @@ Commands:
 ## Arquitectura
 
 ```
-crates/lzt-wallcraft-core/   # lib MIT, sin dependencias GPL
+crates/paperforge-core/   # lib MIT, sin dependencias GPL
 ├── inventory.rs             # walkdir scanner con mtime cache
 ├── paths.rs                 # auto-detect Steam/Flatpak/local dirs
 ├── backend.rs               # WallpaperBackend trait + LweBackend
@@ -99,17 +99,17 @@ crates/lzt-wallcraft-core/   # lib MIT, sin dependencias GPL
 ├── config.rs                # Config + ConfigPaths (TOML)
 └── error.rs                 # Crate-wide Error type
 
-crates/lzt-wallcraft-cli/    # binario `lzt-wallcraft`
+crates/paperforge-cli/    # binario `paperforge`
 └── src/main.rs              # clap derive, 8 subcommands
 
-crates/lzt-wallcraft-tui/    # placeholder Fase 6B
+crates/paperforge-tui/    # placeholder Fase 6B
 └── src/lib.rs
 ```
 
 ### Compatibilidad de licencias
 
-`lzt-wallcraft-core` es MIT. `linux-wallpaperengine` (el fork de
-`louzt/`) es GPL-3.0. **No mezclamos código fuente** — `lzt-wallcraft`
+`paperforge-core` es MIT. `linux-wallpaperengine` (el fork de
+`louzt/`) es GPL-3.0. **No mezclamos código fuente** — `paperforge`
 solo habla con LWE via:
 - `fork+exec` de la binary LWE
 - POSIX signals (`SIGSTOP`, `SIGCONT`, `SIGUSR1`, `SIGUSR2`)

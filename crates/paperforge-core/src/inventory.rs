@@ -7,7 +7,7 @@
 //!
 //! The scanner is intentionally filesystem-only — no Steam Workshop
 //! scraping. The operator installs Wallpaper Engine Workshop items
-//! locally (or symlinks them) and lzt-wallcraft picks them up.
+//! locally (or symlinks them) and paperforge picks them up.
 
 use std::{
     collections::BTreeMap,
@@ -82,7 +82,7 @@ impl WallpaperEntry {
 ///
 /// The inventory does not persist itself — callers serialize the
 /// entries via [`Inventory::entries`] and store the result in their
-/// preferred format (e.g. JSON cache in `~/.cache/lzt-wallcraft/`).
+/// preferred format (e.g. JSON cache in `~/.cache/paperforge/`).
 #[derive(Debug, Default, Clone)]
 pub struct Inventory {
     /// All discovered entries, keyed by absolute path to avoid
@@ -269,7 +269,7 @@ mod tests {
     fn scan_nonexistent_root_returns_zero() {
         let mut inv = Inventory::new();
         let n = inv
-            .scan(Path::new("/nonexistent/lzt-wallcraft-test"), 4)
+            .scan(Path::new("/nonexistent/paperforge-test"), 4)
             .unwrap();
         assert_eq!(n, 0);
     }

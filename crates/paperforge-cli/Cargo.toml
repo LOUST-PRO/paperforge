@@ -1,19 +1,19 @@
 [package]
-name = "lzt-wallcraft-cli"
+name = "paperforge-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "CLI for lzt-wallcraft — set/pause/resume/list/scan/playlist over LWE backend"
+description = "CLI for paperforge — set/pause/resume/list/scan/playlist over LWE backend"
 
 [[bin]]
-name = "lzt-wallcraft"
+name = "paperforge"
 path = "src/main.rs"
 
 [dependencies]
-lzt-wallcraft-core = { path = "../lzt-wallcraft-core" }
+paperforge-core = { path = "../paperforge-core" }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

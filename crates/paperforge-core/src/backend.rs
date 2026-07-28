@@ -207,7 +207,7 @@ impl WallpaperBackend for LweBackend {
         cmd.arg(scene);
 
         // We spawn detached: do NOT block waiting for LWE to exit.
-        // Use `spawn()` (not `status()`) so the parent (lzt-wallcraft
+        // Use `spawn()` (not `status()`) so the parent (paperforge
         // CLI) returns immediately.
         let child = cmd.spawn().map_err(|e| Error::BackendFailure {
             kind: self.kind().process_pattern().to_string(),

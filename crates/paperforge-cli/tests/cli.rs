@@ -1,18 +1,18 @@
-//! Integration tests for the `lzt-wallcraft` CLI.
+//! Integration tests for the `paperforge` CLI.
 //!
 //! These tests build the actual binary and run it as a subprocess, so
 //! they cover clap parsing, the dispatched handlers, and the IPC
-//! helper layers end-to-end. They rely on `CARGO_BIN_EXE_lzt-wallcraft`,
+//! helper layers end-to-end. They rely on `CARGO_BIN_EXE_paperforge`,
 //! which Cargo injects for `tests/` directory tests.
 
 use std::process::{Command, Output};
 
 /// Run the CLI with the given args, capturing stdout + stderr + exit.
 fn run_cli(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_lzt-wallcraft"))
+    Command::new(env!("CARGO_BIN_EXE_paperforge"))
         .args(args)
         .output()
-        .expect("failed to spawn lzt-wallcraft binary")
+        .expect("failed to spawn paperforge binary")
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn cli_list_runs_even_when_no_lwe_present() {
 
 #[test]
 fn cli_set_with_nonexistent_path_errors() {
-    let out = run_cli(&["set", "/nonexistent/lzt-wallcraft-test-scene"]);
+    let out = run_cli(&["set", "/nonexistent/paperforge-test-scene"]);
     assert!(!out.status.success(), "set on missing path should fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);

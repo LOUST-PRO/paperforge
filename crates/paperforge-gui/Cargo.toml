@@ -1,0 +1,27 @@
+[package]
+name = "paperforge-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Dioxus 0.8-alpha desktop GUI for paperforge (Fase 6C)"
+
+[dependencies]
+# Dioxus GUI framework — pinned to 0.8.0-alpha per operator decision D2
+# (PRs upstream al final del big picture; meanwhile patches en louzt/dioxus fork)
+dioxus = { version = "=0.8.0-alpha.0", features = ["desktop"] }
+dioxus-desktop = "=0.8.0-alpha.0"
+
+# Internal: reuso del core lib MIT (Fase 6A)
+paperforge-core = { path = "../paperforge-core" }
+
+# Async runtime + logging (reutilizados del workspace, per paperforge-core)
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default = []
+devtools = ["dioxus-desktop/devtools"]

@@ -1,16 +1,16 @@
 # Examples
 
-This directory contains reference artifacts for `lzt-wallcraft`.
+This directory contains reference artifacts for `paperforge`.
 
 ## Config
 
 - [`config.toml`](config.toml) — annotated example. Copy to
-  `~/.config/lzt-wallcraft/config.toml` and edit.
+  `~/.config/paperforge/config.toml` and edit.
 
 ## Playlists
 
 Sample playlists to demonstrate the schema. Copy to
-`~/.config/lzt-wallcraft/playlists/<name>.json` and adjust paths to
+`~/.config/paperforge/playlists/<name>.json` and adjust paths to
 your installed Workshop items.
 
 - [`playlists/focus.json`](playlists/focus.json) — minimal scenes for
@@ -44,13 +44,13 @@ your installed Workshop items.
 ## Usage
 
 ```bash
-# Save a playlist (manual edit then copy to ~/.config/lzt-wallcraft/playlists/)
-cp examples/playlists/focus.json ~/.config/lzt-wallcraft/playlists/
+# Save a playlist (manual edit then copy to ~/.config/paperforge/playlists/)
+cp examples/playlists/focus.json ~/.config/paperforge/playlists/
 
 # Apply it
-lzt-wallcraft playlist apply focus
+paperforge playlist apply focus
 
 # Inspect what just got applied
-lzt-wallcraft playlist show focus
-lzt-wallcraft list
+paperforge playlist show focus
+paperforge list
 ```

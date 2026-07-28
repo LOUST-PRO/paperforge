@@ -2,10 +2,10 @@
 
 use thiserror::Error;
 
-/// Result alias for `lzt-wallcraft-core`.
+/// Result alias for `paperforge-core`.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Errors that can occur across the `lzt-wallcraft-core` API.
+/// Errors that can occur across the `paperforge-core` API.
 #[derive(Debug, Error)]
 pub enum Error {
     /// Filesystem I/O failed.
