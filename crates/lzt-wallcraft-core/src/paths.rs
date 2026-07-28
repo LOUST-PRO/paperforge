@@ -47,11 +47,23 @@ pub fn default_paths() -> WorkshopPaths {
     let mut workshop_roots = Vec::new();
 
     // Native Steam variants
-    let steam_root = home.join(".steam").join("root").join("steamapps").join("workshop").join("content").join(WWE_APP_ID);
+    let steam_root = home
+        .join(".steam")
+        .join("root")
+        .join("steamapps")
+        .join("workshop")
+        .join("content")
+        .join(WWE_APP_ID);
     if steam_root.exists() {
         workshop_roots.push(steam_root);
     }
-    let steam_alt = home.join(".steam").join("steam").join("steamapps").join("workshop").join("content").join(WWE_APP_ID);
+    let steam_alt = home
+        .join(".steam")
+        .join("steam")
+        .join("steamapps")
+        .join("workshop")
+        .join("content")
+        .join(WWE_APP_ID);
     if steam_alt.exists() {
         workshop_roots.push(steam_alt);
     }
@@ -79,7 +91,10 @@ pub fn default_paths() -> WorkshopPaths {
         }
     }
 
-    WorkshopPaths { workshop_roots, local_roots }
+    WorkshopPaths {
+        workshop_roots,
+        local_roots,
+    }
 }
 
 /// Validate that at least one source directory exists. Used by CLI to
@@ -113,7 +128,10 @@ mod tests {
 
     #[test]
     fn require_at_least_one_rejects_empty() {
-        let empty = WorkshopPaths { workshop_roots: vec![], local_roots: vec![] };
+        let empty = WorkshopPaths {
+            workshop_roots: vec![],
+            local_roots: vec![],
+        };
         assert!(require_at_least_one(&empty).is_err());
     }
 }

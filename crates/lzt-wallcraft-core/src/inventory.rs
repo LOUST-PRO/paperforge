@@ -181,11 +181,7 @@ impl Inventory {
     }
 
     /// Read a `project.json` and produce a [`WallpaperEntry`].
-    fn read_workshop_scene(
-        &self,
-        project_json: &Path,
-        scene_dir: &Path,
-    ) -> Result<WallpaperEntry> {
+    fn read_workshop_scene(&self, project_json: &Path, scene_dir: &Path) -> Result<WallpaperEntry> {
         let text = std::fs::read_to_string(project_json).map_err(|e| Error::ProjectJson {
             path: project_json.display().to_string(),
             message: e.to_string(),
@@ -207,7 +203,9 @@ impl Inventory {
         // WorkshopScene — the actual playable distinction is encoded
         // in `properties.general.file` (out of scope for 6A).
         let kind = match v.get("type").and_then(|t| t.as_str()) {
-            Some("scene") | Some("wallpaper") | Some("video") | None => WallpaperKind::WorkshopScene,
+            Some("scene") | Some("wallpaper") | Some("video") | None => {
+                WallpaperKind::WorkshopScene
+            }
             Some(other) => {
                 tracing::debug!(
                     "scene {} has unrecognized type '{}', treating as WorkshopScene",
@@ -270,7 +268,9 @@ mod tests {
     #[test]
     fn scan_nonexistent_root_returns_zero() {
         let mut inv = Inventory::new();
-        let n = inv.scan(Path::new("/nonexistent/lzt-wallcraft-test"), 4).unwrap();
+        let n = inv
+            .scan(Path::new("/nonexistent/lzt-wallcraft-test"), 4)
+            .unwrap();
         assert_eq!(n, 0);
     }
 
@@ -318,5 +318,67 @@ mod tests {
         inv.scan(tmp.path(), 4).unwrap();
         inv.scan(tmp.path(), 4).unwrap();
         assert_eq!(inv.len(), 1);
+    }
+
+    #[test]
+    fn scan_recognises_video_typed_projects_as_workshop_scene() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scene = tmp.path().join("video123");
+        std::fs::create_dir_all(&scene).unwrap();
+        std::fs::write(
+            scene.join("project.json"),
+            r#"{"title":"Video wallpaper","type":"video","id":"video123"}"#,
+        )
+        .unwrap();
+
+        let mut inv = Inventory::new();
+        let n = inv.scan(tmp.path(), 4).unwrap();
+        assert_eq!(n, 1);
+        let entry = inv.entries().next().unwrap();
+        assert_eq!(entry.kind, WallpaperKind::WorkshopScene);
+        assert_eq!(entry.title.as_deref(), Some("Video wallpaper"));
+    }
+
+    #[test]
+    fn scan_recognises_unknown_type_as_workshop_scene() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scene = tmp.path().join("mystery");
+        std::fs::create_dir_all(&scene).unwrap();
+        std::fs::write(
+            scene.join("project.json"),
+            r#"{"title":"Mystery","type":"some-new-type-from-steam"}"#,
+        )
+        .unwrap();
+
+        let mut inv = Inventory::new();
+        inv.scan(tmp.path(), 4).unwrap();
+        let entry = inv.entries().next().unwrap();
+        assert_eq!(entry.kind, WallpaperKind::WorkshopScene);
+    }
+
+    #[test]
+    fn scan_skips_corrupt_project_json_but_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let good = tmp.path().join("good");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(good.join("project.json"), r#"{"title":"good"}"#).unwrap();
+
+        let bad = tmp.path().join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("project.json"), b"not json at all {{").unwrap();
+
+        let mut inv = Inventory::new();
+        let n = inv.scan(tmp.path(), 4).unwrap();
+        assert_eq!(n, 1, "only the good scene should be added");
+        let entry = inv.entries().next().unwrap();
+        assert_eq!(entry.title.as_deref(), Some("good"));
+    }
+
+    #[test]
+    fn empty_inventory_is_empty() {
+        let inv = Inventory::new();
+        assert!(inv.is_empty());
+        assert_eq!(inv.len(), 0);
     }
 }

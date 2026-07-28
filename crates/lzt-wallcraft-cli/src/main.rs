@@ -19,7 +19,6 @@ use lzt_wallcraft_core::{
     inventory::Inventory,
     paths::default_paths,
     playlist::PlaylistStore,
-    Result,
 };
 
 /// `lzt-wallcraft` — Wallpaper Engine Workshop manager for Linux.
@@ -154,7 +153,11 @@ async fn main() -> anyhow::Result<()> {
             }
             println!("scanned {} entries:", total);
             for entry in inv.entries() {
-                println!("  {}  {:?}", entry.kind.lwe_compatible(), entry.path.display());
+                println!(
+                    "  {}  {:?}",
+                    entry.kind.lwe_compatible(),
+                    entry.path.display()
+                );
             }
         }
         Cmd::Audio { action } => {
@@ -208,10 +211,5 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn unused_to_silence_warnings() -> Result<()> {
     Ok(())
 }

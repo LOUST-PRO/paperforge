@@ -122,8 +122,8 @@ impl Config {
     /// Save config to `paths.config_file()`.
     pub fn save(&self, paths: &ConfigPaths) -> Result<()> {
         let file = paths.config_file();
-        let toml = toml::to_string_pretty(self)
-            .map_err(|e| Error::Config(format!("serialize: {e}")))?;
+        let toml =
+            toml::to_string_pretty(self).map_err(|e| Error::Config(format!("serialize: {e}")))?;
         std::fs::write(&file, toml)?;
         Ok(())
     }
@@ -151,6 +151,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::WallpaperBackend;
 
     #[test]
     fn defaults_backend_is_lwe() {
@@ -168,7 +169,12 @@ mod tests {
             thumbnails_dir: tmp.path().join("cache").join("thumbnails"),
             inventory_cache: tmp.path().join("cache").join("inventory.json"),
         };
-        for d in [&paths.config_dir, &paths.playlists_dir, &paths.cache_dir, &paths.thumbnails_dir] {
+        for d in [
+            &paths.config_dir,
+            &paths.playlists_dir,
+            &paths.cache_dir,
+            &paths.thumbnails_dir,
+        ] {
             std::fs::create_dir_all(d).unwrap();
         }
         let cfg = Config::default();
@@ -176,5 +182,58 @@ mod tests {
         let loaded = Config::load(&paths).unwrap();
         assert_eq!(loaded.backend, cfg.backend);
         assert_eq!(loaded.auto_pause_on_game, cfg.auto_pause_on_game);
+    }
+
+    #[test]
+    fn roundtrip_preserves_extra_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths {
+            config_dir: tmp.path().to_path_buf(),
+            playlists_dir: tmp.path().join("playlists"),
+            cache_dir: tmp.path().join("cache"),
+            thumbnails_dir: tmp.path().join("cache").join("thumbnails"),
+            inventory_cache: tmp.path().join("cache").join("inventory.json"),
+        };
+        for d in [
+            &paths.config_dir,
+            &paths.playlists_dir,
+            &paths.cache_dir,
+            &paths.thumbnails_dir,
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let cfg = Config {
+            extra_sources: vec![PathBuf::from("/srv/wallpapers"), PathBuf::from("/opt/wp")],
+            auto_pause_on_game: false,
+            ..Config::default()
+        };
+        cfg.save(&paths).unwrap();
+        let loaded = Config::load(&paths).unwrap();
+        assert_eq!(loaded.extra_sources, cfg.extra_sources);
+        assert!(!loaded.auto_pause_on_game);
+    }
+
+    #[test]
+    fn backend_constructs_without_panic() {
+        let cfg = Config::default();
+        let backend = cfg.backend();
+        assert_eq!(backend.kind(), BackendKind::LinuxWallpaperEngine);
+    }
+
+    #[test]
+    fn source_roots_includes_extras() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extra = tmp.path().join("extra");
+        std::fs::create_dir_all(&extra).unwrap();
+
+        let cfg = Config {
+            extra_sources: vec![extra.clone()],
+            ..Config::default()
+        };
+        let roots: Vec<&Path> = cfg.source_roots();
+        assert!(
+            roots.iter().any(|p| p == &extra),
+            "extra_sources must appear in source_roots()"
+        );
     }
 }

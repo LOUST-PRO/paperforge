@@ -71,14 +71,12 @@ impl LweAudioController {
         }
 
         for pid in &pids {
-            nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(*pid),
-                cmd.signal(),
-            )
-            .map_err(|e| Error::BackendFailure {
-                kind: "linux-wallpaperengine".to_string(),
-                message: format!("signal {:?} to pid {pid} failed: {e}", cmd.signal()),
-            })?;
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid), cmd.signal()).map_err(
+                |e| Error::BackendFailure {
+                    kind: "linux-wallpaperengine".to_string(),
+                    message: format!("signal {:?} to pid {pid} failed: {e}", cmd.signal()),
+                },
+            )?;
         }
 
         tracing::info!("sent {:?} to {} LWE pid(s)", cmd, pids.len());
@@ -124,6 +122,22 @@ mod tests {
         assert_eq!(
             AudioCommand::Unmute.signal() as i32,
             nix::sys::signal::Signal::SIGCONT as i32
+        );
+    }
+
+    #[test]
+    fn audio_command_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&AudioCommand::Toggle).unwrap(),
+            "\"toggle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AudioCommand::Mute).unwrap(),
+            "\"mute\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AudioCommand::Unmute).unwrap(),
+            "\"unmute\""
         );
     }
 }

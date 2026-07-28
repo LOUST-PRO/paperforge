@@ -10,10 +10,7 @@
 //! With playlists, the operator can switch the entire vibe of their
 //! desktop with one command (`lzt-wallcraft playlist apply focus`).
 
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
