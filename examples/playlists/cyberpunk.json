@@ -1,0 +1,14 @@
+{
+  "name": "cyberpunk",
+  "description": "Neon city loops for late-night hacking sessions",
+  "outputs": [
+    "DP-1",
+    "HDMI-A-1"
+  ],
+  "wallpapers": [
+    "/home/lou/.steam/root/steamapps/workshop/content/431960/3456789012",
+    "/home/lou/.steam/root/steamapps/workshop/content/431960/4567890123",
+    "/home/lou/Pictures/Wallpapers/neon_circuit.mp4"
+  ],
+  "fill": "fill"
+}

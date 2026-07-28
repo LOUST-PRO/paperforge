@@ -1,0 +1,14 @@
+{
+  "name": "focus",
+  "description": "Minimal scenes for deep work — soft loops, no audio",
+  "outputs": [
+    "DP-1",
+    "HDMI-A-1",
+    "eDP-1"
+  ],
+  "wallpapers": [
+    "/home/lou/.steam/root/steamapps/workshop/content/431960/1234567890",
+    "/home/lou/.steam/root/steamapps/workshop/content/431960/2345678901"
+  ],
+  "fill": "cover"
+}

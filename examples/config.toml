@@ -1,0 +1,30 @@
+# Example config.toml for `lzt-wallcraft`.
+#
+# Place at: $XDG_CONFIG_HOME/lzt-wallcraft/config.toml
+# (typically `~/.config/lzt-wallcraft/config.toml`).
+#
+# All fields are optional. Omitting the file is equivalent to using
+# the defaults shown below.
+
+# Which backend to use. Today only "linux-wallpaperengine" is wired.
+# Future: "swww", "hyprpaper", "mpvpaper".
+backend = "linux-wallpaperengine"
+
+# Optional: path to the backend binary. If unset, lzt-wallcraft
+# resolves "linux-wallpaperengine" via $PATH.
+# backend_binary = "/opt/lwe/bin/linux-wallpaperengine"
+
+# Additional wallpaper source directories, on top of the
+# auto-detected ones. Each is walked recursively.
+# extra_sources = [
+#   "/srv/wallpapers",
+#   "/opt/wp",
+# ]
+
+# Auto-pause wallpapers when a game is detected (fullscreen +
+# process-name match). Requires the companion `lzt-wallpaper-governor`
+# daemon — this flag just signals it's desired.
+auto_pause_on_game = true
+
+# Auto-mute audio when fullscreen / game is detected. Same caveat.
+auto_mute_on_fullscreen = true
