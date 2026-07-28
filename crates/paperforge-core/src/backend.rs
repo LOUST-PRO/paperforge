@@ -36,6 +36,11 @@ use crate::{
 pub enum BackendKind {
     /// `linux-wallpaperengine` (Almamu + louzt fork).
     LinuxWallpaperEngine,
+    /// `swww` (https://github.com/Horus645/swww) — Wayland wallpaper
+    /// daemon for static images. Differentiation: pause/resume not
+    /// supported (swww runs as a single daemon, no per-output
+    /// processes); only supports `LooseImage` entries.
+    SwwwDaemon,
 }
 
 impl BackendKind {
@@ -46,6 +51,7 @@ impl BackendKind {
     pub fn process_pattern(self) -> &'static str {
         match self {
             Self::LinuxWallpaperEngine => "linux-wallpaperengine",
+            Self::SwwwDaemon => "swww-daemon",
         }
     }
 }
@@ -292,6 +298,139 @@ impl BackendKind {
     }
 }
 
+/// Backend implementation for `swww-daemon`.
+///
+/// Talks to swww via the `swww` CLI (the binary the upstream project
+/// installs alongside `swww-daemon`). Both binaries must be on PATH
+/// or configured via [`SwwwBackend::with_binaries`].
+///
+/// ## Limitations vs `LweBackend`
+///
+/// - swww runs as a single daemon for all outputs. `list_pids`
+///   returns the daemon's PID at most once; per-output PIDs are not
+///   a thing in swww.
+/// - **No pause/resume.** swww renders frames as a daemon; the only
+///   way to "pause" is `swww clear <color>` (sets all outputs to a
+///   flat color) which is a destructive set, not a suspend.
+/// - Only handles `LooseImage` entries (swww is a static-image
+///   wallpaper tool, not a scene player).
+#[derive(Debug, Clone, Default)]
+pub struct SwwwBackend {
+    /// Path to the `swww` CLI binary (used to dispatch set/clear
+    /// commands). `None` means PATH lookup.
+    pub cli_binary: Option<PathBuf>,
+    /// Path to the `swww-daemon` binary (used to detect running
+    /// state). `None` means PATH lookup.
+    pub daemon_binary: Option<PathBuf>,
+}
+
+impl SwwwBackend {
+    /// Construct with default PATH lookup for both binaries.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct with explicit binary paths.
+    pub fn with_binaries(cli: impl Into<PathBuf>, daemon: impl Into<PathBuf>) -> Self {
+        Self {
+            cli_binary: Some(cli.into()),
+            daemon_binary: Some(daemon.into()),
+        }
+    }
+
+    fn cli(&self) -> &str {
+        self.cli_binary
+            .as_ref()
+            .map(|p| p.to_str().unwrap_or("swww"))
+            .unwrap_or("swww")
+    }
+}
+
+#[async_trait]
+impl WallpaperBackend for SwwwBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::SwwwDaemon
+    }
+
+    async fn list_pids(&self) -> Result<Vec<i32>> {
+        list_pids_in_proc(Path::new("/proc"), self.kind().process_pattern())
+    }
+
+    async fn set(&self, scene: &Path, output: Option<&str>) -> Result<()> {
+        if !scene.exists() {
+            return Err(Error::BackendUnreachable {
+                kind: self.kind().process_pattern().to_string(),
+                message: format!("image path does not exist: {}", scene.display()),
+            });
+        }
+
+        let mut cmd = Command::new(self.cli());
+        cmd.arg("img").arg(scene);
+        if let Some(out) = output {
+            // swww's --outputs flag accepts comma-separated output names.
+            cmd.args(["--outputs", out]);
+        }
+        let status = cmd.status().map_err(|e| Error::BackendFailure {
+            kind: self.kind().process_pattern().to_string(),
+            message: format!("spawn {} failed: {e}", self.cli()),
+        })?;
+        if !status.success() {
+            return Err(Error::BackendFailure {
+                kind: self.kind().process_pattern().to_string(),
+                message: format!("`{} img` exited with {:?}", self.cli(), status.code()),
+            });
+        }
+        tracing::info!(
+            "swww set: output={:?} scene={} (exit {:?})",
+            output,
+            scene.display(),
+            status.code()
+        );
+        Ok(())
+    }
+
+    async fn pause(&self) -> Result<usize> {
+        Err(Error::BackendFailure {
+            kind: self.kind().process_pattern().to_string(),
+            message: "swww does not support pause/resume; use `swww clear <color>` instead"
+                .to_string(),
+        })
+    }
+
+    async fn resume(&self) -> Result<usize> {
+        Err(Error::BackendFailure {
+            kind: self.kind().process_pattern().to_string(),
+            message: "swww does not support pause/resume; the previous wallpaper is lost when cleared"
+                .to_string(),
+        })
+    }
+
+    async fn state(&self, pid: i32) -> Result<BackendState> {
+        // swww runs as a single daemon; the only state we can
+        // report is "running" (process exists) vs "not running".
+        let status_path = format!("/proc/{pid}/status");
+        match std::fs::read_to_string(&status_path) {
+            Ok(content) => {
+                for line in content.lines() {
+                    if let Some(rest) = line.strip_prefix("State:") {
+                        if rest.contains('T') {
+                            return Ok(BackendState::Paused);
+                        }
+                        return Ok(BackendState::Running);
+                    }
+                }
+                Ok(BackendState::NotRunning)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BackendState::NotRunning),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn supports(&self, entry: &crate::WallpaperEntry) -> bool {
+        matches!(entry.kind, crate::inventory::WallpaperKind::LooseImage)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +640,117 @@ mod tests {
         // not exist on a normal box.
         let s = rt.block_on(backend.state(0)).unwrap();
         assert_eq!(s, BackendState::NotRunning);
+    }
+
+    // ---- SwwwBackend tests ----
+
+    #[test]
+    fn swww_backend_kind() {
+        let b = SwwwBackend::new();
+        assert_eq!(b.kind(), BackendKind::SwwwDaemon);
+    }
+
+    #[test]
+    fn swww_pattern_matches_daemon() {
+        assert_eq!(BackendKind::SwwwDaemon.process_pattern(), "swww-daemon");
+    }
+
+    #[test]
+    fn swww_supports_only_loose_images() {
+        use crate::inventory::{WallpaperEntry, WallpaperKind};
+        let b = SwwwBackend::new();
+        let mk = |kind: WallpaperKind| WallpaperEntry {
+            path: PathBuf::from("/dummy"),
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            kind,
+            title: None,
+            workshop_id: None,
+        };
+        assert!(b.supports(&mk(WallpaperKind::LooseImage)));
+        assert!(!b.supports(&mk(WallpaperKind::LooseVideo)));
+        assert!(!b.supports(&mk(WallpaperKind::WorkshopScene)));
+    }
+
+    #[test]
+    fn swww_binary_resolution_default() {
+        let b = SwwwBackend::new();
+        assert_eq!(b.cli(), "swww");
+    }
+
+    #[test]
+    fn swww_binary_resolution_explicit() {
+        let b = SwwwBackend::with_binaries("/opt/swww/swww", "/opt/swww/swww-daemon");
+        assert_eq!(b.cli(), "/opt/swww/swww");
+    }
+
+    #[test]
+    fn swww_pause_returns_backend_failure() {
+        let b = SwwwBackend::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(b.pause()).unwrap_err();
+        assert!(
+            matches!(err, Error::BackendFailure { .. }),
+            "swww.pause() must refuse, got {err:?}"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not support pause"),
+            "error message must explain the limitation, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn swww_resume_returns_backend_failure() {
+        let b = SwwwBackend::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(b.resume()).unwrap_err();
+        assert!(
+            matches!(err, Error::BackendFailure { .. }),
+            "swww.resume() must refuse, got {err:?}"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not support pause"),
+            "error message must explain the limitation, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn swww_set_rejects_missing_path() {
+        let b = SwwwBackend::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(b.set(Path::new("/does/not/exist.png"), Some("DP-1")))
+            .unwrap_err();
+        // Should refuse before spawning the CLI.
+        assert!(
+            matches!(err, Error::BackendUnreachable { .. }),
+            "missing image must be caught before spawn, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn list_pids_finds_swww_daemon_too() {
+        // Confirm the same /proc walker picks up `swww-daemon`
+        // instances — proves the BackendKind dispatch works for both
+        // backends with no extra logic.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc = tmp.path();
+        write_cmdline(proc, 700, &["/usr/bin/swww-daemon"]);
+        write_cmdline(proc, 800, &["/usr/bin/swww", "img", "/wall.jpg"]);
+
+        let lwe_pids = list_pids_in_proc(proc, "linux-wallpaperengine").unwrap();
+        assert!(lwe_pids.is_empty());
+        let swww_pids = list_pids_in_proc(proc, "swww-daemon").unwrap();
+        assert_eq!(swww_pids, vec![700]);
+    }
+
+    #[test]
+    fn lwe_and_swww_are_distinct_patterns() {
+        // The two backends must not collide on /proc walks.
+        assert_ne!(
+            BackendKind::LinuxWallpaperEngine.process_pattern(),
+            BackendKind::SwwwDaemon.process_pattern()
+        );
     }
 }

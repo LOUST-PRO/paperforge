@@ -56,6 +56,18 @@ pub enum Error {
     #[error("config error: {0}")]
     Config(String),
 
+    /// Audio signal dispatch refused because the running LWE binary
+    /// is not known to handle SIGUSR1/SIGUSR2. Sending these signals
+    /// to an unhandled process terminates it. Set
+    /// `lwe_supports_audio_signals = true` in config to override.
+    #[error(
+        "audio signals disabled: {reason}. To override, set `lwe_supports_audio_signals = true` in config.toml"
+    )]
+    AudioSignalsDisabled {
+        /// Why audio signals were refused (probe result or override).
+        reason: String,
+    },
+
     /// Generic anyhow passthrough.
     #[error(transparent)]
     Other(#[from] anyhow::Error),

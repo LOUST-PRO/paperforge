@@ -32,14 +32,16 @@ pub mod backend;
 pub mod config;
 pub mod error;
 pub mod inventory;
+pub mod lwe_probe;
 pub mod paths;
 pub mod playlist;
 
 pub use audio::{AudioCommand, LweAudioController};
-pub use backend::{BackendKind, BackendState, LweBackend, WallpaperBackend};
+pub use backend::{BackendKind, BackendState, LweBackend, SwwwBackend, WallpaperBackend};
 pub use config::{Config, ConfigPaths};
 pub use error::{Error, Result};
 pub use inventory::{Inventory, WallpaperEntry, WallpaperKind};
+pub use lwe_probe::{probe_lwe_binary, LweBuildKind};
 pub use paths::{default_paths, WorkshopPaths};
 pub use playlist::{Playlist, PlaylistStore};
 

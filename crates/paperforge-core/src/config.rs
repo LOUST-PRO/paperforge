@@ -83,6 +83,18 @@ pub struct Config {
     /// Whether to mute audio when fullscreen / games.
     #[serde(default = "default_true")]
     pub auto_mute_on_fullscreen: bool,
+    /// Override the LWE binary version probe for audio signals.
+    ///
+    /// - `Some(true)`: trust the audio signals will be handled (do NOT probe)
+    /// - `Some(false)`: refuse to send SIGUSR1/SIGUSR2 even if probe says ok
+    /// - `None`: auto-probe `<backend_binary> --version` for the
+    ///   "signal handlers" marker before sending
+    ///
+    /// Default is `None` (probe). The probe is cached for the process
+    /// lifetime to avoid spawning `<binary> --version` on every audio
+    /// command.
+    #[serde(default)]
+    pub lwe_supports_audio_signals: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -98,6 +110,7 @@ impl Default for Config {
             default_paths: default_paths(),
             auto_pause_on_game: true,
             auto_mute_on_fullscreen: true,
+            lwe_supports_audio_signals: None,
         }
     }
 }
@@ -135,6 +148,10 @@ impl Config {
                 Some(p) => LweBackend::with_binary(p),
                 None => LweBackend::new(),
             },
+            // Future: route to SwwwBackend / HyprpaperBackend here.
+            // Today the CLI is LWE-only; this branch is unreachable
+            // in practice until we add a `--backend swww` flag.
+            BackendKind::SwwwDaemon => LweBackend::new(),
         }
     }
 
@@ -205,12 +222,54 @@ mod tests {
         let cfg = Config {
             extra_sources: vec![PathBuf::from("/srv/wallpapers"), PathBuf::from("/opt/wp")],
             auto_pause_on_game: false,
+            lwe_supports_audio_signals: Some(true),
             ..Config::default()
         };
         cfg.save(&paths).unwrap();
         let loaded = Config::load(&paths).unwrap();
         assert_eq!(loaded.extra_sources, cfg.extra_sources);
         assert!(!loaded.auto_pause_on_game);
+        assert_eq!(
+            loaded.lwe_supports_audio_signals,
+            Some(true),
+            "lwe_supports_audio_signals override must roundtrip"
+        );
+    }
+
+    #[test]
+    fn default_audio_signals_is_auto_probe() {
+        let cfg = Config::default();
+        assert!(
+            cfg.lwe_supports_audio_signals.is_none(),
+            "default must be None so the probe runs"
+        );
+    }
+
+    #[test]
+    fn roundtrip_default_audio_signals_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths {
+            config_dir: tmp.path().to_path_buf(),
+            playlists_dir: tmp.path().join("playlists"),
+            cache_dir: tmp.path().join("cache"),
+            thumbnails_dir: tmp.path().join("cache").join("thumbnails"),
+            inventory_cache: tmp.path().join("cache").join("inventory.json"),
+        };
+        for d in [
+            &paths.config_dir,
+            &paths.playlists_dir,
+            &paths.cache_dir,
+            &paths.thumbnails_dir,
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let cfg = Config::default();
+        cfg.save(&paths).unwrap();
+        let loaded = Config::load(&paths).unwrap();
+        assert!(
+            loaded.lwe_supports_audio_signals.is_none(),
+            "explicit default must roundtrip as None"
+        );
     }
 
     #[test]
