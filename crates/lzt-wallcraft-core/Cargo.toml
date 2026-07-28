@@ -1,0 +1,28 @@
+[package]
+name = "lzt-wallcraft-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Core library for lzt-wallcraft — wallpaper inventory, LWE backend IPC, playlists per monitor, audio control"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+walkdir = { workspace = true }
+notify = { workspace = true }
+nix = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+async-trait = "0.1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

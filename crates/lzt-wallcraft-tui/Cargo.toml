@@ -1,0 +1,15 @@
+[package]
+name = "lzt-wallcraft-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "TUI for lzt-wallcraft — grid + vim-style navigation over lzt-wallcraft-core (placeholder, Fase 6B)"
+
+[dependencies]
+lzt-wallcraft-core = { path = "../lzt-wallcraft-core" }
+# ratatui + crossterm planned for Fase 6B; keep this placeholder compiling
+serde = { workspace = true }
+serde_json = { workspace = true }

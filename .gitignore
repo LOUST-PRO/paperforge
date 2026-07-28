@@ -1,0 +1,20 @@
+target/
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Build artifacts
+*.d
+*.rlib
+
+# Local config (operator-private)
+.config.local.toml
+.playlists.local/
+
+# Audit / lint
+clippy-report.html

@@ -1,0 +1,22 @@
+[package]
+name = "lzt-wallcraft-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "CLI for lzt-wallcraft — set/pause/resume/list/scan/playlist over LWE backend"
+
+[[bin]]
+name = "lzt-wallcraft"
+path = "src/main.rs"
+
+[dependencies]
+lzt-wallcraft-core = { path = "../lzt-wallcraft-core" }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
