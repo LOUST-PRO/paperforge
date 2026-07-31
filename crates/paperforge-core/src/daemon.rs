@@ -160,9 +160,12 @@ impl BackendOps for LweBackendOps {
             let _pid = self.set_with_pid(output, scene).await?;
         } else {
             // v0.1 legacy: per-output spawn. One LWE process per
-            // monitor — bypasses any merged-argv bug in the upstream
-            // LWE binary. The pid is tracked in `per_output_pids`,
-            // not exposed to the caller here (legacy semantics).
+            // monitor — bypasses the merged-argv path that the
+            // upstream LWE binary mishandles. `set_per_output` is
+            // the inherent method on `LweBackend` that does the
+            // spawn; calling `backend.set(...)` here would route
+            // through `WallpaperBackend::set` which still uses the
+            // pool regardless of `use_pool`.
             let path = std::path::Path::new(scene);
             let pid = self.backend.set_per_output(path, output).await?;
             tracing::info!(
@@ -176,38 +179,36 @@ impl BackendOps for LweBackendOps {
     }
 
     async fn set_with_pid(&self, output: &str, scene: &str) -> Result<i32> {
-        // Only the pool path returns a real pid. The v0.1 fallback
-        // is observable as `pid: 0` in the daemon event.
-        if !self.use_pool {
-            let path = std::path::Path::new(scene);
-            self.backend.set(path, Some(output)).await?;
-            return Ok(0);
-        }
+        // Pool path returns the real pid (the pool's single LWE pid).
+        // Per-output path returns the spawned child's pid (recorded
+        // in `per_output_pids`).
         let path = std::path::Path::new(scene);
-        // Need to extract content_id from the Workshop path; we
-        // delegate to the pool's bind_scene which validates +
-        // returns the pid.
-        let pid = self.backend.pool().bind_scene(output, path).await?;
-        Ok(pid)
+        if self.use_pool {
+            // Delegate to the pool's bind_scene which validates +
+            // returns the pid.
+            self.backend.pool().bind_scene(output, path).await
+        } else {
+            // Route through `set_per_output` (inherent method that
+            // does the actual spawn), NOT `backend.set` (which goes
+            // through the pool regardless of `use_pool`).
+            self.backend.set_per_output(path, output).await
+        }
     }
 
     async fn pause(&self) -> Result<usize> {
-        if self.use_pool {
-            self.backend.pause().await
-        } else {
-            self.backend.pause_per_output().await
-        }
+        self.backend.pause().await
     }
 
     async fn resume(&self) -> Result<usize> {
-        if self.use_pool {
-            self.backend.resume().await
-        } else {
-            self.backend.resume_per_output().await
-        }
+        self.backend.resume().await
     }
 
     async fn list(&self) -> Result<Vec<(i32, BackendState)>> {
+        // Use the mode-appropriate pids source. `list_pids()` is the
+        // `WallpaperBackend` trait method and only reads from the
+        // pool; in per-output mode (CLI-stateless or daemon
+        // post-spawn) the in-memory `per_output_pids` map + /proc
+        // fallback is the source of truth.
         let pids = if self.use_pool {
             self.backend.list_pids().await?
         } else {
@@ -764,17 +765,21 @@ mod tests {
         let _ = LweBackendOps::with_binary("/opt/lwe/linux-wallpaperengine");
     }
 
-    /// `use_pool = false` (the v0.1 fallback path) must still
-    /// succeed on `set_with_pid` but return `pid = 0` — the legacy
-    /// per-output spawn does not surface a pid.
+    /// `use_pool = false` (the v0.1 fallback path) must succeed on
+    /// `set_with_pid` AND return the spawned child's real pid. The
+    /// previous behaviour (pid = 0) was incorrect — `set_with_pid`
+    /// should always reflect the runtime process so the daemon can
+    /// report `DaemonEvent::WallpaperStarted { pid }` accurately.
+    /// The fix is to route through `LweBackend::set_per_output`
+    /// (the actual per-output spawn), not `LweBackend::set` (which
+    /// goes through the pool regardless of `use_pool`).
     #[tokio::test]
-    async fn lwe_backend_ops_pool_disabled_returns_zero_pid() {
+    async fn lwe_backend_ops_pool_disabled_returns_real_pid() {
         let backend = LweBackendOps::with_pool(false);
         assert!(!backend.use_pool(), "use_pool must be false");
-        // The v0.1 (legacy) path validates the scene path is a
-        // Workshop-shaped path AND the file exists. Spawn a wrapper
-        // binary so the legacy spawn actually runs (otherwise the
-        // path's existence check is the only guarantee).
+        // Spawn a wrapper binary so the per-output spawn actually
+        // runs (otherwise the path's existence check is the only
+        // guarantee).
         let wrapper = std::env::temp_dir().join("paperforge-pool-disabled-binary.sh");
         std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
         std::fs::set_permissions(
@@ -793,10 +798,14 @@ mod tests {
             .set_with_pid("DP-1", scene.to_str().unwrap())
             .await
             .unwrap();
-        assert_eq!(
-            pid, 0,
-            "use_pool=false path must return pid=0 (legacy v0.1)"
+        assert!(
+            pid > 0,
+            "use_pool=false path must return real spawned pid, got {pid}"
         );
+        // Cleanup: list() must see the child too.
+        let list = backend.list().await.unwrap();
+        assert_eq!(list.len(), 1, "one per-output child expected");
+        assert_eq!(list[0].0, pid, "list() must match set_with_pid");
         // Cleanup.
         let _ = std::fs::remove_file(&wrapper);
     }

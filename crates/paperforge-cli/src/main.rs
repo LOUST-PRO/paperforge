@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use paperforge_core::{
     audio::AudioCommand,
-    backend::{BackendState, WallpaperBackend},
+    backend::BackendState,
     config::{Config, ConfigPaths},
     daemon::{BackendOps, PaperforgeDaemon},
     dbus::{serve_dbus, PaperforgeControl},
@@ -135,37 +135,51 @@ async fn main() -> anyhow::Result<()> {
     let paths = ConfigPaths::defaults().context("resolving config paths")?;
     let cfg = Config::load(&paths).context("loading config")?;
 
+    // Use `build_backend_ops()` (which honours `pool_enabled`) for
+    // destructive commands (`set`/`pause`/`resume`). Use the raw
+    // `backend()` (always `use_pool = true`) for read-only introspection
+    // where `pool_enabled` doesn't change semantics.
+    let backend_ops = cfg.build_backend_ops();
     let backend = cfg.backend();
     let store = PlaylistStore::default_location().context("opening playlist store")?;
 
     match cli.cmd {
         Cmd::Set { path, output } => {
             let p = std::path::PathBuf::from(&path);
-            backend.set(&p, output.as_deref()).await?;
+            // Route through BackendOps so `pool_enabled=false`
+            // actually triggers per-output spawn. Direct calls to
+            // `backend.set()` (WallpaperBackend trait) ignore
+            // `pool_enabled` and always go through the pool.
+            backend_ops
+                .set(output.as_deref().unwrap_or(""), &path)
+                .await?;
             println!("set {} on output {:?}", p.display(), output);
         }
         Cmd::Pause => {
-            let n = backend.pause().await?;
+            // Route through BackendOps so per-output children are
+            // signaled too (pool mode + per-output mode unified).
+            let n = backend_ops.pause().await?;
             println!("paused {n} LWE instance(s)");
         }
         Cmd::Resume => {
-            let n = backend.resume().await?;
+            let n = backend_ops.resume().await?;
             println!("resumed {n} LWE instance(s)");
         }
         Cmd::List => {
             // Prefer the daemon's view of LWE PIDs (via D-Bus) over
-            // the local `backend.list_pids()` — when the daemon owns
-            // the per-output children, only the daemon knows their
-            // pids. Fall back to the local backend if no daemon is
-            // reachable. We shell out to `gdbus` rather than linking
-            // zbus into the CLI (keeps the CLI hermetic — only the
-            // daemon process links the session bus).
-            let pid_state_pairs: Vec<(i32, BackendState)> = match list_via_dbus().await {
+            // the local backend — when the daemon owns the per-output
+            // children, only the daemon knows their pids. Fall back
+            // to the local backend if no daemon is reachable. We shell
+            // out to `gdbus` rather than linking zbus into the CLI
+            // (keeps the CLI hermetic — only the daemon process
+            // links the session bus). For the local fallback we use
+            // `backend_ops.list()` so per-output children spawned by
+            // earlier CLI invocations are visible via /proc.
+            let dbus_result = list_via_dbus().await;
+            tracing::debug!("list_via_dbus returned: {dbus_result:?}");
+            let pid_state_pairs: Vec<(i32, BackendState)> = match dbus_result {
                 Some(v) => v,
-                None => {
-                    let map = PlaylistStore::lwe_status(&backend).await?;
-                    map.into_iter().collect()
-                }
+                None => backend_ops.list().await?,
             };
             if pid_state_pairs.is_empty() {
                 println!("(no LWE instances running)");
@@ -197,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Audio { action } => {
-            let audio = backend.audio();
+            let audio = backend_ops.audio();
             let cmd: AudioCommand = action.into();
             let n = audio.send(cmd).await?;
             println!("sent {cmd:?} to {n} LWE instance(s)");

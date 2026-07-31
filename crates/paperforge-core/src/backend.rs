@@ -358,9 +358,25 @@ impl LweBackend {
     }
 
     /// List per-output PIDs (v0.1).
+    ///
+    /// Strategy: prefer the in-memory `per_output_pids` map (populated
+    /// by `set_per_output` calls in this process) so we don't pick up
+    /// foreign LWE processes. Fall back to `/proc` walking when the
+    /// map is empty — that's the CLI-stateless case where earlier
+    /// invocations spawned LWE children that got reparented to init.
+    /// In a daemon context the map is always populated, so `/proc` is
+    /// rarely hit.
     pub async fn list_per_output_pids(&self) -> Vec<i32> {
         let pids = self.per_output_pids.lock().await;
-        pids.values().copied().collect()
+        if !pids.is_empty() {
+            return pids.values().copied().collect();
+        }
+        // Fallback: walk /proc for any LWE process. The CLI is a
+        // single-shot process; children survive in /proc after exit.
+        match list_pids_in_proc(Path::new("/proc"), self.kind().process_pattern()) {
+            Ok(v) => v,
+            Err(_) => Vec::new(),
+        }
     }
 }
 
@@ -479,23 +495,22 @@ impl WallpaperBackend for LweBackend {
 
     async fn state(&self, pid: i32) -> Result<BackendState> {
         // The pool is the single source of truth for which LWE pid
-        // we actually own. If the caller asks about a foreign pid,
-        // we report NotRunning instead of a stale /proc read.
+        // we actually own in v0.2 mode. If the caller asks about a
+        // foreign pid in pool mode, we report NotRunning instead of
+        // a stale /proc read.
         //
-        // v0.1 per-output path: skip the ownership gate. The pid map
-        // (`per_output_pids`) is the source of truth in v0.1; we trust
-        // any pid that lives in `per_output_pids` and report real
-        // /proc state for it.
+        // v0.1 per-output path: stateless CLI calls have an empty
+        // `per_output_pids` map, but LWE children survive in /proc
+        // (reparented to init after our exit). Read the kernel-
+        // reported state directly via /proc/<pid>/status. If the
+        // pid is gone, /proc reports ENOENT → NotRunning.
         let owned = self.pool.current_pid().await;
-        let in_per_output = self
-            .per_output_pids
-            .lock()
-            .await
-            .values()
-            .any(|&p| p == pid);
-        if owned != Some(pid) && !in_per_output {
-            return Ok(BackendState::NotRunning);
+        if owned == Some(pid) {
+            return pid_state_quick(pid);
         }
+        // Per-output + stateless CLI: skip the ownership gate and
+        // trust /proc. This matches the v0.1 design where each LWE
+        // child survives independently of any parent state.
         pid_state_quick(pid)
     }
 
