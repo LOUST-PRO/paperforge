@@ -498,9 +498,7 @@ mod tests {
         // ignore `--silent`. `--no-audio-processing` is the upstream
         // decoder-side mute; together they form a layered defense.
         let f = default_flags();
-        let has_volume_zero = f
-            .windows(2)
-            .any(|w| w[0] == "--volume" && w[1] == "0");
+        let has_volume_zero = f.windows(2).any(|w| w[0] == "--volume" && w[1] == "0");
         assert!(has_volume_zero, "default flags must include --volume 0");
         assert!(
             f.iter().any(|s| s == "--noautomute"),
