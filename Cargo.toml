@@ -50,6 +50,18 @@ chrono = { version = "0.4", features = ["serde"] }
 # Path helpers
 dirs = "5"
 
+# TOML serialization (config + updater.toml)
+toml = "0.8"
+
+# SHA-256 hashing (used by self-update for SHA256SUMS verification)
+sha2 = "0.10"
+
+# Tempdir for self-update staging area
+tempfile = "3"
+
+# File mtime setter (used by self-update backup pruning tests)
+filetime = "0.2"
+
 # D-Bus IPC service (Fase 6D — zbus-based daemon control)
 zbus = { version = "4", default-features = false, features = ["tokio"] }
 

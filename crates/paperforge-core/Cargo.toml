@@ -30,10 +30,13 @@ notify = { workspace = true }
 nix = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
 async-trait = "0.1"
 toml = "0.8"
 zbus = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
+filetime = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
