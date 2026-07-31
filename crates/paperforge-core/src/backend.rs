@@ -18,6 +18,7 @@
 //! isolation.
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -25,6 +26,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::{
     audio::LweAudioController,
@@ -134,6 +136,14 @@ pub struct LweBackend {
     /// Shared multi-output pool. The pool is `Clone`-cheap (internal
     /// `Arc<Mutex<...>>`) so `LweBackend: Clone` stays.
     pool: Arc<LweSinglePool>,
+    /// Per-output child PIDs (v0.1 legacy path). One LWE process per
+    /// monitor — bypasses the merged-argv path that some LWE builds
+    /// (e.g. `nicobz/linux-wallpaperengine` with `workshop/content/<id>`
+    /// scenes that hit a parse error in `--bg <id>` when 2+ outputs
+    /// are bound at once). Populated only when
+    /// [`LweBackendOps::use_pool`] is `false`; the pool path ignores
+    /// this map and uses `self.pool` instead.
+    per_output_pids: Arc<Mutex<BTreeMap<String, i32>>>,
 }
 
 /// Extract the Steam Workshop `content_id` from a scene path.
@@ -190,6 +200,7 @@ impl LweBackend {
         Self {
             binary_path: None,
             pool: Arc::new(pool),
+            per_output_pids: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -201,6 +212,7 @@ impl LweBackend {
         Self {
             binary_path: Some(pb),
             pool: Arc::new(pool),
+            per_output_pids: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -227,6 +239,7 @@ impl LweBackend {
         Self {
             binary_path: self.binary_path,
             pool: Arc::new(new_pool),
+            per_output_pids: self.per_output_pids,
         }
     }
 
@@ -234,6 +247,133 @@ impl LweBackend {
     /// because SIGUSR1/SIGUSR2 are tied to LWE).
     pub fn audio(&self) -> LweAudioController {
         LweAudioController::new(self.clone())
+    }
+
+    /// Per-output spawn (v0.1 legacy path). Spawns a fresh LWE
+    /// process for `output` with `--screen-root <output> --bg <id>`,
+    /// SIGTERMs any previous LWE for the same output, and records the
+    /// new pid in `per_output_pids`. Returns the spawned pid.
+    ///
+    /// Use this when the upstream LWE binary mishandles the
+    /// merged-argv path (e.g. crashes within seconds when 2+ outputs
+    /// are bound at once). Cost: ~1 LWE process per monitor (~250 MiB
+    /// RSS each on Wayland/CEF builds). Trade vs the pool is memory
+    /// for stability.
+    pub async fn set_per_output(&self, scene: &Path, output: &str) -> Result<i32> {
+        if !scene.exists() {
+            return Err(Error::BackendUnreachable {
+                kind: self.kind().process_pattern().to_string(),
+                message: format!("scene path does not exist: {}", scene.display()),
+            });
+        }
+        let content_id = workshop_content_id(scene).ok_or_else(|| Error::BackendFailure {
+            kind: self.kind().process_pattern().to_string(),
+            message: format!(
+                "scene path {} is not a Steam Workshop scene \
+                     (expected `workshop/content/<appid>/<numeric>`)",
+                scene.display()
+            ),
+        })?;
+
+        let binary = self
+            .binary_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("linux-wallpaperengine"));
+
+        // Kill any existing LWE for this output before spawning the
+        // replacement. SIGTERM is graceful; the new spawn happens
+        // ~immediately so a hung child is OK.
+        {
+            let mut pids = self.per_output_pids.lock().await;
+            if let Some(old) = pids.remove(output) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(old),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+            }
+        }
+
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.arg("--screen-root")
+            .arg(output)
+            .arg("--bg")
+            .arg(&content_id)
+            .arg("--silent")
+            .arg("--no-audio-processing")
+            .arg("--disable-particles")
+            .arg("--disable-mouse")
+            .arg("--disable-parallax")
+            .arg("--fullscreen-pause-only-active");
+
+        let child = cmd.spawn().map_err(|e| Error::BackendFailure {
+            kind: self.kind().process_pattern().to_string(),
+            message: format!("per-output spawn LWE failed: {e}"),
+        })?;
+        let pid = child.id() as i32;
+        tracing::info!(
+            "per-output spawn: output={} bg={} pid={}",
+            output,
+            content_id,
+            pid,
+        );
+
+        let mut pids = self.per_output_pids.lock().await;
+        pids.insert(output.to_string(), pid);
+        Ok(pid)
+    }
+
+    /// Per-output pause (v0.1). Sends SIGSTOP to every LWE pid we
+    /// recorded via [`Self::set_per_output`].
+    pub async fn pause_per_output(&self) -> Result<usize> {
+        let pids = self.per_output_pids.lock().await;
+        let mut count = 0;
+        for &pid in pids.values() {
+            if nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGSTOP,
+            )
+            .is_ok()
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Per-output resume (v0.1). Sends SIGCONT to every recorded pid.
+    pub async fn resume_per_output(&self) -> Result<usize> {
+        let pids = self.per_output_pids.lock().await;
+        let mut count = 0;
+        for &pid in pids.values() {
+            if nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGCONT,
+            )
+            .is_ok()
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// List per-output PIDs (v0.1).
+    ///
+    /// Strategy: prefer the in-memory `per_output_pids` map (populated
+    /// by `set_per_output` calls in this process) so we don't pick up
+    /// foreign LWE processes. Fall back to `/proc` walking when the
+    /// map is empty — that's the CLI-stateless case where earlier
+    /// invocations spawned LWE children that got reparented to init.
+    /// In a daemon context the map is always populated, so `/proc` is
+    /// rarely hit.
+    pub async fn list_per_output_pids(&self) -> Vec<i32> {
+        let pids = self.per_output_pids.lock().await;
+        if !pids.is_empty() {
+            return pids.values().copied().collect();
+        }
+        // Fallback: walk /proc for any LWE process. The CLI is a
+        // single-shot process; children survive in /proc after exit.
+        list_pids_in_proc(Path::new("/proc"), self.kind().process_pattern()).unwrap_or_default()
     }
 }
 
@@ -352,12 +492,22 @@ impl WallpaperBackend for LweBackend {
 
     async fn state(&self, pid: i32) -> Result<BackendState> {
         // The pool is the single source of truth for which LWE pid
-        // we actually own. If the caller asks about a foreign pid,
-        // we report NotRunning instead of a stale /proc read.
+        // we actually own in v0.2 mode. If the caller asks about a
+        // foreign pid in pool mode, we report NotRunning instead of
+        // a stale /proc read.
+        //
+        // v0.1 per-output path: stateless CLI calls have an empty
+        // `per_output_pids` map, but LWE children survive in /proc
+        // (reparented to init after our exit). Read the kernel-
+        // reported state directly via /proc/<pid>/status. If the
+        // pid is gone, /proc reports ENOENT → NotRunning.
         let owned = self.pool.current_pid().await;
-        if owned != Some(pid) {
-            return Ok(BackendState::NotRunning);
+        if owned == Some(pid) {
+            return pid_state_quick(pid);
         }
+        // Per-output + stateless CLI: skip the ownership gate and
+        // trust /proc. This matches the v0.1 design where each LWE
+        // child survives independently of any parent state.
         pid_state_quick(pid)
     }
 

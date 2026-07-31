@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use paperforge_core::{
     audio::AudioCommand,
-    backend::{BackendState, WallpaperBackend},
+    backend::BackendState,
     config::{Config, ConfigPaths},
     daemon::{BackendOps, PaperforgeDaemon},
     dbus::{serve_dbus, PaperforgeControl},
@@ -135,29 +135,56 @@ async fn main() -> anyhow::Result<()> {
     let paths = ConfigPaths::defaults().context("resolving config paths")?;
     let cfg = Config::load(&paths).context("loading config")?;
 
+    // Use `build_backend_ops()` (which honours `pool_enabled`) for
+    // destructive commands (`set`/`pause`/`resume`). Use the raw
+    // `backend()` (always `use_pool = true`) for read-only introspection
+    // where `pool_enabled` doesn't change semantics.
+    let backend_ops = cfg.build_backend_ops();
     let backend = cfg.backend();
     let store = PlaylistStore::default_location().context("opening playlist store")?;
 
     match cli.cmd {
         Cmd::Set { path, output } => {
             let p = std::path::PathBuf::from(&path);
-            backend.set(&p, output.as_deref()).await?;
+            // Route through BackendOps so `pool_enabled=false`
+            // actually triggers per-output spawn. Direct calls to
+            // `backend.set()` (WallpaperBackend trait) ignore
+            // `pool_enabled` and always go through the pool.
+            backend_ops
+                .set(output.as_deref().unwrap_or(""), &path)
+                .await?;
             println!("set {} on output {:?}", p.display(), output);
         }
         Cmd::Pause => {
-            let n = backend.pause().await?;
+            // Route through BackendOps so per-output children are
+            // signaled too (pool mode + per-output mode unified).
+            let n = backend_ops.pause().await?;
             println!("paused {n} LWE instance(s)");
         }
         Cmd::Resume => {
-            let n = backend.resume().await?;
+            let n = backend_ops.resume().await?;
             println!("resumed {n} LWE instance(s)");
         }
         Cmd::List => {
-            let status = PlaylistStore::lwe_status(&backend).await?;
-            if status.is_empty() {
+            // Prefer the daemon's view of LWE PIDs (via D-Bus) over
+            // the local backend — when the daemon owns the per-output
+            // children, only the daemon knows their pids. Fall back
+            // to the local backend if no daemon is reachable. We shell
+            // out to `gdbus` rather than linking zbus into the CLI
+            // (keeps the CLI hermetic — only the daemon process
+            // links the session bus). For the local fallback we use
+            // `backend_ops.list()` so per-output children spawned by
+            // earlier CLI invocations are visible via /proc.
+            let dbus_result = list_via_dbus().await;
+            tracing::debug!("list_via_dbus returned: {dbus_result:?}");
+            let pid_state_pairs: Vec<(i32, BackendState)> = match dbus_result {
+                Some(v) => v,
+                None => backend_ops.list().await?,
+            };
+            if pid_state_pairs.is_empty() {
                 println!("(no LWE instances running)");
             } else {
-                for (pid, state) in status {
+                for (pid, state) in pid_state_pairs {
                     let s = match state {
                         BackendState::Running => "running",
                         BackendState::Paused => "paused",
@@ -184,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Audio { action } => {
-            let audio = backend.audio();
+            let audio = backend_ops.audio();
             let cmd: AudioCommand = action.into();
             let n = audio.send(cmd).await?;
             println!("sent {cmd:?} to {n} LWE instance(s)");
@@ -360,4 +387,57 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<&'static str> {
     });
     rx.await
         .map_err(|e| anyhow::anyhow!("shutdown channel: {e}"))
+}
+
+/// Query the daemon's `ListRunning` D-Bus method via `gdbus`.
+///
+/// Returns `None` if the daemon is not running on the session bus
+/// (so the caller should fall back to the local backend).
+async fn list_via_dbus() -> Option<Vec<(i32, paperforge_core::backend::BackendState)>> {
+    use paperforge_core::backend::BackendState;
+    let out = tokio::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.louzt.Paperforge",
+            "--object-path",
+            "/org/louzt/Paperforge",
+            "--method",
+            "org.louzt.Paperforge1.ListRunning",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Expected shape: `([(123, 'running'), (456, 'paused')],)`.
+    // Slice out the `[...]` array, drop the outer parens.
+    let open = stdout.find('[')?;
+    let close = stdout.rfind(']')? + 1;
+    let body = stdout
+        .get(open..close)?
+        .trim_matches(|c: char| c == '[' || c == ']')
+        .trim();
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out_vec = Vec::new();
+    // Split by `), (` to get each (pid, 'state') tuple.
+    for tuple in body.split("), (") {
+        let cleaned = tuple.trim_start_matches('(').trim_end_matches(')');
+        let mut parts = cleaned.splitn(2, ',');
+        let pid_str = parts.next()?.trim();
+        let state_str = parts.next()?.trim().trim_matches('\'');
+        let pid: i32 = pid_str.parse().ok()?;
+        let state = match state_str {
+            "running" => BackendState::Running,
+            "paused" => BackendState::Paused,
+            _ => BackendState::NotRunning,
+        };
+        out_vec.push((pid, state));
+    }
+    Some(out_vec)
 }
