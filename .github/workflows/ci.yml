@@ -46,7 +46,8 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            libsoup-3.0-dev
+            libsoup-3.0-dev \
+            libxdo-dev
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
@@ -65,7 +66,8 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            libsoup-3.0-dev
+            libsoup-3.0-dev \
+            libxdo-dev
       - name: Run unit tests
         run: cargo test --all --no-fail-fast
       - name: Run doc tests
@@ -87,7 +89,8 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            libsoup-3.0-dev
+            libsoup-3.0-dev \
+            libxdo-dev
       - run: cargo build --release --locked
       - name: Smoke test (binary runs)
         run: |
