@@ -5,18 +5,34 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 rust-version.workspace = true
-description = "CLI for paperforge — set/pause/resume/list/scan/playlist over LWE backend"
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+documentation = "https://docs.rs/paperforge-cli"
+description = """
+CLI for paperforge — set / pause / resume / list / scan / audio /
+playlist over the LWE Workshop backend and alternative backends
+(swww / hyprpaper / mpvpaper).
+"""
 
 [[bin]]
 name = "paperforge"
 path = "src/main.rs"
 
 [dependencies]
-paperforge-core = { path = "../paperforge-core" }
+paperforge-core = { path = "../paperforge-core", version = "0.1.0" }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
+# `daemon` subcommand uses nix::sys::signal::{sigwait,...} because the
+# workspace `tokio` does not enable the `signal` feature. `chrono` is
+# used to stamp `DaemonEvent::MonitorChanged { at: ... }`. Both are
+# workspace-level deps already declared for paperforge-core.
+nix = { workspace = true }
+chrono = { workspace = true }
