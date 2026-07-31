@@ -30,7 +30,7 @@ your installed Workshop items.
 }
 ```
 
-`fill` options (mirrors waypaper):
+`fill` options:
 
 | Value | Behaviour |
 |---|---|

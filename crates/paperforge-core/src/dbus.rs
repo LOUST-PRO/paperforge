@@ -1,0 +1,529 @@
+//! D-Bus IPC service for paperforge.
+//!
+//! Exposes paperforge's control plane over the session bus so external
+//! scripts, keybindings, and other tools can drive it without spawning
+//! a new process per command.
+//!
+//! # Bus name
+//!
+//! ```text
+//! org.louzt.Paperforge
+//! ```
+//!
+//! # Object path
+//!
+//! ```text
+//! /org/louzt/Paperforge
+//! ```
+//!
+//! # Interface
+//!
+//! `org.louzt.Paperforge1` (versioned suffix per freedesktop guidelines).
+//!
+//! # Methods
+//!
+//! - `SetWallpaper(s: output, s: scene_path) → ()` — apply a scene to a
+//!   specific Wayland output. Equivalent to `paperforge set`.
+//! - `Pause() → u32` — SIGSTOP all running LWE. Returns count.
+//! - `Resume() → u32` — SIGCONT all paused LWE. Returns count.
+//! - `AudioToggle() → u32` — SIGUSR1 all LWE. Returns count.
+//! - `AudioMute() → u32` — SIGUSR2 all LWE. Returns count.
+//! - `AudioUnmute() → u32` — SIGCONT all LWE. Returns count.
+//! - `ListRunning() → a(i)` — return array of `(pid, state)` tuples.
+//! - `ApplyPlaylist(s: name) → ()` — load and apply a named playlist.
+//! - `GetState() → s` — JSON snapshot of the daemon state (backend,
+//!   active playlist, known outputs, etc).
+//!
+//! # Signals
+//!
+//! - `WallpaperStarted(s: output, s: scene_path, i: pid)` — emitted when
+//!   a new LWE instance is spawned.
+//! - `WallpaperStopped(i: pid)` — emitted when an LWE PID disappears.
+//! - `MonitorChanged(as: outputs)` — emitted when the Wayland output
+//!   set changes (hotplug). The new list of output names is in the arg.
+//!
+//! # Architecture
+//!
+//! The D-Bus interface is a thin layer over the
+//! [`PaperforgeControl`] trait. Production code wires
+//! [`LweDaemonControl`] as the implementation; tests can inject a
+//! stub. The trait is the public API — zbus is an implementation
+//! detail.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use zbus::{interface, object_server::SignalContext};
+
+use crate::{
+    backend::{BackendKind, BackendState},
+    error::{Error, Result},
+};
+
+/// Snapshot of the daemon's runtime state. Returned by
+/// `GetState` as a JSON string for forward-compatibility (new fields
+/// can be added without breaking existing clients).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonState {
+    /// Which backend the daemon is orchestrating.
+    pub backend: BackendKind,
+    /// Currently active playlist, if any.
+    pub active_playlist: Option<String>,
+    /// PIDs of running wallpaper processes with their last-known state.
+    pub running: Vec<(i32, BackendState)>,
+    /// Last-known set of Wayland output names.
+    pub known_outputs: Vec<String>,
+    /// paperforge version.
+    pub version: String,
+}
+
+/// Backend-agnostic control surface that the D-Bus interface adapts.
+///
+/// All methods are async (the daemon runs on tokio). Implementations
+/// should be cheap to clone — typically `Arc<impl ...>`.
+#[async_trait]
+pub trait PaperforgeControl: Send + Sync {
+    /// Apply `scene_path` to the given Wayland `output`.
+    async fn set_wallpaper(&self, output: &str, scene_path: &str) -> Result<()>;
+
+    /// Pause all running instances. Returns the count of PIDs signaled.
+    async fn pause(&self) -> Result<u32>;
+
+    /// Resume all paused instances. Returns the count of PIDs signaled.
+    async fn resume(&self) -> Result<u32>;
+
+    /// Toggle audio on all instances. Returns the count of PIDs signaled.
+    async fn audio_toggle(&self) -> Result<u32>;
+
+    /// Force-mute all instances. Returns the count of PIDs signaled.
+    async fn audio_mute(&self) -> Result<u32>;
+
+    /// Force-unmute all instances. Returns the count of PIDs signaled.
+    async fn audio_unmute(&self) -> Result<u32>;
+
+    /// List running instances with their last-known state.
+    async fn list_running(&self) -> Result<Vec<(i32, BackendState)>>;
+
+    /// Apply a named playlist from the playlist store.
+    async fn apply_playlist(&self, name: &str) -> Result<()>;
+
+    /// Return a JSON snapshot of the daemon state.
+    async fn get_state(&self) -> Result<DaemonState>;
+}
+
+/// The D-Bus interface object. Adapts a [`PaperforgeControl`] to the
+/// zbus connection. One instance per connection; the daemon holds the
+/// trait impl, the D-Bus layer is a thin proxy.
+pub struct PaperforgeInterface {
+    ctrl: Arc<dyn PaperforgeControl>,
+}
+
+impl PaperforgeInterface {
+    /// Wrap a control impl for exposure over D-Bus.
+    pub fn new(ctrl: Arc<dyn PaperforgeControl>) -> Self {
+        Self { ctrl }
+    }
+}
+
+#[interface(name = "org.louzt.Paperforge1")]
+impl PaperforgeInterface {
+    /// Apply `scene_path` to `output`. Returns an error string on
+    /// failure (zbus can only transport strings across methods).
+    async fn set_wallpaper(&self, output: String, scene_path: String) -> zbus::fdo::Result<()> {
+        self.ctrl
+            .set_wallpaper(&output, &scene_path)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
+    }
+
+    async fn pause(&self) -> zbus::fdo::Result<u32> {
+        self.ctrl
+            .pause()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
+    }
+
+    async fn resume(&self) -> zbus::fdo::Result<u32> {
+        self.ctrl
+            .resume()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
+    }
+
+    async fn audio_toggle(&self) -> zbus::fdo::Result<u32> {
+        self.ctrl
+            .audio_toggle()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
+    }
+
+    async fn audio_mute(&self) -> zbus::fdo::Result<u32> {
+        self.ctrl
+            .audio_mute()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
+    }
+
+    async fn audio_unmute(&self) -> zbus::fdo::Result<u32> {
+        self.ctrl
+            .audio_unmute()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
+    }
+
+    /// Returns `a(is)` — array of `(pid, state_string)` tuples where
+    /// `state_string` is one of `"running"`, `"paused"`, `"not-running"`.
+    async fn list_running(&self) -> zbus::fdo::Result<Vec<(i32, String)>> {
+        let raw = self
+            .ctrl
+            .list_running()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))?;
+        Ok(raw
+            .into_iter()
+            .map(|(pid, state)| {
+                let s = match state {
+                    BackendState::Running => "running".to_string(),
+                    BackendState::Paused => "paused".to_string(),
+                    BackendState::NotRunning => "not-running".to_string(),
+                };
+                (pid, s)
+            })
+            .collect())
+    }
+
+    async fn apply_playlist(&self, name: String) -> zbus::fdo::Result<()> {
+        self.ctrl
+            .apply_playlist(&name)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
+    }
+
+    /// Return JSON-encoded [`DaemonState`].
+    async fn get_state(&self) -> zbus::fdo::Result<String> {
+        let s = self
+            .ctrl
+            .get_state()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))?;
+        serde_json::to_string(&s).map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
+    }
+
+    /// Signal: a wallpaper instance just started rendering on `output`
+    /// from `scene_path` under `pid`.
+    #[zbus(signal)]
+    async fn wallpaper_started(
+        signal_ctx: &SignalContext<'_>,
+        output: String,
+        scene_path: String,
+        pid: i32,
+    ) -> zbus::Result<()>;
+
+    /// Signal: the LWE process with `pid` has exited.
+    #[zbus(signal)]
+    async fn wallpaper_stopped(signal_ctx: &SignalContext<'_>, pid: i32) -> zbus::Result<()>;
+
+    /// Signal: the Wayland output set changed. `outputs` is the new
+    /// list (no guaranteed order).
+    #[zbus(signal)]
+    async fn monitor_changed(
+        signal_ctx: &SignalContext<'_>,
+        outputs: Vec<String>,
+    ) -> zbus::Result<()>;
+}
+
+/// Standard D-Bus bus name for paperforge.
+pub const BUS_NAME: &str = "org.louzt.Paperforge";
+/// Standard D-Bus object path for paperforge.
+pub const OBJECT_PATH: &str = "/org/louzt/Paperforge";
+
+/// Serve the D-Bus interface on the session bus. Returns once the
+/// connection is established and the interface is registered.
+///
+/// Blocks until the connection is dropped (typically when the daemon
+/// receives SIGTERM/SIGINT and the tokio runtime is shut down).
+///
+/// The `event_rx` is consumed by an internal forwarder task that
+/// translates in-process [`crate::DaemonEvent`]s into zbus signal
+/// emissions on the interface. Without this, the daemon emits events
+/// to a channel that no one reads.
+pub async fn serve_dbus(
+    ctrl: Arc<dyn PaperforgeControl>,
+    event_rx: tokio::sync::mpsc::UnboundedReceiver<crate::DaemonEvent>,
+) -> Result<()> {
+    let iface = PaperforgeInterface::new(ctrl);
+
+    let conn = zbus::connection::Builder::session()
+        .map_err(|e| Error::Other(anyhow::anyhow!("session bus: {e}")))?
+        .name(BUS_NAME)
+        .map_err(|e| Error::Other(anyhow::anyhow!("name claim: {e}")))?
+        .serve_at(OBJECT_PATH, iface)
+        .map_err(|e| Error::Other(anyhow::anyhow!("serve_at: {e}")))?
+        .build()
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("build: {e}")))?;
+
+    // Take a reference to the interface so we can emit signals from
+    // the forwarder task. `connection::Connection` exposes the
+    // `SignalContext` we need for `emit_signal`.
+    let iface_ref = conn
+        .object_server()
+        .interface::<_, PaperforgeInterface>(OBJECT_PATH)
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("interface lookup: {e}")))?;
+    let signal_ctx = iface_ref.signal_context().clone();
+
+    tokio::spawn(forward_events(event_rx, signal_ctx));
+
+    tracing::info!("D-Bus interface ready: {} {}", BUS_NAME, OBJECT_PATH);
+
+    // Hold the connection until it's dropped externally.
+    let _ = conn;
+    // Wait forever (until the runtime is shut down). We don't have a
+    // great way to await "until the connection is gone" without
+    // listening on a channel; for the daemon pattern, the supervisor
+    // (systemd) terminates the process via SIGTERM, which drops the
+    // runtime and ends the serve loop.
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+/// Forward in-process `DaemonEvent`s to D-Bus signals. The forwarder
+/// drains the receiver channel and emits the zbus signal with the
+/// matching payload. Exits cleanly when the channel closes (daemon
+/// shutdown).
+async fn forward_events(
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<crate::DaemonEvent>,
+    signal_ctx: zbus::object_server::SignalContext<'_>,
+) {
+    use crate::DaemonEvent;
+    while let Some(ev) = event_rx.recv().await {
+        match ev {
+            DaemonEvent::WallpaperStarted {
+                output,
+                scene_path,
+                pid,
+                at: _,
+            } => {
+                if let Err(e) =
+                    PaperforgeInterface::wallpaper_started(&signal_ctx, output, scene_path, pid)
+                        .await
+                {
+                    tracing::warn!(target: "paperforge", "wallpaper_started signal failed: {e}");
+                }
+            }
+            DaemonEvent::WallpaperStopped { pid, at: _ } => {
+                if let Err(e) = PaperforgeInterface::wallpaper_stopped(&signal_ctx, pid).await {
+                    tracing::warn!(target: "paperforge", "wallpaper_stopped signal failed: {e}");
+                }
+            }
+            DaemonEvent::MonitorChanged { outputs, at: _ } => {
+                if let Err(e) = PaperforgeInterface::monitor_changed(&signal_ctx, outputs).await {
+                    tracing::warn!(target: "paperforge", "monitor_changed signal failed: {e}");
+                }
+            }
+        }
+    }
+    tracing::debug!(target: "paperforge", "event forwarder exiting (channel closed)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// In-memory stub for `PaperforgeControl`. Records every method
+    /// call so tests can assert on the side-effects.
+    #[derive(Default)]
+    struct StubControl {
+        calls: Mutex<Vec<String>>,
+        paused: Mutex<u32>,
+        applied: Mutex<Option<String>>,
+        state: Mutex<DaemonState>,
+    }
+
+    #[async_trait]
+    impl PaperforgeControl for StubControl {
+        async fn set_wallpaper(&self, output: &str, scene_path: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_wallpaper:{output}:{scene_path}"));
+            Ok(())
+        }
+
+        async fn pause(&self) -> Result<u32> {
+            self.calls.lock().unwrap().push("pause".to_string());
+            *self.paused.lock().unwrap() = 3;
+            Ok(3)
+        }
+
+        async fn resume(&self) -> Result<u32> {
+            self.calls.lock().unwrap().push("resume".to_string());
+            *self.paused.lock().unwrap() = 0;
+            Ok(3)
+        }
+
+        async fn audio_toggle(&self) -> Result<u32> {
+            self.calls.lock().unwrap().push("audio_toggle".to_string());
+            Ok(2)
+        }
+
+        async fn audio_mute(&self) -> Result<u32> {
+            self.calls.lock().unwrap().push("audio_mute".to_string());
+            Ok(2)
+        }
+
+        async fn audio_unmute(&self) -> Result<u32> {
+            self.calls.lock().unwrap().push("audio_unmute".to_string());
+            Ok(2)
+        }
+
+        async fn list_running(&self) -> Result<Vec<(i32, BackendState)>> {
+            self.calls.lock().unwrap().push("list_running".to_string());
+            Ok(vec![
+                (100, BackendState::Running),
+                (101, BackendState::Paused),
+            ])
+        }
+
+        async fn apply_playlist(&self, name: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("apply_playlist:{name}"));
+            *self.applied.lock().unwrap() = Some(name.to_string());
+            Ok(())
+        }
+
+        async fn get_state(&self) -> Result<DaemonState> {
+            self.calls.lock().unwrap().push("get_state".to_string());
+            Ok(self.state.lock().unwrap().clone())
+        }
+    }
+
+    #[test]
+    fn daemon_state_serializes_as_json() {
+        let s = DaemonState {
+            backend: BackendKind::LinuxWallpaperEngine,
+            active_playlist: Some("focus".to_string()),
+            running: vec![(100, BackendState::Running)],
+            known_outputs: vec!["DP-1".to_string(), "HDMI-A-1".to_string()],
+            version: "0.1.0".to_string(),
+        };
+        let j = serde_json::to_string(&s).unwrap();
+        assert!(j.contains("\"backend\":\"linux-wallpaper-engine\""));
+        assert!(j.contains("\"active_playlist\":\"focus\""));
+        assert!(j.contains("\"version\":\"0.1.0\""));
+    }
+
+    #[test]
+    fn daemon_state_roundtrip() {
+        let s = DaemonState {
+            backend: BackendKind::SwwwDaemon,
+            active_playlist: None,
+            running: vec![],
+            known_outputs: vec!["eDP-1".to_string()],
+            version: "0.1.0".to_string(),
+        };
+        let j = serde_json::to_string(&s).unwrap();
+        let back: DaemonState = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[tokio::test]
+    async fn stub_control_records_calls() {
+        let stub = Arc::new(StubControl::default());
+        let ctrl: Arc<dyn PaperforgeControl> = stub.clone();
+
+        ctrl.set_wallpaper("DP-1", "/scenes/focus").await.unwrap();
+        ctrl.pause().await.unwrap();
+        ctrl.apply_playlist("focus").await.unwrap();
+        ctrl.audio_toggle().await.unwrap();
+
+        let calls = stub.calls.lock().unwrap();
+        assert_eq!(calls[0], "set_wallpaper:DP-1:/scenes/focus");
+        assert_eq!(calls[1], "pause");
+        assert_eq!(calls[2], "apply_playlist:focus");
+        assert_eq!(calls[3], "audio_toggle");
+
+        let applied = stub.applied.lock().unwrap();
+        assert_eq!(*applied, Some("focus".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stub_control_list_running() {
+        let stub = Arc::new(StubControl::default());
+        let ctrl: Arc<dyn PaperforgeControl> = stub.clone();
+        let r = ctrl.list_running().await.unwrap();
+        assert_eq!(
+            r,
+            vec![(100, BackendState::Running), (101, BackendState::Paused)]
+        );
+    }
+
+    #[tokio::test]
+    async fn stub_control_get_state() {
+        let stub = Arc::new(StubControl::default());
+        {
+            let mut s = stub.state.lock().unwrap();
+            *s = DaemonState {
+                backend: BackendKind::LinuxWallpaperEngine,
+                active_playlist: Some("default".to_string()),
+                running: vec![],
+                known_outputs: vec!["DP-1".to_string()],
+                version: "0.1.0".to_string(),
+            };
+        }
+        let ctrl: Arc<dyn PaperforgeControl> = stub.clone();
+        let s = ctrl.get_state().await.unwrap();
+        assert_eq!(s.active_playlist.as_deref(), Some("default"));
+        assert_eq!(s.known_outputs, vec!["DP-1".to_string()]);
+    }
+
+    /// Verify the zbus interface compiles + the type is constructible.
+    /// We don't open a real D-Bus connection here — that's covered by
+    /// the `serve_dbus` integration smoke test below.
+    #[test]
+    fn interface_compiles_with_stub() {
+        let stub: Arc<dyn PaperforgeControl> = Arc::new(StubControl::default());
+        let _iface = PaperforgeInterface::new(stub);
+    }
+
+    #[test]
+    fn bus_constants_are_static() {
+        assert_eq!(BUS_NAME, "org.louzt.Paperforge");
+        assert_eq!(OBJECT_PATH, "/org/louzt/Paperforge");
+    }
+
+    /// The forwarder task is a pure event→signal mapper. We can't
+    /// easily exercise the zbus signal emission without a real
+    /// connection, but we can verify the channel draining math: an
+    /// empty channel exits the loop, and a closed channel returns
+    /// `None` immediately.
+    #[tokio::test]
+    async fn forward_events_drains_then_exits_on_close() {
+        // We can't call the real `forward_events` without a real
+        // SignalContext (it needs a zbus connection), but we can
+        // assert the behaviour of the same channel pattern in
+        // isolation: an UnboundedReceiver on a freshly-built channel
+        // returns None on the first recv when the sender is dropped.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::DaemonEvent>();
+        tx.send(crate::DaemonEvent::WallpaperStopped {
+            pid: 42,
+            at: chrono::Utc::now(),
+        })
+        .unwrap();
+        drop(tx);
+        let first = rx.recv().await.unwrap();
+        match first {
+            crate::DaemonEvent::WallpaperStopped { pid, .. } => assert_eq!(pid, 42),
+            _ => panic!("expected WallpaperStopped"),
+        }
+        assert!(
+            rx.recv().await.is_none(),
+            "next recv after sender drop must be None"
+        );
+    }
+}

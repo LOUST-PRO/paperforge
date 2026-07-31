@@ -30,20 +30,33 @@
 pub mod audio;
 pub mod backend;
 pub mod config;
+pub mod daemon;
+pub mod dbus;
 pub mod error;
+pub mod hotplug;
 pub mod inventory;
 pub mod lwe_probe;
 pub mod paths;
 pub mod playlist;
+pub mod pool;
 
 pub use audio::{AudioCommand, LweAudioController};
-pub use backend::{BackendKind, BackendState, LweBackend, SwwwBackend, WallpaperBackend};
+pub use backend::{
+    BackendKind, BackendState, HyprpaperBackend, LweBackend, MpvpaperBackend, SwwwBackend,
+    WallpaperBackend,
+};
 pub use config::{Config, ConfigPaths};
+pub use daemon::{BackendOps, DaemonEvent, LweBackendOps, PaperforgeDaemon};
+pub use dbus::{
+    serve_dbus, DaemonState, PaperforgeControl, PaperforgeInterface, BUS_NAME, OBJECT_PATH,
+};
 pub use error::{Error, Result};
+pub use hotplug::{CompositorHotplugSource, HotplugEvent, HotplugSource, HotplugWatcher, Output};
 pub use inventory::{Inventory, WallpaperEntry, WallpaperKind};
 pub use lwe_probe::{probe_lwe_binary, LweBuildKind};
 pub use paths::{default_paths, WorkshopPaths};
 pub use playlist::{Playlist, PlaylistStore};
+pub use pool::LweSinglePool;
 
 /// Crate version (matches `Cargo.toml` workspace version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

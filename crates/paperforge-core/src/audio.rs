@@ -40,9 +40,7 @@ use crate::{
 
 /// Signal-dispatch function: receives the signal + pid and either
 /// performs the kill (default) or records the call (tests).
-pub type DispatchFn = dyn Fn(nix::sys::signal::Signal, i32) -> std::io::Result<()>
-    + Send
-    + Sync;
+pub type DispatchFn = dyn Fn(nix::sys::signal::Signal, i32) -> std::io::Result<()> + Send + Sync;
 
 /// Commands that can be sent to LWE's audio control plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,23 +228,25 @@ impl LweAudioController {
     /// Internal: dispatch the signal without the safety check. Called
     /// by `send` after the gate passes.
     async fn send_unchecked(&self, cmd: AudioCommand) -> Result<usize> {
-        let pids = self.backend.list_pids().await?;
-        if pids.is_empty() {
+        // Read the pool directly rather than `backend.list_pids()`.
+        // The pool is the single source of truth for which LWE pid
+        // is alive — `list_pids()` is a /proc walk that would also
+        // pick up orphans we don't own.
+        let pid = self.backend.pool().current_pid().await;
+        let Some(pid) = pid else {
             return Err(Error::BackendUnreachable {
                 kind: "linux-wallpaperengine".to_string(),
                 message: "no LWE instances running".to_string(),
             });
-        }
+        };
 
-        for pid in &pids {
-            (self.dispatch)(cmd.signal(), *pid).map_err(|e| Error::BackendFailure {
-                kind: "linux-wallpaperengine".to_string(),
-                message: format!("signal {:?} to pid {pid} failed: {e}", cmd.signal()),
-            })?;
-        }
+        (self.dispatch)(cmd.signal(), pid).map_err(|e| Error::BackendFailure {
+            kind: "linux-wallpaperengine".to_string(),
+            message: format!("signal {:?} to pid {pid} failed: {e}", cmd.signal()),
+        })?;
 
-        tracing::info!("sent {:?} to {} LWE pid(s)", cmd, pids.len());
-        Ok(pids.len())
+        tracing::info!("sent {:?} to pool pid {pid}", cmd);
+        Ok(1)
     }
 
     /// Convenience: toggle audio on all LWE instances.
@@ -326,9 +326,8 @@ mod tests {
 
     /// Signal-dispatch function: receives the signal + pid and either
     /// performs the kill (default) or records the call (tests).
-    pub type DispatchFn = dyn Fn(nix::sys::signal::Signal, i32) -> std::io::Result<()>
-        + Send
-        + Sync;
+    pub type DispatchFn =
+        dyn Fn(nix::sys::signal::Signal, i32) -> std::io::Result<()> + Send + Sync;
 
     /// Recorded signal + pid pair, used by test helpers to assert
     /// what the safety gate let through without dispatching.
