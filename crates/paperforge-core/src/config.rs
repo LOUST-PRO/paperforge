@@ -10,9 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     backend::{BackendKind, LweBackend},
+    daemon::LweBackendOps,
     error::{Error, Result},
     paths::{default_paths, WorkshopPaths},
 };
+use std::sync::Arc;
 
 /// Paths used at runtime for config, playlists, cache.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,9 +97,24 @@ pub struct Config {
     /// command.
     #[serde(default)]
     pub lwe_supports_audio_signals: Option<bool>,
+    /// When `true` (default), paperforge uses a single LWE process
+    /// with multi-output argv (the v0.2 pool architecture). When
+    /// `false` (legacy v0.1), each output gets its own LWE process
+    /// — slower, ~3× more RSS, but bypasses any pool bug by falling
+    /// back to per-process mode.
+    ///
+    /// Operators can disable the pool via `[pool_enabled]` in
+    /// `~/.config/paperforge/config.toml` if they hit an edge case
+    /// (e.g. a specific LWE build that mishandles merged argv).
+    #[serde(default = "default_pool_enabled")]
+    pub pool_enabled: bool,
 }
 
 fn default_true() -> bool {
+    true
+}
+
+fn default_pool_enabled() -> bool {
     true
 }
 
@@ -111,6 +128,7 @@ impl Default for Config {
             auto_pause_on_game: true,
             auto_mute_on_fullscreen: true,
             lwe_supports_audio_signals: None,
+            pool_enabled: true,
         }
     }
 }
@@ -151,8 +169,27 @@ impl Config {
             // Future: route to SwwwBackend / HyprpaperBackend here.
             // Today the CLI is LWE-only; this branch is unreachable
             // in practice until we add a `--backend swww` flag.
-            BackendKind::SwwwDaemon => LweBackend::new(),
+            BackendKind::SwwwDaemon | BackendKind::Hyprpaper | BackendKind::Mpvpaper => {
+                LweBackend::new()
+            }
         }
+    }
+
+    /// Build the daemon-side [`LweBackendOps`] this config describes.
+    ///
+    /// Differs from [`backend()`](Self::backend) in two ways:
+    /// 1. Returns an `Arc<dyn BackendOps>` compatible with the daemon
+    ///    entry point (which stores the backend as a trait object).
+    /// 2. Reads [`pool_enabled`](Self::pool_enabled) and passes
+    ///    `use_pool = pool_enabled` to `LweBackendOps`. Setting
+    ///    `pool_enabled = false` in `config.toml` flips the daemon
+    ///    to the v0.1 per-output spawn path.
+    pub fn build_backend_ops(&self) -> Arc<LweBackendOps> {
+        let ops = match &self.backend_binary {
+            Some(p) => LweBackendOps::with_binary_and_pool(p, self.pool_enabled),
+            None => LweBackendOps::with_pool(self.pool_enabled),
+        };
+        Arc::new(ops)
     }
 
     /// All source roots: defaults + extras.
@@ -293,6 +330,75 @@ mod tests {
         assert!(
             roots.iter().any(|p| p == &extra),
             "extra_sources must appear in source_roots()"
+        );
+    }
+
+    #[test]
+    fn default_pool_enabled_is_true() {
+        // The pool architecture is the v0.2 default. Operators opt
+        // out via `pool_enabled = false` in config.toml.
+        let cfg = Config::default();
+        assert!(cfg.pool_enabled, "pool_enabled must default to true");
+    }
+
+    #[test]
+    fn roundtrip_pool_enabled_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths {
+            config_dir: tmp.path().to_path_buf(),
+            playlists_dir: tmp.path().join("playlists"),
+            cache_dir: tmp.path().join("cache"),
+            thumbnails_dir: tmp.path().join("cache").join("thumbnails"),
+            inventory_cache: tmp.path().join("cache").join("inventory.json"),
+        };
+        for d in [
+            &paths.config_dir,
+            &paths.playlists_dir,
+            &paths.cache_dir,
+            &paths.thumbnails_dir,
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let cfg = Config {
+            pool_enabled: false,
+            ..Config::default()
+        };
+        cfg.save(&paths).unwrap();
+        let loaded = Config::load(&paths).unwrap();
+        assert!(
+            !loaded.pool_enabled,
+            "pool_enabled=false must roundtrip through toml"
+        );
+    }
+
+    #[test]
+    fn build_backend_ops_respects_pool_enabled() {
+        let cfg_pool = Config::default();
+        assert!(cfg_pool.pool_enabled);
+        let ops_pool = cfg_pool.build_backend_ops();
+        assert!(ops_pool.use_pool(), "pool_enabled=true → use_pool=true");
+
+        let cfg_no_pool = Config {
+            pool_enabled: false,
+            ..Config::default()
+        };
+        let ops_no_pool = cfg_no_pool.build_backend_ops();
+        assert!(
+            !ops_no_pool.use_pool(),
+            "pool_enabled=false → use_pool=false"
+        );
+    }
+
+    #[test]
+    fn build_backend_ops_with_binary_path() {
+        let cfg = Config {
+            backend_binary: Some(PathBuf::from("/opt/lwe/linux-wallpaperengine")),
+            ..Config::default()
+        };
+        let ops = cfg.build_backend_ops();
+        assert_eq!(
+            ops.backend().binary_path.as_deref(),
+            Some(Path::new("/opt/lwe/linux-wallpaperengine"))
         );
     }
 }

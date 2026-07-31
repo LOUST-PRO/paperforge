@@ -12,8 +12,12 @@ edition = "2021"
 license = "MIT"
 authors = ["Lou Mireles <davidmirelesll@outlook.com>"]
 repository = "https://github.com/louzt/paperforge"
+homepage = "https://github.com/louzt/paperforge"
+readme = "README.md"
+publish = true
 rust-version = "1.75"
-
+keywords = ["wallpaper", "wallpaper-engine", "wayland", "linux", "workshop"]
+categories = ["command-line-utilities", "api-bindings", "filesystem"]
 [workspace.dependencies]
 # Async runtime (net-unix is included via `net`)
 tokio = { version = "1", features = ["fs", "process", "net", "sync", "time", "macros", "rt-multi-thread"] }
@@ -45,6 +49,9 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Path helpers
 dirs = "5"
+
+# D-Bus IPC service (Fase 6D — zbus-based daemon control)
+zbus = { version = "4", default-features = false, features = ["tokio"] }
 
 [profile.release]
 lto = "thin"

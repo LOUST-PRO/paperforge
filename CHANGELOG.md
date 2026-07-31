@@ -53,7 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 24 unit tests covering all public APIs.
 
 ### Provenance
-- Designed to complement (not replace) [`waypaper`](https://github.com/anufrievroman/waypaper).
+- Designed to focus on what's missing in generic Wayland wallpaper
+  switchers (per-monitor playlists, audio control via signals, etc).
 - License: MIT.
 - Backend: [`louzt/linux-wallpaperengine`](https://github.com/louzt/linux-wallpaperengine) (GPL-3.0) via IPC.
 
