@@ -4,8 +4,8 @@
 > / list / scan / audio / playlist over the LWE Workshop backend and
 > alternative backends (swww / hyprpaper / mpvpaper).
 >
-> 📖 **Workspace overview**: see the [main README](https://github.com/louzt/paperforge).
-> 🇪🇸 [Documentación en español](https://github.com/louzt/paperforge/blob/main/docs/README.es.md).
+> 📖 **Workspace overview**: see the [main README](https://github.com/LOUST-PRO/paperforge).
+> 🇪🇸 [Documentación en español](https://github.com/LOUST-PRO/paperforge/blob/main/docs/README.es.md).
 
 ## Install
 
@@ -13,7 +13,7 @@
 cargo install paperforge-cli
 
 # Or from source
-git clone https://github.com/louzt/paperforge
+git clone https://github.com/LOUST-PRO/paperforge
 cd paperforge
 cargo build --release
 sudo install -m 0755 target/release/paperforge /usr/local/bin/
@@ -102,7 +102,7 @@ extra_sources = ["/data/wallpapers"]
 require_explicit = true            # refuse SIGUSR1/2 unless explicitly toggled
 ```
 
-See [`examples/config.toml`](https://github.com/louzt/paperforge/blob/main/examples/config.toml)
+See [`examples/config.toml`](https://github.com/LOUST-PRO/paperforge/blob/main/examples/config.toml)
 for the annotated reference.
 
 ## Exit codes

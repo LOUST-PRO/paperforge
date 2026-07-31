@@ -4,8 +4,8 @@
 > backend IPC via POSIX signals, per-monitor playlists, audio toggle,
 > and a trait-based backend abstraction.
 >
-> 📖 **Workspace overview & install**: see the [main README](https://github.com/louzt/paperforge).
-> 🇪🇸 [Documentación en español](https://github.com/louzt/paperforge/blob/main/docs/README.es.md).
+> 📖 **Workspace overview & install**: see the [main README](https://github.com/LOUST-PRO/paperforge).
+> 🇪🇸 [Documentación en español](https://github.com/LOUST-PRO/paperforge/blob/main/docs/README.es.md).
 
 ## What's in this crate?
 
@@ -107,4 +107,4 @@ cargo test  -p paperforge-core --lib        # 120 tests
 cargo clippy -p paperforge-core --all-targets -- -D warnings
 ```
 
-License: MIT. See [LICENSE](https://github.com/louzt/paperforge/blob/main/LICENSE).
+License: MIT. See [LICENSE](https://github.com/LOUST-PRO/paperforge/blob/main/LICENSE).

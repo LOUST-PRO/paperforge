@@ -5,7 +5,7 @@
 > inventory. Four panels on independent timers (2s / 5s / 10s / 30s),
 > vim-friendly keys.
 >
-> 📖 **Workspace overview**: see the [main README](https://github.com/louzt/paperforge).
+> 📖 **Workspace overview**: see the [main README](https://github.com/LOUST-PRO/paperforge).
 
 ## What is this?
 

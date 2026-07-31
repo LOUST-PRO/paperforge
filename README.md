@@ -35,7 +35,7 @@ The killer feature is **per-monitor reusable playlists**: define
 cargo install paperforge-cli
 
 # From source
-git clone https://github.com/louzt/paperforge
+git clone https://github.com/LOUST-PRO/paperforge
 cd paperforge
 cargo build --release
 sudo install -m 0755 target/release/paperforge /usr/local/bin/

@@ -58,5 +58,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - License: MIT.
 - Backend: [`louzt/linux-wallpaperengine`](https://github.com/louzt/linux-wallpaperengine) (GPL-3.0) via IPC.
 
-[Unreleased]: https://github.com/louzt/paperforge/compare/0.1.0...HEAD
-[0.1.0]: https://github.com/louzt/paperforge/releases/tag/0.1.0
+[Unreleased]: https://github.com/LOUST-PRO/paperforge/compare/0.1.0...HEAD
+[0.1.0]: https://github.com/LOUST-PRO/paperforge/releases/tag/0.1.0

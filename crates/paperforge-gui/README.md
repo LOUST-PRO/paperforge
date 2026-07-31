@@ -4,7 +4,7 @@
 > progress. Same `paperforge-core` library, lazy-load video previews
 > and visual playlist editor.
 >
-> 📖 **Workspace overview**: see the [main README](https://github.com/louzt/paperforge).
+> 📖 **Workspace overview**: see the [main README](https://github.com/LOUST-PRO/paperforge).
 
 ## Status
 
@@ -39,7 +39,7 @@ stabilize this GUI when 0.8 hits stable. See
 
 ```bash
 # Currently only buildable from source
-git clone https://github.com/louzt/paperforge
+git clone https://github.com/LOUST-PRO/paperforge
 cd paperforge
 cargo build --release -p paperforge-gui
 
