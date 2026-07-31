@@ -27,6 +27,7 @@ use paperforge_core::{
     inventory::Inventory,
     paths::default_paths,
     playlist::PlaylistStore,
+    updater::{Channel, UpdateInfo, Updater, UpdaterConfig},
 };
 
 /// `paperforge` — Wallpaper Engine Workshop manager for Linux.
@@ -80,6 +81,32 @@ enum Cmd {
     /// Start the LWE pool daemon (D-Bus service + hotplug watcher).
     /// Blocks until SIGINT/SIGTERM, then performs graceful shutdown.
     Daemon,
+    /// Self-update: query, apply, or roll back a paperforge upgrade.
+    /// Off-by-default; requires `enabled = true` in
+    /// `~/.config/paperforge/updater.toml`.
+    SelfUpdate {
+        /// Just query the GitHub release feed; print result, exit.
+        #[arg(long)]
+        check: bool,
+        /// Download, verify (SHA-256), and atomically swap the binary.
+        #[arg(long)]
+        apply: bool,
+        /// Track pre-releases instead of stable (with --check/--apply).
+        #[arg(long)]
+        pre: bool,
+        /// Restore the most recent backup (undoes the last --apply).
+        #[arg(long)]
+        rollback: bool,
+        /// Skip the confirmation prompt before --apply / --rollback.
+        #[arg(long)]
+        yes: bool,
+        /// List retained backups (newest first).
+        #[arg(long)]
+        list_backups: bool,
+        /// Print the loaded updater config and exit.
+        #[arg(long)]
+        config: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -299,8 +326,161 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Daemon => {
             run_daemon(cfg).await?;
         }
+        Cmd::SelfUpdate {
+            check,
+            apply,
+            pre,
+            rollback,
+            yes,
+            list_backups,
+            config: show_config,
+        } => {
+            let opts = SelfUpdateOpts {
+                check,
+                apply,
+                pre,
+                rollback,
+                yes,
+                list_backups,
+                config: show_config,
+            };
+            run_self_update(&paths, opts).await?;
+        }
     }
     Ok(())
+}
+
+async fn run_self_update(paths: &ConfigPaths, opts: SelfUpdateOpts) -> anyhow::Result<()> {
+    let updater_cfg_path = paths.config_dir.join("updater.toml");
+    let mut updater_cfg = UpdaterConfig::load_or_default(&updater_cfg_path)?;
+
+    if opts.pre {
+        updater_cfg.channel = Channel::Pre;
+    }
+
+    if opts.config {
+        println!(
+            "config file: {}\n{}",
+            updater_cfg_path.display(),
+            toml::to_string_pretty(&updater_cfg)?
+        );
+        return Ok(());
+    }
+
+    if opts.list_backups {
+        let updater = Updater::new(updater_cfg)?;
+        let backups = updater.list_backups()?;
+        if backups.is_empty() {
+            println!("(no backups retained)");
+        } else {
+            for b in backups {
+                println!(
+                    "{}\t{}\t{}",
+                    b.version,
+                    b.created_at.to_rfc3339(),
+                    b.path.display()
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if opts.rollback {
+        let updater = Updater::new(updater_cfg)?;
+        if !opts.yes {
+            let backups = updater.list_backups()?;
+            let newest = backups
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("no backups to roll back to"))?;
+            eprintln!(
+                "About to roll back to version '{}' from {}",
+                newest.version,
+                newest.path.display()
+            );
+            eprintln!(
+                "This will replace the running binary at {}.",
+                updater.binary_path().display()
+            );
+            eprintln!("Re-run with --yes to skip this prompt.");
+            return Ok(());
+        }
+        let restored = updater.rollback().await?;
+        println!(
+            "rolled back to {} (backup: {})",
+            restored.version,
+            restored.path.display()
+        );
+        return Ok(());
+    }
+
+    // check / apply path
+    let updater = Updater::new(updater_cfg)?;
+    let info = updater.check().await?;
+    print_check_summary(&info);
+
+    if !info.update_available {
+        return Ok(());
+    }
+    if opts.check || !opts.apply {
+        // Default when no flag is given: behave like --check.
+        eprintln!("run with --apply to install this update (--yes to skip prompt).");
+        return Ok(());
+    }
+
+    if !opts.yes {
+        eprintln!(
+            "About to apply update {} -> {} (asset {}).",
+            info.current_version, info.latest_version, info.asset_name,
+        );
+        eprintln!(
+            "This will replace the binary at {} and create a backup.",
+            updater.binary_path().display()
+        );
+        eprintln!("Re-run with --yes to skip this prompt.");
+        return Ok(());
+    }
+
+    // We need a fresh info with the SHA-256 populated. The check
+    // path leaves it blank (deferred fetch). Re-fetch it here.
+    let backup = updater.apply(&info).await?;
+    println!(
+        "updated {} -> {} (backup at {}).",
+        info.current_version,
+        info.latest_version,
+        backup.path.display()
+    );
+    Ok(())
+}
+
+/// Aggregated options for `self-update`, parsed out of the clap
+/// subcommand fields so the worker function does not trip
+/// `clippy::too_many_arguments`.
+#[derive(Debug)]
+struct SelfUpdateOpts {
+    check: bool,
+    apply: bool,
+    pre: bool,
+    rollback: bool,
+    yes: bool,
+    list_backups: bool,
+    config: bool,
+}
+
+fn print_check_summary(info: &UpdateInfo) {
+    println!("current: {}", info.current_version);
+    println!("latest:  {} ({})", info.latest_version, info.release_tag);
+    println!("asset:   {}", info.asset_name);
+    if let Some(sz) = info.size_bytes {
+        println!("size:    {} bytes", sz);
+    }
+    if info.is_prerelease {
+        println!("(this release is a pre-release)");
+    }
+    if info.update_available {
+        println!("status:  update available");
+    } else {
+        println!("status:  up to date");
+    }
 }
 
 async fn run_daemon(cfg: Config) -> anyhow::Result<()> {

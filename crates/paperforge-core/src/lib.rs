@@ -39,6 +39,7 @@ pub mod lwe_probe;
 pub mod paths;
 pub mod playlist;
 pub mod pool;
+pub mod updater;
 
 pub use audio::{AudioCommand, LweAudioController};
 pub use backend::{
@@ -57,6 +58,7 @@ pub use lwe_probe::{probe_lwe_binary, LweBuildKind};
 pub use paths::{default_paths, WorkshopPaths};
 pub use playlist::{Playlist, PlaylistStore};
 pub use pool::LweSinglePool;
+pub use updater::{BackupEntry, Channel, UpdateInfo, Updater, UpdaterConfig};
 
 /// Crate version (matches `Cargo.toml` workspace version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
