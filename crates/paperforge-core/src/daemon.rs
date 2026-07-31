@@ -159,13 +159,18 @@ impl BackendOps for LweBackendOps {
             // daemon's event channel.
             let _pid = self.set_with_pid(output, scene).await?;
         } else {
-            // v0.1 legacy: per-output spawn. The `WallpaperBackend`
-            // shim already implements this path; the only thing we
-            // lose in this branch is the pid (the legacy implementation
-            // doesn't surface it). Returning 0 is acknowledged by the
-            // `DaemonEvent::WallpaperStarted { pid: 0 }` payload.
+            // v0.1 legacy: per-output spawn. One LWE process per
+            // monitor — bypasses any merged-argv bug in the upstream
+            // LWE binary. The pid is tracked in `per_output_pids`,
+            // not exposed to the caller here (legacy semantics).
             let path = std::path::Path::new(scene);
-            self.backend.set(path, Some(output)).await?;
+            let pid = self.backend.set_per_output(path, output).await?;
+            tracing::info!(
+                "per-output spawn: output={} scene={} pid={}",
+                output,
+                scene,
+                pid,
+            );
         }
         Ok(())
     }
@@ -187,15 +192,27 @@ impl BackendOps for LweBackendOps {
     }
 
     async fn pause(&self) -> Result<usize> {
-        self.backend.pause().await
+        if self.use_pool {
+            self.backend.pause().await
+        } else {
+            self.backend.pause_per_output().await
+        }
     }
 
     async fn resume(&self) -> Result<usize> {
-        self.backend.resume().await
+        if self.use_pool {
+            self.backend.resume().await
+        } else {
+            self.backend.resume_per_output().await
+        }
     }
 
     async fn list(&self) -> Result<Vec<(i32, BackendState)>> {
-        let pids = self.backend.list_pids().await?;
+        let pids = if self.use_pool {
+            self.backend.list_pids().await?
+        } else {
+            self.backend.list_per_output_pids().await
+        };
         let mut out = Vec::with_capacity(pids.len());
         for pid in pids {
             let s = self.backend.state(pid).await?;

@@ -153,11 +153,24 @@ async fn main() -> anyhow::Result<()> {
             println!("resumed {n} LWE instance(s)");
         }
         Cmd::List => {
-            let status = PlaylistStore::lwe_status(&backend).await?;
-            if status.is_empty() {
+            // Prefer the daemon's view of LWE PIDs (via D-Bus) over
+            // the local `backend.list_pids()` — when the daemon owns
+            // the per-output children, only the daemon knows their
+            // pids. Fall back to the local backend if no daemon is
+            // reachable. We shell out to `gdbus` rather than linking
+            // zbus into the CLI (keeps the CLI hermetic — only the
+            // daemon process links the session bus).
+            let pid_state_pairs: Vec<(i32, BackendState)> = match list_via_dbus().await {
+                Some(v) => v,
+                None => {
+                    let map = PlaylistStore::lwe_status(&backend).await?;
+                    map.into_iter().collect()
+                }
+            };
+            if pid_state_pairs.is_empty() {
                 println!("(no LWE instances running)");
             } else {
-                for (pid, state) in status {
+                for (pid, state) in pid_state_pairs {
                     let s = match state {
                         BackendState::Running => "running",
                         BackendState::Paused => "paused",
@@ -360,4 +373,57 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<&'static str> {
     });
     rx.await
         .map_err(|e| anyhow::anyhow!("shutdown channel: {e}"))
+}
+
+/// Query the daemon's `ListRunning` D-Bus method via `gdbus`.
+///
+/// Returns `None` if the daemon is not running on the session bus
+/// (so the caller should fall back to the local backend).
+async fn list_via_dbus() -> Option<Vec<(i32, paperforge_core::backend::BackendState)>> {
+    use paperforge_core::backend::BackendState;
+    let out = tokio::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.louzt.Paperforge",
+            "--object-path",
+            "/org/louzt/Paperforge",
+            "--method",
+            "org.louzt.Paperforge1.ListRunning",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Expected shape: `([(123, 'running'), (456, 'paused')],)`.
+    // Slice out the `[...]` array, drop the outer parens.
+    let open = stdout.find('[')?;
+    let close = stdout.rfind(']')? + 1;
+    let body = stdout
+        .get(open..close)?
+        .trim_matches(|c: char| c == '[' || c == ']')
+        .trim();
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out_vec = Vec::new();
+    // Split by `), (` to get each (pid, 'state') tuple.
+    for tuple in body.split("), (") {
+        let cleaned = tuple.trim_start_matches('(').trim_end_matches(')');
+        let mut parts = cleaned.splitn(2, ',');
+        let pid_str = parts.next()?.trim();
+        let state_str = parts.next()?.trim().trim_matches('\'');
+        let pid: i32 = pid_str.parse().ok()?;
+        let state = match state_str {
+            "running" => BackendState::Running,
+            "paused" => BackendState::Paused,
+            _ => BackendState::NotRunning,
+        };
+        out_vec.push((pid, state));
+    }
+    Some(out_vec)
 }
