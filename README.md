@@ -1,157 +1,174 @@
 # paperforge
-Frontends Rust para `linux-wallpaperengine` Workshop en Linux.
 
-> **Status**: Pre-0.1.0 (Fase 6A in progress). API surface todavía puede cambiar.
+Rust frontends for **Wallpaper Engine Workshop** scenes on Linux.
 
-## Que es?
+> **Status**: v0.1.0-rc1 — pre-release. API may change before 0.1.0.
+> **License**: MIT. Backend IPC to `linux-wallpaperengine` (GPL-3.0)
+> preserves license cleanliness via process isolation.
 
-`paperforge` gestiona los wallpapers animados de **Wallpaper Engine Workshop**
-sobre Linux. Hoy se enfoca en el backend `linux-wallpaperengine` (fork
-de Almamu mantenido por `louzt/`) que renderiza escenas Workshop.
+## What is it?
 
-Stack:
-- **Workspace Rust** (3 crates: `paperforge-core`, `paperforge-cli`,
-  `paperforge-tui`)
-- **MIT licensed** — `paperforge-core` habla con LWE via subprocess
-  + POSIX signals (separación de procesos = licencia clean respecto al
-  GPL-3.0 de LWE)
-- **Backend-friendly**: `WallpaperBackend` trait permite añadir swww,
-  hyprpaper, mpvpaper, awww como backends alternativos en el futuro
+`paperforge` is a Rust workspace that orchestrates animated wallpapers
+on Wayland. It launches Workshop scenes, manages playlists, toggles
+audio, and exposes a debug TUI — all without re-implementing a
+renderer.
 
-## Por que no waypaper?
+The feature set focuses on what's missing in most generic Wayland
+wallpaper switchers:
 
-[`waypaper`](https://github.com/anufrievroman/waypaper) es excelente y
-OSS. `paperforge` lo complementa (no lo reemplaza) con:
-
-| Feature | waypaper | paperforge |
+| Feature | Typical switchers | paperforge |
 |---|---|---|
-| GUI GTK | ✅ | 🚧 Fase 6C (Dioxus) |
-| CLI | basico | ✅ (set/pause/resume/list/scan/audio/playlist) |
-| **Playlists por monitor** | ❌ | ✅ (`playlist apply focus`) |
-| Audio toggle via IPC | ❌ | ✅ (SIGUSR1/SIGUSR2) |
-| Auto-detect Steam + Flatpak | parcial | ✅ |
-| Inventory con mtime | ❌ | ✅ |
-| Inventario raw JSON via `scan` | ❌ | ✅ |
+| Per-monitor playlists | ❌ | ✅ `paperforge playlist apply focus` |
+| Audio control via POSIX signals | ❌ | ✅ `paperforge audio toggle` |
+| Steam + Flatpak auto-detect | partial | ✅ |
+| Inventory with mtime | ❌ | ✅ |
+| Read-only TUI debugger | ❌ | ✅ `paperforge-tui` |
+| Multiple backends (LWE, swww, hyprpaper, mpvpaper) | ❌ | ✅ |
 
-La killer feature es **playlists reutilizables por monitor** — con
-waypaper cada wallpaper es one-off, con nosotros guardas listas
-`focus` / `cyberpunk` / `gaming` y las aplicas en un comando.
+The killer feature is **per-monitor reusable playlists**: define
+`focus` / `cyberpunk` / `gaming` once, apply on demand.
+
+## Install
+
+```bash
+# crates.io (once published)
+cargo install paperforge-cli
+
+# From source
+git clone https://github.com/louzt/paperforge
+cd paperforge
+cargo build --release
+sudo install -m 0755 target/release/paperforge /usr/local/bin/
+```
+
+Requires `rustc >= 1.75`, `pkg-config`, Linux (uses `/proc/<pid>/status`
+directly).
 
 ## Quickstart
 
 ```bash
-# Build (release)
-cargo build --release
+# Discover what your system has
+paperforge paths
 
-# Smoke test
-./target/release/paperforge paths
-./target/release/paperforge list
-./target/release/paperforge scan --max-depth 2
+# List running wallpapers
+paperforge list
 
-# Lanzar wallpaper (Workshop scene)
-./target/release/paperforge set \
-  ~/.steam/root/steamapps/workshop/content/431960/1234567 \
+# Launch a Workshop scene on a specific output
+paperforge set ~/.steam/root/steamapps/workshop/content/431960/1234567 \
   --output DP-1
 
-# Pausar todos los LWE (libera GPU/CPU)
-./target/release/paperforge pause
+# Free GPU/CPU without quitting
+paperforge pause && paperforge resume
 
-# Reanudar
-./target/release/paperforge resume
+# Save and apply a playlist
+paperforge playlist save focus scene1 scene2 scene3 \
+  --output DP-1 --output DP-2
+paperforge playlist apply focus
 
-# Audio
-./target/release/paperforge audio toggle
-./target/release/paperforge audio mute
-./target/release/paperforge audio unmute
-
-# Playlists
-./target/release/paperforge playlist list
-./target/release/paperforge playlist show focus
-./target/release/paperforge playlist apply focus
-./target/release/paperforge playlist delete focus
+# Debug interactively
+paperforge-tui
 ```
 
-## Subcomandos
+## Subcommands
 
 ```
-paperforge <CMD>
+paperforge <COMMAND>
 
 Commands:
-  set       Lanzar LWE con un scene directory o archivo
-  pause     SIGSTOP todas las instancias LWE
-  resume    SIGCONT todas las instancias LWE
-  list      Listar PIDs LWE corriendo + state
-  scan      Escanear paths default, print discovered entries
-  audio     Audio control via POSIX signals (toggle/mute/unmute)
-  playlist  Playlist management (list/show/save/apply/delete)
-  paths     Print auto-detected source paths
+  set         Launch LWE with a scene dir or file
+  pause       SIGSTOP all running LWE instances
+  resume      SIGCONT all paused LWE instances
+  list        List running LWE PIDs + state
+  scan        Scan default paths, print discovered entries
+  audio       Audio control (toggle/mute/unmute) via SIGUSR1/SIGUSR2
+  playlist    Playlist management (list/show/save/apply/delete)
+  paths       Print auto-detected source paths
 ```
 
-## Arquitectura
+`paperforge-tui` is a separate binary — a read-only TUI debugger over
+inventory, running PIDs, playlists, and Wayland outputs.
+
+## Architecture
 
 ```
-crates/paperforge-core/   # lib MIT, sin dependencias GPL
-├── inventory.rs             # walkdir scanner con mtime cache
-├── paths.rs                 # auto-detect Steam/Flatpak/local dirs
-├── backend.rs               # WallpaperBackend trait + LweBackend
-├── audio.rs                 # LweAudioController (SIGUSR1/SIGUSR2)
-├── playlist.rs              # Playlist + PlaylistStore (JSON files)
-├── config.rs                # Config + ConfigPaths (TOML)
-└── error.rs                 # Crate-wide Error type
-
-crates/paperforge-cli/    # binario `paperforge`
-└── src/main.rs              # clap derive, 8 subcommands
-
-crates/paperforge-tui/    # placeholder Fase 6B
-└── src/lib.rs
+paperforge/                         (MIT)
+├── crates/paperforge-core/         MIT, no GPL deps
+│   ├── inventory.rs    walkdir scanner + mtime cache
+│   ├── paths.rs        Steam / Flatpak / local auto-detect
+│   ├── backend.rs      WallpaperBackend trait + LweBackend
+│   ├── audio.rs        LweAudioController (SIGUSR1/SIGUSR2)
+│   ├── playlist.rs     Playlist + PlaylistStore (JSON)
+│   ├── config.rs       Config + ConfigPaths (TOML)
+│   ├── daemon.rs       PaperforgeDaemon (tokio + tokio::sync::RwLock)
+│   ├── hotplug.rs      CompositorHotplugSource (Wayland output events)
+│   ├── dbus.rs         zbus IPC service (differentiation vs swww)
+│   ├── lwe_probe.rs    runtime detection of LWE audio signal support
+│   └── error.rs        crate-wide Error type
+├── crates/paperforge-cli/          bin `paperforge` (clap)
+├── crates/paperforge-tui/          bin `paperforge-tui` (ratatui)
+└── crates/paperforge-gui/          bin `paperforge-gui` (Dioxus, WIP)
 ```
 
-### Compatibilidad de licencias
+### License boundary
 
-`paperforge-core` es MIT. `linux-wallpaperengine` (el fork de
-`louzt/`) es GPL-3.0. **No mezclamos código fuente** — `paperforge`
-solo habla con LWE via:
-- `fork+exec` de la binary LWE
+`paperforge-core` is MIT. `linux-wallpaperengine` is GPL-3.0.
+We never link or import LWE source — `paperforge` talks to LWE
+exclusively via:
+
+- `fork+exec` of the LWE binary
 - POSIX signals (`SIGSTOP`, `SIGCONT`, `SIGUSR1`, `SIGUSR2`)
-- Lectura de `/proc/<pid>/cmdline` y `/proc/<pid>/status`
+- reads of `/proc/<pid>/cmdline` and `/proc/<pid>/status`
 
-FSF GPL FAQ confirma que dos programas que se comunican por IPC
-siguen siendo programas separados. No se genera trabajo derivado
-con GPL.
+Per the FSF GPL FAQ, two programs communicating via IPC remain
+separate programs. No GPL derivative work is generated.
 
-## Build
+### Backends
+
+| Backend | Pause | Audio | Workshop | Trait impl |
+|---|---|---|---|---|
+| `LweBackend` | SIGSTOP/SIGCONT | SIGUSR1/SIGUSR2 | ✅ | first-class |
+| `SwwwBackend` | swww CLI | n/a | ❌ | proof-of-concept |
+| `HyprpaperBackend` | n/a (stateless) | n/a | ❌ | stub |
+| `MpvpaperBackend` | mpv IPC `pause` | mpv IPC | ❌ | stub |
+
+Workshop scenes (the killer feature) are only renderable through LWE.
+
+## Build & test
 
 ```bash
-cargo build                    # debug
-cargo build --release          # release (lto + strip)
-cargo test --all               # 46 tests
-cargo clippy --all-targets -- -D warnings
+cargo build --release              # lto + strip
+cargo test --workspace             # 158 tests (one lwe_probe needs upstream binary)
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Build dependencies:
-- `rustc >= 1.75` (usa `let ... else { ... };`)
-- `pkg-config` (para algunas deps)
-- Linux (testea `/proc/<pid>/cmdline` directamente — no portable a macOS)
+CI: `.github/workflows/ci.yml` runs `cargo test --workspace`,
+clippy with `-D warnings`, and `cargo fmt --check` on every push.
 
 ## Roadmap
 
-- **Fase 6A** ✅ — Core lib + CLI + audio SIGUSR (este PR)
-- **Fase 6B** 🚧 — `ratatui` TUI con grid + vim-nav + thumbnails
-- **Fase 6C** 🚧 — `Dioxus` GUI desktop con lazy-load video preview
-- **Fase 6D** ⏳ — Steam Workshop API catalog (read-only)
+- **6A** ✅ — Core lib + CLI + audio SIGUSR (v0.1.0)
+- **6B** ✅ — `ratatui` TUI debugger
+- **6C** 🚧 — Dioxus GUI desktop with lazy-load video preview
+- **6D** ⏳ — Steam Workshop API catalog (read-only)
+- **6E** ⏳ — Wireguard-aware network kill-switch for offline playlists
 
-## Contribuir
+## Contributing
 
-Ver [`CONTRIBUTING.md`](CONTRIBUTING.md). PRs bienvenidos — sobre todo
-backends adicionales (`swww`, `hyprpaper`, `mpvpaper`).
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). New backends are the most
+useful contribution — implement `WallpaperBackend` for `swww`,
+`awww`, `hyprpaper`, `mpvpaper`, or `waypipe`.
 
 ## License
 
-MIT — ver [`LICENSE`](LICENSE).
+MIT — see [`LICENSE`](LICENSE).
 
 ## Provenance
 
-- Fork / companion a [`louzt/linux-wallpaperengine`](https://github.com/louzt/linux-wallpaperengine)
-- Inspired by [`waypaper`](https://github.com/anufrievroman/waypaper) (GPL-3.0)
-- Powered by `tokio`, `clap`, `walkdir`, `notify`, `nix`, `serde`, `dirs`
+- Companion to [`louzt/linux-wallpaperengine`](https://github.com/louzt/linux-wallpaperengine)
+- Powered by `tokio`, `clap`, `ratatui`, `walkdir`, `notify`,
+  `nix`, `serde`, `dirs`, `zbus`
+
+## Translations
+
+- [Español](docs/README.es.md)
