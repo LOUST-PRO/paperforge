@@ -5,10 +5,10 @@
 //! set of Wayland outputs. Applying a playlist sets the wallpaper
 //! for each output in turn.
 //!
-//! This is the killer feature that waypaper does NOT have. Waypaper
-//! treats each wallpaper as a one-off (path → monitor mapping only).
-//! With playlists, the operator can switch the entire vibe of their
-//! desktop with one command (`paperforge playlist apply focus`).
+//! Most generic wallpaper switchers treat each wallpaper as a one-off
+//! (path → monitor mapping only). With playlists, the operator can
+//! switch the entire vibe of their desktop with one command
+//! (`paperforge playlist apply focus`).
 
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -36,7 +36,8 @@ pub struct Playlist {
     /// outputs.
     pub wallpapers: Vec<PathBuf>,
     /// Fill mode applied across monitors when a wallpaper is too
-    /// small for the output. Mirrors waypaper's fill option.
+    /// small for the output. Standard `fill`/`fit`/`stretch`/`tile`
+    /// options.
     #[serde(default = "default_fill")]
     pub fill: FillMode,
 }

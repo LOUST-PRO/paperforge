@@ -5,8 +5,17 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 rust-version.workspace = true
-description = "Dioxus 0.8-alpha desktop GUI for paperforge (Fase 6C)"
+keywords = ["gui", "dioxus", "wallpaper", "desktop", "wayland"]
+categories = ["gui", "command-line-utilities"]
+publish.workspace = true
+documentation = "https://docs.rs/paperforge-gui"
+description = """
+Dioxus desktop GUI for paperforge — Phase 6C, in progress. Same core
+library, lazy-load video previews and visual playlist editor.
+"""
 
 [dependencies]
 # Dioxus GUI framework — pinned to 0.8.0-alpha per operator decision D2
@@ -15,7 +24,7 @@ dioxus = { version = "=0.8.0-alpha.0", features = ["desktop"] }
 dioxus-desktop = "=0.8.0-alpha.0"
 
 # Internal: reuso del core lib MIT (Fase 6A)
-paperforge-core = { path = "../paperforge-core" }
+paperforge-core = { path = "../paperforge-core", version = "0.1.0" }
 
 # Async runtime + logging (reutilizados del workspace, per paperforge-core)
 tokio = { workspace = true }
