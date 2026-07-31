@@ -327,7 +327,7 @@ impl LweBackend {
     pub async fn pause_per_output(&self) -> Result<usize> {
         let pids = self.per_output_pids.lock().await;
         let mut count = 0;
-        for (_, &pid) in pids.iter() {
+        for &pid in pids.values() {
             if nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid),
                 nix::sys::signal::Signal::SIGSTOP,
@@ -344,7 +344,7 @@ impl LweBackend {
     pub async fn resume_per_output(&self) -> Result<usize> {
         let pids = self.per_output_pids.lock().await;
         let mut count = 0;
-        for (_, &pid) in pids.iter() {
+        for &pid in pids.values() {
             if nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid),
                 nix::sys::signal::Signal::SIGCONT,
@@ -373,10 +373,7 @@ impl LweBackend {
         }
         // Fallback: walk /proc for any LWE process. The CLI is a
         // single-shot process; children survive in /proc after exit.
-        match list_pids_in_proc(Path::new("/proc"), self.kind().process_pattern()) {
-            Ok(v) => v,
-            Err(_) => Vec::new(),
-        }
+        list_pids_in_proc(Path::new("/proc"), self.kind().process_pattern()).unwrap_or_default()
     }
 }
 
