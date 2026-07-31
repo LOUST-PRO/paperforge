@@ -27,7 +27,7 @@ use paperforge_core::{
     inventory::Inventory,
     paths::default_paths,
     playlist::PlaylistStore,
-    updater::{Channel, Updater, UpdaterConfig, UpdateInfo},
+    updater::{Channel, UpdateInfo, Updater, UpdaterConfig},
 };
 
 /// `paperforge` — Wallpaper Engine Workshop manager for Linux.
@@ -323,10 +323,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_self_update(
-    paths: &ConfigPaths,
-    opts: SelfUpdateOpts,
-) -> anyhow::Result<()> {
+async fn run_self_update(paths: &ConfigPaths, opts: SelfUpdateOpts) -> anyhow::Result<()> {
     let updater_cfg_path = paths.config_dir.join("updater.toml");
     let mut updater_cfg = UpdaterConfig::load_or_default(&updater_cfg_path)?;
 
@@ -350,7 +347,12 @@ async fn run_self_update(
             println!("(no backups retained)");
         } else {
             for b in backups {
-                println!("{}\t{}\t{}", b.version, b.created_at.to_rfc3339(), b.path.display());
+                println!(
+                    "{}\t{}\t{}",
+                    b.version,
+                    b.created_at.to_rfc3339(),
+                    b.path.display()
+                );
             }
         }
         return Ok(());
@@ -360,14 +362,18 @@ async fn run_self_update(
         let updater = Updater::new(updater_cfg)?;
         if !opts.yes {
             let backups = updater.list_backups()?;
-            let newest = backups.first().ok_or_else(|| {
-                anyhow::anyhow!("no backups to roll back to")
-            })?;
+            let newest = backups
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("no backups to roll back to"))?;
             eprintln!(
                 "About to roll back to version '{}' from {}",
-                newest.version, newest.path.display()
+                newest.version,
+                newest.path.display()
             );
-            eprintln!("This will replace the running binary at {}.", updater.binary_path().display());
+            eprintln!(
+                "This will replace the running binary at {}.",
+                updater.binary_path().display()
+            );
             eprintln!("Re-run with --yes to skip this prompt.");
             return Ok(());
         }
@@ -397,9 +403,7 @@ async fn run_self_update(
     if !opts.yes {
         eprintln!(
             "About to apply update {} -> {} (asset {}).",
-            info.current_version,
-            info.latest_version,
-            info.asset_name,
+            info.current_version, info.latest_version, info.asset_name,
         );
         eprintln!(
             "This will replace the binary at {} and create a backup.",

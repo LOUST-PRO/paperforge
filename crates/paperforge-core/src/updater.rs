@@ -132,7 +132,10 @@ impl UpdaterConfig {
     /// default config if the file is absent.
     pub fn load_or_default(path: &Path) -> Result<Self> {
         if !path.exists() {
-            debug!("updater config {} not found; using defaults", path.display());
+            debug!(
+                "updater config {} not found; using defaults",
+                path.display()
+            );
             return Ok(Self::default());
         }
         let text = std::fs::read_to_string(path)?;
@@ -207,9 +210,8 @@ impl Updater {
     pub fn new(config: UpdaterConfig) -> Result<Self> {
         let binary_path = match config.binary_path.clone() {
             Some(p) => p,
-            None => std::env::current_exe().map_err(|e| Error::Config(format!(
-                "could not resolve current_exe: {e}"
-            )))?,
+            None => std::env::current_exe()
+                .map_err(|e| Error::Config(format!("could not resolve current_exe: {e}")))?,
         };
 
         let backup_root = dirs::data_dir()
@@ -275,8 +277,8 @@ impl Updater {
         };
 
         let body = self.http_get(&url).await?;
-        let release: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| Error::BackendFailure {
+        let release: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| Error::BackendFailure {
                 kind: "github_api".to_string(),
                 message: format!("parse release JSON: {e}"),
             })?;
@@ -326,9 +328,7 @@ impl Updater {
             })
             .ok_or_else(|| Error::BackendFailure {
                 kind: "github_api".to_string(),
-                message: format!(
-                    "no release asset ending with '{target_suffix}' in release {tag}"
-                ),
+                message: format!("no release asset ending with '{target_suffix}' in release {tag}"),
             })?;
 
         let asset_name = asset
@@ -423,15 +423,21 @@ impl Updater {
                 });
             }
         } else {
-            warn!(
-                "verify_signature=false in updater.toml; skipping SHA-256 check (testing only)"
-            );
+            warn!("verify_signature=false in updater.toml; skipping SHA-256 check (testing only)");
         }
 
         // 4. Extract
         let extract_dir = staging_dir.path().join("extracted");
         std::fs::create_dir_all(&extract_dir)?;
-        run_command("tar", &["-xzf", tarball_path.to_str().unwrap_or("?"), "-C", extract_dir.to_str().unwrap_or("?")])?;
+        run_command(
+            "tar",
+            &[
+                "-xzf",
+                tarball_path.to_str().unwrap_or("?"),
+                "-C",
+                extract_dir.to_str().unwrap_or("?"),
+            ],
+        )?;
 
         // Find the staged binary inside the extracted tree. The
         // release tarball contains a single binary at the root
@@ -521,9 +527,10 @@ impl Updater {
     pub async fn rollback(&self) -> Result<BackupEntry> {
         self.ensure_enabled()?;
         let backups = self.list_backups()?;
-        let newest = backups.into_iter().next().ok_or_else(|| Error::Config(
-            "no backups to roll back to".to_string(),
-        ))?;
+        let newest = backups
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Config("no backups to roll back to".to_string()))?;
         std::fs::copy(&newest.path, &self.binary_path)?;
         let _ = std::fs::set_permissions(&self.binary_path, std::fs::Permissions::from_mode(0o755));
         info!(
@@ -536,7 +543,8 @@ impl Updater {
 
     async fn backup_current_binary(&self, new_version: &str) -> Result<BackupEntry> {
         let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let prev_version = probe_version(&self.binary_path).unwrap_or_else(|_| "unknown".to_string());
+        let prev_version =
+            probe_version(&self.binary_path).unwrap_or_else(|_| "unknown".to_string());
         let backup_path = self
             .backup_dir
             .join(format!("paperforge-v{prev_version}-{ts}.bin"));
@@ -622,9 +630,7 @@ fn parse_sha256_for(sums: &str, asset_name: &str) -> Option<String> {
         // strip one optional leading `*`.
         let hash = raw_hash.strip_prefix('*').unwrap_or(raw_hash);
         // The filename can be prefixed with `./`. Strip it.
-        let name = parts
-            .next()?
-            .trim_start_matches("./");
+        let name = parts.next()?.trim_start_matches("./");
         if name == asset_name {
             return Some(hash.to_lowercase());
         }
@@ -650,7 +656,9 @@ fn find_single_binary(dir: &Path) -> Option<PathBuf> {
 }
 
 fn walk_for_binary(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let p = entry.path();
         if p.is_dir() {
@@ -672,7 +680,11 @@ fn probe_version(binary: &Path) -> Result<String> {
     if !out.status.success() {
         return Err(Error::BackendFailure {
             kind: "probe".to_string(),
-            message: format!("`{} --version` exited with {:?}", binary.display(), out.status),
+            message: format!(
+                "`{} --version` exited with {:?}",
+                binary.display(),
+                out.status
+            ),
         });
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -688,12 +700,13 @@ fn probe_version(binary: &Path) -> Result<String> {
 }
 
 fn run_command(prog: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new(prog).args(args).output().map_err(|e| {
-        Error::BackendFailure {
+    let out = Command::new(prog)
+        .args(args)
+        .output()
+        .map_err(|e| Error::BackendFailure {
             kind: prog.to_string(),
             message: format!("spawn: {e}"),
-        }
-    })?;
+        })?;
     if !out.status.success() {
         return Err(Error::BackendFailure {
             kind: prog.to_string(),
@@ -744,7 +757,10 @@ mod tests {
         assert_eq!(loaded.github_repo, "louzt/paperforge");
         assert_eq!(loaded.backup_retention, 3);
         assert!(!loaded.verify_signature);
-        assert_eq!(loaded.binary_path, Some(PathBuf::from("/opt/bin/paperforge")));
+        assert_eq!(
+            loaded.binary_path,
+            Some(PathBuf::from("/opt/bin/paperforge"))
+        );
     }
 
     #[test]
@@ -820,7 +836,9 @@ def456  paperforge-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
         };
         // Manually populate the backup dir.
         for i in 0..5 {
-            let p = tmp.path().join(format!("paperforge-v0.0.{i}-20260101T00000{i}Z.bin"));
+            let p = tmp
+                .path()
+                .join(format!("paperforge-v0.0.{i}-20260101T00000{i}Z.bin"));
             std::fs::write(&p, b"bin").unwrap();
             // Set mtimes to differ.
             let t = filetime::FileTime::from_unix_time(1_700_000_000 + i as i64, 0);
