@@ -30,6 +30,23 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # System deps for paperforge-gui (Dioxus desktop). webkit2gtk + gtk3 +
+      # glib are needed at link time even when the GUI is just a scaffold —
+      # excluding the crate from CI hides real breakage in the dependency
+      # graph and makes first-time contributors hit "glib-2.0 not found"
+      # locally with no signal. Installing here means contributors see
+      # CI green for the same code that builds on their machine after
+      # `apt-get install` (documented in README).
+      - name: Install system dependencies (GUI scaffold)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
@@ -39,6 +56,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies (GUI scaffold)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev
       - name: Run unit tests
         run: cargo test --all --no-fail-fast
       - name: Run doc tests
@@ -51,6 +78,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies (GUI scaffold)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev
       - run: cargo build --release --locked
       - name: Smoke test (binary runs)
         run: |
