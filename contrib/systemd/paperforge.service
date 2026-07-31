@@ -1,0 +1,53 @@
+# paperforge daemon — systemd user unit
+#
+# Install (after building + installing the binary to ~/.local/bin/paperforge):
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/systemd/paperforge.service ~/.config/systemd/user/
+#   cp contrib/systemd/paperforge.service.d/10-hardening.conf \
+#      ~/.config/systemd/user/paperforge.service.d/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now paperforge.service
+#
+# Or use the helper script:
+#
+#   contrib/systemd/install.sh
+#
+# Notes:
+#
+# - The unit uses systemd specifiers (%h, %U) so it does not embed
+#   any host-specific path or UID. Verify it parses with:
+#
+#     systemd-analyze verify ~/.config/systemd/user/paperforge.service
+#
+# - ExecStart resolves %h at unit activation time. If you install
+#   the binary somewhere other than ~/.local/bin/, edit the unit
+#   before linking it.
+#
+# - PartOf=niri.service means the daemon is auto-stopped when niri
+#   exits and auto-started when niri comes back. Drop the PartOf
+#   line if you run a different compositor (Hyprland, sway) or run
+#   niri outside systemd.
+
+[Unit]
+Description=paperforge daemon — LWE pool + D-Bus + hotplug watcher
+Documentation=https://github.com/LOUST-PRO/paperforge
+After=niri.service graphical-session.target
+Wants=niri.service
+PartOf=niri.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/paperforge daemon
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=%h
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+Environment=RUST_LOG=info,paperforge_core=debug
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
