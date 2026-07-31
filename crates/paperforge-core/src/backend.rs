@@ -1280,6 +1280,11 @@ mod tests {
     /// This is the closest thing to "smoke test" the signal code
     /// without a real LWE instance. It uses the real
     /// `nix::sys::signal::kill` + the real `/proc` filesystem.
+    ///
+    /// Uses `pid_state_quick` directly because `LweBackend::state`
+    /// gates on pool ownership (returns NotRunning for foreign pids),
+    /// which is correct production behavior but wrong for this smoke
+    /// test — the test deliberately creates an unmanaged sleep.
     #[test]
     fn real_sigstop_sigcont_round_trip() {
         let mut child = std::process::Command::new("sleep")
@@ -1291,9 +1296,7 @@ mod tests {
         // Give the scheduler a moment so /proc reflects the new PID.
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        let backend = LweBackend::new();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let state_running = rt.block_on(backend.state(pid)).unwrap();
+        let state_running = pid_state_quick(pid).unwrap();
         assert_eq!(
             state_running,
             BackendState::Running,
@@ -1308,7 +1311,7 @@ mod tests {
 
         // Yield to scheduler so the kernel processes the signal.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let state_paused = rt.block_on(backend.state(pid)).unwrap();
+        let state_paused = pid_state_quick(pid).unwrap();
         assert_eq!(
             state_paused,
             BackendState::Paused,
@@ -1322,7 +1325,7 @@ mod tests {
         .expect("SIGCONT");
 
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let state_resumed = rt.block_on(backend.state(pid)).unwrap();
+        let state_resumed = pid_state_quick(pid).unwrap();
         assert_eq!(
             state_resumed,
             BackendState::Running,
