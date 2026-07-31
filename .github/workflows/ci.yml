@@ -13,7 +13,7 @@ env:
 jobs:
   fmt:
     name: rustfmt
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -23,75 +23,44 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # System deps for paperforge-gui (Dioxus desktop). webkit2gtk + gtk3 +
-      # glib are needed at link time even when the GUI is just a scaffold —
-      # excluding the crate from CI hides real breakage in the dependency
-      # graph and makes first-time contributors hit "glib-2.0 not found"
-      # locally with no signal. Installing here means contributors see
-      # CI green for the same code that builds on their machine after
-      # `apt-get install` (documented in README).
-      - name: Install system dependencies (GUI scaffold)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libsoup-3.0-dev \
-            libxdo-dev
+      # paperforge-gui (Dioxus desktop) is excluded from the workspace build
+      # (see Makefile target `release` -> `--exclude paperforge-gui`), so we
+      # don't need webkit2gtk/gtk3/glib on the runner. If you fork this
+      # workflow for your own runner and DO build the GUI, install:
+      #   libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+      #   libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev \
+      #   libxdo-dev
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     name: test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install system dependencies (GUI scaffold)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libsoup-3.0-dev \
-            libxdo-dev
+      # Same note as clippy: paperforge-gui is excluded, GUI deps not needed.
       - name: Run unit tests
-        run: cargo test --all --no-fail-fast
+        run: cargo test --workspace --exclude paperforge-gui --no-fail-fast
       - name: Run doc tests
-        run: cargo test --all --doc
+        run: cargo test --workspace --exclude paperforge-gui --doc
 
   build:
     name: build (release)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install system dependencies (GUI scaffold)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libsoup-3.0-dev \
-            libxdo-dev
-      - run: cargo build --release --locked
+      # Same note: paperforge-gui excluded, GUI deps not needed.
+      - run: cargo build --release --workspace --exclude paperforge-gui --locked
       - name: Smoke test (binary runs)
         run: |
           ./target/release/paperforge --version
