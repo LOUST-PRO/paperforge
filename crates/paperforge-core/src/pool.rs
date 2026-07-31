@@ -424,13 +424,21 @@ fn build_argv(
 
 /// Default flags applied to every spawned LWE process. `--silent` is
 /// essential in a systemd-managed daemon (otherwise stderr floods the
-/// journal); `--fullscreen-pause-only-active` enables LWE's native
+/// journal); `--volume 0` defensively mutes the LWE-internal audio
+/// path even if a fork build ignores `--silent`; the daemon also
+/// mutes the PulseAudio sink-input post-spawn as a second layer
+/// (see [`crate::backend::LweBackend::set_per_output`]). `--no-automute`
+/// prevents LWE from re-enabling audio when another app stops
+/// playing. `--fullscreen-pause-only-active` enables LWE's native
 /// per-output pause when a fullscreen window is focused on that output
 /// (Wayland only).
 fn default_flags() -> Vec<String> {
     vec![
         "--silent".to_string(),
+        "--volume".to_string(),
+        "0".to_string(),
         "--no-audio-processing".to_string(),
+        "--noautomute".to_string(),
         "--disable-particles".to_string(),
         "--disable-mouse".to_string(),
         "--disable-parallax".to_string(),
@@ -480,6 +488,31 @@ mod tests {
         assert!(
             f.iter().any(|s| s == "--fullscreen-pause-only-active"),
             "default flags must enable LWE's native per-output fullscreen pause"
+        );
+    }
+
+    #[test]
+    fn default_flags_mute_audio_path() {
+        // Default spawn must include `--volume 0` and `--noautomute` so
+        // the wallpaper cannot produce audio even on LWE builds that
+        // ignore `--silent`. `--no-audio-processing` is the upstream
+        // decoder-side mute; together they form a layered defense.
+        let f = default_flags();
+        let has_volume_zero = f
+            .windows(2)
+            .any(|w| w[0] == "--volume" && w[1] == "0");
+        assert!(has_volume_zero, "default flags must include --volume 0");
+        assert!(
+            f.iter().any(|s| s == "--noautomute"),
+            "default flags must include --noautomute to prevent auto-unmute"
+        );
+        assert!(
+            f.iter().any(|s| s == "--silent"),
+            "default flags must include --silent"
+        );
+        assert!(
+            f.iter().any(|s| s == "--no-audio-processing"),
+            "default flags must include --no-audio-processing"
         );
     }
 
