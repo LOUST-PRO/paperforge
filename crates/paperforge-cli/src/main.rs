@@ -16,6 +16,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 use paperforge_core::{
     audio::AudioCommand,
@@ -552,8 +553,23 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // 1-3. Build LWE ops + daemon.
     let lwe_ops = cfg.build_backend_ops();
     let backend_dyn: Arc<dyn BackendOps> = lwe_ops.clone();
-    let (daemon, event_rx) = PaperforgeDaemon::with_lwe_backend_ops(backend_dyn, lwe_ops.clone())
-        .context("constructing PaperforgeDaemon")?;
+    // Load the configured pause mode so the daemon's D-Bus
+    // pause/resume honour `[pause]` from config.toml instead of
+    // always issuing plain SIGSTOP (which drops the surface to
+    // grey). Test contexts use the default mode if `cfg.pause`
+    // is absent.
+    let pause_cfg = paperforge_core::config::Config::load(
+        &paperforge_core::config::ConfigPaths::defaults()
+            .expect("config paths resolvable in CLI context"),
+    )
+    .map(|c| c.pause)
+    .unwrap_or_default();
+    let (daemon, event_rx) = PaperforgeDaemon::with_lwe_backend_ops_store_and_pause(
+        backend_dyn,
+        lwe_ops.clone(),
+        Arc::new(RwLock::new(PlaylistStore::default_location()?)),
+        Arc::new(RwLock::new(pause_cfg)),
+    );
 
     // 4. D-Bus layer (consumes event_rx).
     let ctrl: Arc<dyn PaperforgeControl> = daemon.clone();

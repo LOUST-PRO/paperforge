@@ -759,6 +759,57 @@ impl LweBackend {
         Ok(count)
     }
 
+    /// Per-output THROTTLE resume (v0.1). Mirrors `pause_per_output_throttle`:
+    /// when LWE was re-spawned with `--fps 1` on pause, resume
+    /// should re-spawn with the normal FPS cap so the renderer
+    /// ramps back up. We SIGTERM the throttled children, clear
+    /// their pids, and respawn at `target_fps`.
+    pub async fn resume_per_output_throttle(&self, target_fps: u32) -> Result<usize> {
+        let pairs: Vec<(String, PathBuf)> = {
+            let pids = self.per_output_pids.lock().await;
+            let scenes = self.per_output_scenes.lock().await;
+            pids.keys()
+                .filter_map(|out| scenes.get(out).cloned().map(|s| (out.clone(), s)))
+                .collect()
+        };
+        // Clear pid map; populate after re-spawn. Throttled LWE
+        // will be replaced (not SIGCONT'd) so we don't need to
+        // clean-shutdown each one — the kernel reaps them when
+        // their parent (us) exits the spawned-child ref.
+        {
+            let mut pids = self.per_output_pids.lock().await;
+            pids.clear();
+        }
+        let mut respawned = 0usize;
+        let mut skipped: Vec<(String, String)> = Vec::new();
+        for (output, scene) in &pairs {
+            match self
+                .set_per_output_with_fps(scene, output, target_fps)
+                .await
+            {
+                Ok(pid) if pid > 0 => respawned += 1,
+                Ok(_) => skipped.push((output.clone(), "spawn returned pid 0".into())),
+                Err(e) => {
+                    tracing::warn!(
+                        "throttle-resume: respawn for output={} failed: {e}",
+                        output
+                    );
+                    skipped.push((output.clone(), e.to_string()));
+                }
+            }
+        }
+        if !skipped.is_empty() {
+            tracing::warn!(
+                target: "paperforge",
+                "throttle-resume: {} of {} output(s) skipped: {:?}",
+                skipped.len(),
+                pairs.len(),
+                skipped
+            );
+        }
+        Ok(respawned)
+    }
+
     /// Prune dead children from `per_output_pids` + `per_output_scenes`.
     /// Returns the outputs that were pruned (caller can re-bind or
     /// emit a D-Bus event).
