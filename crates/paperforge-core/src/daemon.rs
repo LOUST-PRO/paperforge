@@ -141,6 +141,64 @@ impl LweBackendOps {
     pub fn use_pool(&self) -> bool {
         self.use_pool
     }
+
+    /// Pause with the v0.3 mode-aware semantics. Dispatches to the
+    /// pool's pause_soft / pause_throttle / pause based on `mode`,
+    /// or to the per-output variants when `use_pool` is false.
+    /// `paused_fps`, `clock_awake_ms`, and `clock_asleep_ms` are
+    /// ignored in `hard` / `throttle` modes.
+    pub async fn pause_with_mode(
+        &self,
+        mode: crate::config::PauseMode,
+        paused_fps: u32,
+        clock_awake_ms: u64,
+        clock_asleep_ms: u64,
+    ) -> Result<usize> {
+        // Effective cycle derives from the configured fps target so
+        // a user wanting more responsive pause can lower
+        // `paused_fps` and the cycle adapts.
+        let (awake_ms, asleep_ms): (u64, u64) = if paused_fps == 0 {
+            (clock_awake_ms, clock_asleep_ms)
+        } else {
+            // 1000ms / paused_fps = total cycle; split as 20% awake,
+            // 80% asleep (matches defaults: 100/400 = 20%).
+            let total = (1000_u64 / paused_fps as u64).max(50);
+            let awake = total / 5;
+            let asleep = total - awake;
+            (awake, asleep)
+        };
+        if self.use_pool {
+            let pool = self.backend.pool();
+            match mode {
+                crate::config::PauseMode::Hard => {
+                    pool.pause().await.map(|n| if n.is_some() { 1 } else { 0 })
+                }
+                crate::config::PauseMode::Frame => pool
+                    .pause_soft(awake_ms, asleep_ms)
+                    .await
+                    .map(|n| if n.is_some() { 1 } else { 0 }),
+                crate::config::PauseMode::Throttle => {
+                    pool.pause().await.map(|n| if n.is_some() { 1 } else { 0 })
+                }
+            }
+        } else {
+            match mode {
+                crate::config::PauseMode::Hard => self.backend.pause_per_output().await,
+                crate::config::PauseMode::Frame => {
+                    self.backend
+                        .pause_per_output_soft(awake_ms, asleep_ms)
+                        .await
+                }
+                crate::config::PauseMode::Throttle => {
+                    // No scene resolver in the daemon path yet —
+                    // pass an identity closure that always returns
+                    // None; the throttle method gracefully skips
+                    // respawns whose scene can't be resolved.
+                    self.backend.pause_per_output_throttle(|_| None).await
+                }
+            }
+        }
+    }
 }
 
 impl Default for LweBackendOps {

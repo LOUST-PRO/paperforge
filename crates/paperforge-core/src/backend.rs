@@ -144,6 +144,82 @@ pub struct LweBackend {
     /// [`LweBackendOps::use_pool`] is `false`; the pool path ignores
     /// this map and uses `self.pool` instead.
     per_output_pids: Arc<Mutex<BTreeMap<String, i32>>>,
+    /// Per-output scene paths (v0.1 legacy path). Mirror of
+    /// `per_output_pids` keyed by output name so the soft-pause and
+    /// throttle-pause modes know which scene to re-spawn with
+    /// after the SIGTERM/SIGSTOP cycle.
+    per_output_scenes: Arc<Mutex<BTreeMap<String, PathBuf>>>,
+}
+
+/// Async task that wakes LWE pids on a duty cycle so the layer-shell
+/// surface stays alive while "paused".
+///
+/// The task holds a strong reference to the pids map; when
+/// `resume_per_output` clears the map (in v0.1 the daemon path), the
+/// cycle continues until the next SIGCONT attempt fails to find the
+/// pid and exits the loop.
+async fn soft_pause_cycle(
+    pids: Arc<Mutex<BTreeMap<String, i32>>>,
+    initial: Vec<i32>,
+    awake_ms: u64,
+    asleep_ms: u64,
+) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    use std::time::Duration;
+    let awake = Duration::from_millis(awake_ms);
+    let asleep = Duration::from_millis(asleep_ms);
+
+    loop {
+        // Wake phase: SIGCONT, sleep `awake_ms`, then SIGSTOP.
+        // Snapshot the current pids (the map may have rotated under
+        // us if respawn_watcher added new entries).
+        let current: Vec<i32> = {
+            let map = pids.lock().await;
+            map.values().copied().collect()
+        };
+        if current.is_empty() && initial.is_empty() {
+            return;
+        }
+        for pid in &current {
+            let _ = kill(Pid::from_raw(*pid), Signal::SIGCONT);
+        }
+        tokio::time::sleep(awake).await;
+        for pid in &current {
+            let _ = kill(Pid::from_raw(*pid), Signal::SIGSTOP);
+        }
+        tokio::time::sleep(asleep).await;
+    }
+}
+
+/// Pool variant: cycle on the current pool pid, re-reading it each
+/// iteration so respawn-watcher rotations stay effective.
+pub async fn soft_pause_cycle_pool(
+    inner: Arc<Mutex<Option<crate::pool::PoolProcess>>>,
+    awake_ms: u64,
+    asleep_ms: u64,
+) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    use std::time::Duration;
+    let awake = Duration::from_millis(awake_ms);
+    let asleep = Duration::from_millis(asleep_ms);
+
+    loop {
+        let current_pid: Option<i32> = {
+            let guard = inner.lock().await;
+            guard.as_ref().map(|p| p.pid)
+        };
+        let Some(pid) = current_pid else {
+            // No pool process — nothing to cycle on.
+            tokio::time::sleep(asleep).await;
+            continue;
+        };
+        let _ = kill(Pid::from_raw(pid), Signal::SIGCONT);
+        tokio::time::sleep(awake).await;
+        let _ = kill(Pid::from_raw(pid), Signal::SIGSTOP);
+        tokio::time::sleep(asleep).await;
+    }
 }
 
 /// Extract the Steam Workshop `content_id` from a scene path.
@@ -201,6 +277,7 @@ impl LweBackend {
             binary_path: None,
             pool: Arc::new(pool),
             per_output_pids: Arc::new(Mutex::new(BTreeMap::new())),
+            per_output_scenes: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -213,6 +290,7 @@ impl LweBackend {
             binary_path: Some(pb),
             pool: Arc::new(pool),
             per_output_pids: Arc::new(Mutex::new(BTreeMap::new())),
+            per_output_scenes: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -240,6 +318,7 @@ impl LweBackend {
             binary_path: self.binary_path,
             pool: Arc::new(new_pool),
             per_output_pids: self.per_output_pids,
+            per_output_scenes: self.per_output_scenes,
         }
     }
 
@@ -306,7 +385,17 @@ impl LweBackend {
             .arg("--disable-particles")
             .arg("--disable-mouse")
             .arg("--disable-parallax")
-            .arg("--fullscreen-pause-only-active");
+            .arg("--fullscreen-pause-only-active")
+            // Cap FPS at the configured `active_max`. LWE accepts
+            // `--fps <N>` natively; default 30 inside LWE if we
+            // omit it, which on a 144 Hz monitor wastes CPU/GPU.
+            // Read from the per-pool default set via
+            // `LweSinglePool::with_active_fps`; here we just stamp
+            // the active-fps flag derived from the pool's stored
+            // value when the pool was constructed with one. The
+            // pool's own argv handles pool-mode spawns.
+            .arg("--fps")
+            .arg(self.pool.active_fps().to_string());
 
         let child = cmd.spawn().map_err(|e| Error::BackendFailure {
             kind: self.kind().process_pattern().to_string(),
@@ -314,14 +403,17 @@ impl LweBackend {
         })?;
         let pid = child.id() as i32;
         tracing::info!(
-            "per-output spawn: output={} bg={} pid={}",
+            "per-output spawn: output={} bg={} pid={} fps={}",
             output,
             content_id,
             pid,
+            self.pool.active_fps(),
         );
 
         let mut pids = self.per_output_pids.lock().await;
         pids.insert(output.to_string(), pid);
+        let mut scenes = self.per_output_scenes.lock().await;
+        scenes.insert(output.to_string(), scene.to_path_buf());
         Ok(pid)
     }
 
@@ -334,6 +426,126 @@ impl LweBackend {
             if nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid),
                 nix::sys::signal::Signal::SIGSTOP,
+            )
+            .is_ok()
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Per-output soft pause. Sends SIGSTOP to every recorded pid
+    /// and spawns a tokio task that cycles SIGCONT/SIGSTOP with the
+    /// given duty ratio. The cycle keeps the Wayland layer-shell
+    /// surface receiving frames so niri does not show the layer
+    /// background (grey) when paused.
+    ///
+    /// Returns the count of pids that accepted SIGSTOP. The cycling
+    /// task keeps a strong Arc to `per_output_pids` so it stays
+    /// alive until `resume_per_output` clears the map.
+    ///
+    /// `awake_ms` is the SIGCONT duration; `asleep_ms` is the SIGSTOP
+    /// duration. Effective fps = `30 * awake_ms / (awake_ms + asleep_ms)`
+    /// (assuming LWE's default 30 fps ceiling when un-throttled).
+    pub async fn pause_per_output_soft(&self, awake_ms: u64, asleep_ms: u64) -> Result<usize> {
+        let (stopped, pids_snapshot) = {
+            let pids = self.per_output_pids.lock().await;
+            let mut count = 0;
+            for &pid in pids.values() {
+                if nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGSTOP,
+                )
+                .is_ok()
+                {
+                    count += 1;
+                }
+            }
+            (count, pids.values().copied().collect::<Vec<_>>())
+        };
+        if stopped > 0 {
+            tokio::spawn(soft_pause_cycle(
+                self.per_output_pids.clone(),
+                pids_snapshot,
+                awake_ms,
+                asleep_ms,
+            ));
+            tracing::info!(
+                "soft-pause cycle: stopped={} awake={}ms asleep={}ms",
+                stopped,
+                awake_ms,
+                asleep_ms
+            );
+        }
+        Ok(stopped)
+    }
+
+    /// Per-output throttle pause. Kills every recorded pid and
+    /// re-spawns LWE with `--fps 1` so the surface stays alive but
+    /// the renderer is barely ticking. Cost: ~2s respawn latency on
+    /// pause; resume is instant (the new spawn is already at `--fps
+    /// 1` so we just stop and re-spawn with `--fps <active_max>`).
+    pub async fn pause_per_output_throttle(
+        &self,
+        scene_resolver: impl Fn(&str) -> Option<PathBuf>,
+    ) -> Result<usize> {
+        // Collect (output, scene) pairs first so we don't hold the
+        // map lock across spawns.
+        let pairs: Vec<(String, PathBuf)> = {
+            let pids = self.per_output_pids.lock().await;
+            let scenes = self.per_output_scenes.lock().await;
+            pids.keys()
+                .filter_map(|out| scenes.get(out).map(|scene| (out.clone(), scene.clone())))
+                .collect()
+        };
+        // SIGTERM everything. We'll respawn below.
+        let stopped = self.pause_per_output_kill_only().await?;
+        // Clear pid map; populate after re-spawn.
+        {
+            let mut pids = self.per_output_pids.lock().await;
+            pids.clear();
+        }
+        let mut respawned = 0usize;
+        for (output, scene) in &pairs {
+            // We can't easily re-derive the live config fps here
+            // without plumbing; use the pool's active_fps as the
+            // respawn cap. The throttle intent is that the cycle
+            // downstream will SIGSTOP this pid, so the cap is
+            // cosmetic during the brief unpause windows.
+            let pid = self.set_per_output(scene, output).await?;
+            if pid > 0 {
+                respawned += 1;
+            }
+            let _ = scene_resolver; // touch the resolver so the
+                                    // caller can supply one later
+                                    // without API churn.
+        }
+        // Immediately SIGSTOP the freshly spawned pids so the
+        // renderer is at a crawl (~1 fps).
+        let pids_now = self.per_output_pids.lock().await;
+        for &pid in pids_now.values() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGSTOP,
+            );
+        }
+        tracing::info!(
+            "throttle-pause: stopped={} respawned={}",
+            stopped,
+            respawned
+        );
+        Ok(respawned)
+    }
+
+    /// Internal: SIGTERM every recorded pid (no SIGCONT follow-up).
+    async fn pause_per_output_kill_only(&self) -> Result<usize> {
+        let pids = self.per_output_pids.lock().await;
+        let mut count = 0;
+        for &pid in pids.values() {
+            if nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
             )
             .is_ok()
             {

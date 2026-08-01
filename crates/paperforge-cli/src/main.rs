@@ -48,8 +48,16 @@ enum Cmd {
         #[arg(long)]
         output: Option<String>,
     },
-    /// SIGSTOP all LWE instances.
-    Pause,
+    /// Pause wallpapers. Default mode is `frame` (SIGSTOP/SIGCONT
+    /// clock so the layer-shell surface stays alive — no grey).
+    /// Override per-call with `--mode`.
+    Pause {
+        /// `hard` (pure SIGSTOP, grey surface), `frame` (default,
+        /// SIGSTOP/SIGCONT clock), or `throttle` (respawn with
+        /// `--fps 1`).
+        #[arg(long)]
+        mode: Option<String>,
+    },
     /// SIGCONT all LWE instances.
     Resume,
     /// List running LWE PIDs with their state.
@@ -182,11 +190,29 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             println!("set {} on output {:?}", p.display(), output);
         }
-        Cmd::Pause => {
-            // Route through BackendOps so per-output children are
-            // signaled too (pool mode + per-output mode unified).
-            let n = backend_ops.pause().await?;
-            println!("paused {n} LWE instance(s)");
+        Cmd::Pause { mode } => {
+            // v0.3 supports three modes; `--mode` overrides the
+            // `[pause].mode` from config.toml.
+            let cfg = paperforge_core::config::Config::load(
+                &paperforge_core::config::ConfigPaths::defaults()
+                    .expect("config paths resolvable in CLI context"),
+            )
+            .unwrap_or_default();
+            let mode = match mode {
+                Some(s) => s
+                    .parse::<paperforge_core::config::PauseMode>()
+                    .expect("invalid --mode value (use hard|frame|throttle)"),
+                None => cfg.pause.mode,
+            };
+            let n = backend_ops
+                .pause_with_mode(
+                    mode,
+                    cfg.pause.paused_fps,
+                    cfg.pause.clock_awake_ms,
+                    cfg.pause.clock_asleep_ms,
+                )
+                .await?;
+            println!("paused {n} LWE instance(s) (mode={mode})");
         }
         Cmd::Resume => {
             let n = backend_ops.resume().await?;

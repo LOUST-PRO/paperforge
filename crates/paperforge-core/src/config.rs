@@ -108,6 +108,264 @@ pub struct Config {
     /// (e.g. a specific LWE build that mishandles merged argv).
     #[serde(default = "default_pool_enabled")]
     pub pool_enabled: bool,
+
+    /// Pause behaviour. Replaces the v0.2 single SIGSTOP behaviour
+    /// with three modes:
+    ///
+    /// - `hard` (v0.2 default if `pause.mode` is unset): SIGSTOP all
+    ///   per-output pids. Cheapest, but the layer-shell surface stops
+    ///   receiving frames so niri shows its layer background (grey).
+    /// - `frame` (v0.3 default): SIGSTOP/SIGCONT clock — process sleeps
+    ///   most of the cycle and wakes briefly to render a frame, keeping
+    ///   the surface alive. ~2% CPU even when "paused".
+    /// - `throttle`: re-spawn LWE with `--fps 1` when paused. Cleanest
+    ///   visual, but costs ~2s of respawn latency on pause/resume.
+    #[serde(default)]
+    pub pause: PauseConfig,
+
+    /// FPS cap for the LWE process when ACTIVE (not paused). LWE
+    /// supports `--fps <N>` natively (default 30). Setting this lower
+    /// than the monitor refresh trades smoothness for CPU/GPU.
+    #[serde(default)]
+    pub fps: FpsConfig,
+
+    /// Static-photo fallback. When LWE is dead or the user pauses
+    /// with `pause.mode = "hard"` and `fallback.enabled = true`,
+    /// paperforge renders a still image into the layer via a small
+    /// Wayland helper (`paperforge-fallback`, shipped as a separate
+    /// binary). Defaults to looking under `~/.local/share/backgrounds/`
+    /// and the last-rendered scene screenshot under
+    /// `~/.cache/paperforge/last-frame/`.
+    #[serde(default)]
+    pub fallback: FallbackConfig,
+}
+
+/// Static-image fallback for when LWE is not running. The renderer
+/// is a separate binary (`paperforge-fallback`) that creates a
+/// wl_subsurface layer with the configured image. The binary is not
+/// built by default; when it's missing, paperforge logs a warning
+/// and the layer shows the compositor's default (grey on niri).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FallbackConfig {
+    /// Master switch. When `true` and the fallback binary exists,
+    /// paperforge spawns it when LWE dies.
+    #[serde(default = "default_fallback_enabled")]
+    pub enabled: bool,
+    /// Search paths for static images, in priority order. The first
+    /// existing file wins. Defaults to:
+    /// 1. `~/.local/share/backgrounds/` (XDG standard)
+    /// 2. `~/.cache/paperforge/last-frame/` (paperforge's own
+    ///    last-rendered scene screenshots)
+    /// 3. `~/.local/state/pollinations-gamebar/generated-images/` (operator's generated images)
+    #[serde(default)]
+    pub search_paths: Vec<PathBuf>,
+}
+
+impl Default for FallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_fallback_enabled(),
+            search_paths: default_fallback_search_paths(),
+        }
+    }
+}
+
+fn default_fallback_enabled() -> bool {
+    true
+}
+
+fn default_fallback_search_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".local/share/backgrounds"));
+        paths.push(home.join(".cache/paperforge/last-frame"));
+        paths.push(home.join(".local/state/pollinations-gamebar/generated-images"));
+    }
+    paths
+}
+
+/// Pause behaviour — see [`Config::pause`] for the high-level
+/// rationale and the trade-off matrix.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PauseConfig {
+    /// `hard` | `soft` | `throttle` (case-insensitive on load).
+    pub mode: PauseMode,
+    /// Effective fps target when paused in `soft` mode. Drives the
+    /// SIGSTOP/SIGCONT duty cycle.
+    #[serde(default = "default_paused_fps")]
+    pub paused_fps: u32,
+    /// `soft` mode: how long LWE is allowed to render before SIGSTOP
+    /// (milliseconds). Smaller = more responsive to resume, but more
+    /// wake-up overhead. Default 100 ms.
+    #[serde(default = "default_clock_awake_ms")]
+    pub clock_awake_ms: u64,
+    /// `soft` mode: how long LWE is frozen before the next SIGCONT
+    /// (milliseconds). Default 400 ms — combined with `clock_awake_ms`
+    /// yields ~6 fps perceived.
+    #[serde(default = "default_clock_asleep_ms")]
+    pub clock_asleep_ms: u64,
+}
+
+impl Default for PauseConfig {
+    fn default() -> Self {
+        Self {
+            mode: PauseMode::Frame,
+            paused_fps: default_paused_fps(),
+            clock_awake_ms: default_clock_awake_ms(),
+            clock_asleep_ms: default_clock_asleep_ms(),
+        }
+    }
+}
+
+fn default_paused_fps() -> u32 {
+    2
+}
+
+fn default_clock_awake_ms() -> u64 {
+    100
+}
+
+fn default_clock_asleep_ms() -> u64 {
+    400
+}
+
+/// Pause mode — string-compatible with the on-disk `mode = "frame"`
+/// field. Unknown values fail at deserialize time (we'd rather a
+/// config typo surface immediately than silently fall back to `hard`).
+///
+/// Semantics (v0.3):
+///
+/// - `hard`: pure SIGSTOP. Cheapest. Grey surface on niri because
+///   the layer-shell stops receiving frames.
+/// - `frame` (default, was called `soft` in early drafts): SIGSTOP /
+///   SIGCONT duty cycle. Process sleeps most of the cycle and wakes
+///   briefly to render a frame, keeping the surface alive. ~2% CPU
+///   even when "paused", no grey. This is the "intermediate" pause:
+///   not kernel-level kill, but the rendered frame is frozen during
+///   the SIGSTOP window because the Wayland buffer is preserved.
+/// - `throttle`: re-spawn LWE with `--fps 1`. Cleanest visual (frames
+///   keep coming at 1 Hz so animation isn't fully frozen), but costs
+///   ~2s respawn latency on pause / resume.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PauseMode {
+    /// Pure SIGSTOP. Cheapest. Grey surface on niri.
+    Hard,
+    /// SIGSTOP/SIGCONT clock. Default in v0.3.
+    Frame,
+    /// Re-spawn LWE with `--fps 1`. Cleanest, but ~2s respawn cost.
+    Throttle,
+}
+
+impl std::str::FromStr for PauseMode {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "hard" => Ok(Self::Hard),
+            "frame" | "soft" => Ok(Self::Frame), // "soft" legacy alias
+            "throttle" => Ok(Self::Throttle),
+            other => Err(format!(
+                "unknown pause mode: {other} (expected: hard | frame | throttle)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for PauseMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Hard => "hard",
+            Self::Frame => "frame",
+            Self::Throttle => "throttle",
+        })
+    }
+}
+
+/// FPS cap configuration for the LWE process when active.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FpsConfig {
+    /// FPS cap when active. Passed as `--fps <N>` to LWE. The pool's
+    /// `set()` always re-uses this value, so changes take effect on
+    /// the next respawn (or immediately if you call
+    /// `BackendOps::set_active_fps`).
+    #[serde(default = "default_active_max_fps")]
+    pub active_max: u32,
+    /// `auto` (default) detects monitor refresh via `niri msg outputs`
+    /// at daemon start and clamps `active_max` to that. `fixed` uses
+    /// `active_max` verbatim.
+    #[serde(default = "default_fps_mode")]
+    pub mode: FpsMode,
+    /// Smart calibration — if GPU/CPU load is high, halve `active_max`
+    /// until load drops below the threshold. Reads
+    /// `/sys/class/drm/card*/device/gpu_busy_percent` (no sudo) and
+    /// `/proc/loadavg` as a CPU fallback.
+    #[serde(default)]
+    pub smart: SmartCalibration,
+}
+
+impl Default for FpsConfig {
+    fn default() -> Self {
+        Self {
+            active_max: default_active_max_fps(),
+            mode: default_fps_mode(),
+            smart: SmartCalibration::default(),
+        }
+    }
+}
+
+fn default_active_max_fps() -> u32 {
+    60
+}
+
+fn default_fps_mode() -> FpsMode {
+    FpsMode::Auto
+}
+
+/// How `active_max` is resolved. `auto` queries the compositor at
+/// daemon start; `fixed` uses the config value verbatim.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FpsMode {
+    /// Detect monitor refresh rate and clamp `active_max` to that.
+    Auto,
+    /// Use `active_max` as configured.
+    Fixed,
+}
+
+/// Smart calibration: auto-halve `active_max` when system load is
+/// hot. Disabled by default — opt in via `[fps.smart] enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SmartCalibration {
+    /// Master switch. When `false`, the rest of this struct is
+    /// ignored and `active_max` is never adjusted at runtime.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Threshold above which `active_max` is halved. Range 0.0–1.0.
+    /// 0.80 = "if GPU/CPU is more than 80% busy, throttle".
+    #[serde(default = "default_gpu_load_high")]
+    pub gpu_load_high_threshold: f32,
+    /// Re-check interval (seconds). Smart calibration is a back-off:
+    /// it does not poll every frame. Default 30s.
+    #[serde(default = "default_smart_check_interval_s")]
+    pub check_interval_s: u64,
+}
+
+impl Default for SmartCalibration {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gpu_load_high_threshold: default_gpu_load_high(),
+            check_interval_s: default_smart_check_interval_s(),
+        }
+    }
+}
+
+fn default_gpu_load_high() -> f32 {
+    0.80
+}
+
+fn default_smart_check_interval_s() -> u64 {
+    30
 }
 
 fn default_true() -> bool {
@@ -129,6 +387,9 @@ impl Default for Config {
             auto_mute_on_fullscreen: true,
             lwe_supports_audio_signals: None,
             pool_enabled: true,
+            pause: PauseConfig::default(),
+            fps: FpsConfig::default(),
+            fallback: FallbackConfig::default(),
         }
     }
 }
@@ -314,6 +575,85 @@ mod tests {
         let cfg = Config::default();
         let backend = cfg.backend();
         assert_eq!(backend.kind(), BackendKind::LinuxWallpaperEngine);
+    }
+
+    #[test]
+    fn default_pause_mode_is_frame() {
+        // The "intermediate" mode (SIGSTOP/SIGCONT clock) is the
+        // v0.3 default — see PauseMode doc for rationale.
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.pause.mode,
+            PauseMode::Frame,
+            "pause.mode must default to Frame (the intermediate \
+             SIGSTOP/SIGCONT-clock mode) so paused wallpapers stay \
+             visible instead of niri showing the layer background"
+        );
+    }
+
+    #[test]
+    fn default_fps_active_max_is_60() {
+        let cfg = Config::default();
+        assert_eq!(cfg.fps.active_max, 60);
+        assert_eq!(cfg.fps.mode, FpsMode::Auto);
+    }
+
+    #[test]
+    fn default_smart_calibration_is_disabled() {
+        let cfg = Config::default();
+        assert!(
+            !cfg.fps.smart.enabled,
+            "smart calibration must be opt-in (default false)"
+        );
+    }
+
+    #[test]
+    fn roundtrip_pause_mode_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths {
+            config_dir: tmp.path().to_path_buf(),
+            playlists_dir: tmp.path().join("playlists"),
+            cache_dir: tmp.path().join("cache"),
+            thumbnails_dir: tmp.path().join("cache").join("thumbnails"),
+            inventory_cache: tmp.path().join("cache").join("inventory.json"),
+        };
+        for d in [
+            &paths.config_dir,
+            &paths.playlists_dir,
+            &paths.cache_dir,
+            &paths.thumbnails_dir,
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let cfg = Config {
+            pause: PauseConfig {
+                mode: PauseMode::Frame,
+                paused_fps: 4,
+                clock_awake_ms: 80,
+                clock_asleep_ms: 320,
+            },
+            ..Config::default()
+        };
+        cfg.save(&paths).unwrap();
+        let loaded = Config::load(&paths).unwrap();
+        assert_eq!(loaded.pause.mode, PauseMode::Frame);
+        assert_eq!(loaded.pause.paused_fps, 4);
+        assert_eq!(loaded.pause.clock_awake_ms, 80);
+    }
+
+    #[test]
+    fn pause_mode_from_str_legacy_alias_soft() {
+        // Pre-v0.3 configs used `mode = "soft"`. We still parse that
+        // as Frame (the same mode under a new name).
+        let mode: PauseMode = "soft".parse().unwrap();
+        assert_eq!(mode, PauseMode::Frame);
+        let mode: PauseMode = "frame".parse().unwrap();
+        assert_eq!(mode, PauseMode::Frame);
+        let mode: PauseMode = "hard".parse().unwrap();
+        assert_eq!(mode, PauseMode::Hard);
+        let mode: PauseMode = "throttle".parse().unwrap();
+        assert_eq!(mode, PauseMode::Throttle);
+        assert!("bogus".parse::<PauseMode>().is_err());
     }
 
     #[test]

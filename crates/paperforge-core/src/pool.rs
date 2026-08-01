@@ -76,13 +76,17 @@ use crate::{
 /// `child` is held as an `Option` so we can `take()` it during a swap
 /// (kill + wait), then `replace()` with a fresh `Child`.
 #[derive(Debug)]
-struct PoolProcess {
-    pid: i32,
+pub struct PoolProcess {
+    /// OS pid of the spawned LWE process.
+    pub pid: i32,
     /// `output_name` → `content_id` for every `--screen-root` pair in
     /// the current argv. BTreeMap keeps iteration deterministic for
     /// argv construction (tests + reproducible respawns).
-    bindings: BTreeMap<String, String>,
-    child: Option<std::process::Child>,
+    pub bindings: BTreeMap<String, String>,
+    /// Handle to the spawned child so we can `wait()` after SIGTERM
+    /// during hot-swap. Held as `Option` so we can `take()` it during
+    /// the swap and `replace()` with the fresh `Child`.
+    pub child: Option<std::process::Child>,
 }
 
 /// LWE single-pool: one process, multi-output argv.
@@ -103,6 +107,10 @@ pub struct LweSinglePool {
     /// Common flags appended to every invocation (e.g. `--silent`,
     /// `--disable-particles`). Operator-overridable via constructor.
     common_flags: Vec<String>,
+    /// FPS cap passed as `--fps <N>` to LWE. Defaults to 30 (LWE's
+    /// own default). Smart calibration can override this at runtime
+    /// via [`Self::set_active_fps`].
+    active_fps: u32,
     inner: Arc<Mutex<Option<PoolProcess>>>,
 }
 
@@ -117,6 +125,7 @@ impl LweSinglePool {
         Self {
             binary: binary.into(),
             common_flags: default_flags(),
+            active_fps: 30,
             inner: Arc::new(Mutex::new(None)),
         }
     }
@@ -129,13 +138,36 @@ impl LweSinglePool {
         self
     }
 
+    /// Override the FPS cap (mostly for tests / smart calibration).
+    pub fn with_active_fps(mut self, fps: u32) -> Self {
+        self.active_fps = fps;
+        self
+    }
+
+    /// Read the current FPS cap (passed as `--fps <N>` to LWE).
+    pub fn active_fps(&self) -> u32 {
+        self.active_fps
+    }
+
+    /// Update the FPS cap at runtime. The new value takes effect on
+    /// the next respawn (current process keeps its existing
+    /// `--fps` argv until it's respawned).
+    pub fn set_active_fps(&mut self, fps: u32) {
+        self.active_fps = fps;
+    }
+
     /// Return the in-memory current argv (one entry per flag), used by
     /// tests + the upcoming `daemon get_state` D-Bus method.
     pub async fn current_argv(&self) -> Option<Vec<String>> {
         let guard = self.inner.lock().await;
-        guard
-            .as_ref()
-            .map(|p| build_argv(&self.binary, &p.bindings, &self.common_flags))
+        guard.as_ref().map(|p| {
+            build_argv(
+                &self.binary,
+                &p.bindings,
+                &self.common_flags,
+                self.active_fps,
+            )
+        })
     }
 
     /// Return the current bindings (output → content_id), or empty.
@@ -222,7 +254,12 @@ impl LweSinglePool {
         }
 
         // Spawn the new process.
-        let argv = build_argv(&self.binary, &new_bindings, &self.common_flags);
+        let argv = build_argv(
+            &self.binary,
+            &new_bindings,
+            &self.common_flags,
+            self.active_fps,
+        );
         let mut cmd = Command::new(&self.binary);
         cmd.args(&argv[1..]); // argv[0] is the binary itself; Command already has it
         let child = cmd.spawn().map_err(|e| Error::BackendFailure {
@@ -315,7 +352,12 @@ impl LweSinglePool {
         }
 
         // Step 5: spawn fresh with the remaining bindings.
-        let argv = build_argv(&self.binary, &new_bindings, &self.common_flags);
+        let argv = build_argv(
+            &self.binary,
+            &new_bindings,
+            &self.common_flags,
+            self.active_fps,
+        );
         let mut cmd = Command::new(&self.binary);
         cmd.args(&argv[1..]);
         let child = cmd.spawn().map_err(|e| Error::BackendFailure {
@@ -354,6 +396,38 @@ impl LweSinglePool {
             message: format!("SIGSTOP to pid {} failed: {e}", proc.pid),
         })?;
         Ok(Some(proc.pid))
+    }
+
+    /// Frame pause: SIGSTOP + tokio SIGCONT/SIGSTOP clock so the
+    /// layer-shell surface keeps receiving frames. Default behaviour
+    /// in v0.3.
+    ///
+    /// The cycle task holds an `Arc<Mutex<Option<PoolProcess>>>` clone
+    /// of `self.inner`. When the LWE process dies (respawn watcher
+    /// replaces it under a new PID), the cycle continues with the
+    /// new PID because we re-read `self.inner` at each iteration.
+    pub async fn pause_soft(&self, awake_ms: u64, asleep_ms: u64) -> Result<Option<i32>> {
+        let (started, pid) = {
+            let guard = self.inner.lock().await;
+            let Some(proc) = guard.as_ref() else {
+                return Ok(None);
+            };
+            kill(Pid::from_raw(proc.pid), Signal::SIGSTOP).map_err(|e| Error::BackendFailure {
+                kind: BackendKind::LinuxWallpaperEngine
+                    .process_pattern()
+                    .to_string(),
+                message: format!("SIGSTOP to pid {} failed: {e}", proc.pid),
+            })?;
+            (true, proc.pid)
+        };
+        if started {
+            tokio::spawn(super::backend::soft_pause_cycle_pool(
+                self.inner.clone(),
+                awake_ms,
+                asleep_ms,
+            ));
+        }
+        Ok(Some(pid))
     }
 
     /// SIGCONT the current LWE process (global resume).
@@ -409,8 +483,9 @@ fn build_argv(
     binary: &Path,
     bindings: &BTreeMap<String, String>,
     common_flags: &[String],
+    active_fps: u32,
 ) -> Vec<String> {
-    let mut argv = Vec::with_capacity(3 + bindings.len() * 4 + common_flags.len());
+    let mut argv = Vec::with_capacity(3 + bindings.len() * 4 + common_flags.len() + 2);
     argv.push(binary.display().to_string());
     for (out, id) in bindings {
         argv.push("--screen-root".to_string());
@@ -419,6 +494,10 @@ fn build_argv(
         argv.push(id.clone());
     }
     argv.extend(common_flags.iter().cloned());
+    // FPS cap last so it always wins on the argv even if common_flags
+    // includes another `--fps` (operator override via config).
+    argv.push("--fps".to_string());
+    argv.push(active_fps.to_string());
     argv
 }
 
@@ -456,8 +535,9 @@ mod tests {
         let mut bindings = BTreeMap::new();
         bindings.insert("DP-1".to_string(), "111".to_string());
         bindings.insert("HDMI-A-1".to_string(), "222".to_string());
-        let argv = build_argv(&binary, &bindings, &["--silent".to_string()]);
-        // BTreeMap iterates sorted by key.
+        let argv = build_argv(&binary, &bindings, &["--silent".to_string()], 30);
+        // BTreeMap iterates sorted by key. `--fps 30` is appended
+        // last so it always wins on the argv.
         assert_eq!(
             argv,
             vec![
@@ -471,6 +551,8 @@ mod tests {
                 "--bg",
                 "222",
                 "--silent",
+                "--fps",
+                "30",
             ]
         );
     }
@@ -478,8 +560,8 @@ mod tests {
     #[test]
     fn build_argv_empty_bindings_just_binary_and_flags() {
         let binary = PathBuf::from("/usr/bin/lwe");
-        let argv = build_argv(&binary, &BTreeMap::new(), &["--silent".to_string()]);
-        assert_eq!(argv, vec!["/usr/bin/lwe", "--silent"]);
+        let argv = build_argv(&binary, &BTreeMap::new(), &["--silent".to_string()], 30);
+        assert_eq!(argv, vec!["/usr/bin/lwe", "--silent", "--fps", "30"]);
     }
 
     #[test]
