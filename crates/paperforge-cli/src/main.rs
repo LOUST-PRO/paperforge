@@ -89,6 +89,16 @@ enum Cmd {
     /// Start the LWE pool daemon (D-Bus service + hotplug watcher).
     /// Blocks until SIGINT/SIGTERM, then performs graceful shutdown.
     Daemon,
+    /// Manually trigger a self-heal pass: re-bind any output whose
+    /// LWE process has died. Useful when the background reconciler
+    /// in the daemon hasn't run yet (e.g. right after the daemon
+    /// starts, or after a manual kill of a single LWE process for
+    /// debugging).
+    ///
+    /// This talks to the running daemon over D-Bus — it does NOT
+    /// spawn its own LWE instances. If no daemon is running, the
+    /// command exits with an error.
+    Reconcile,
     /// Self-update: query, apply, or roll back a paperforge upgrade.
     /// Off-by-default; requires `enabled = true` in
     /// `~/.config/paperforge/updater.toml`.
@@ -352,6 +362,30 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Daemon => {
             run_daemon(cfg).await?;
         }
+        Cmd::Reconcile => {
+            // Talk to the running daemon over D-Bus to trigger an
+            // immediate self-heal pass. If no daemon is up, the
+            // client surfaces a connection error instead of
+            // silently doing nothing.
+            let client = paperforge_core::dbus::PaperforgeClient::connect()
+                .await
+                .context("connecting to paperforge D-Bus interface (is `paperforge daemon` running?)")?;
+            match client.reconcile().await {
+                Ok(pairs) => {
+                    if pairs.is_empty() {
+                        println!("reconcile: nothing to re-bind (all LWE PIDs alive)");
+                    } else {
+                        for (output, pid) in &pairs {
+                            println!("reconcile: re-bound {output} pid={pid}");
+                        }
+                        println!("reconcile: {} output(s) re-bound", pairs.len());
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("reconcile failed: {e}"));
+                }
+            }
+        }
         Cmd::SelfUpdate {
             check,
             apply,
@@ -529,6 +563,14 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     //    hotplug module's doc comment).
     let hotplug_handle = tokio::spawn(hotplug_dispatcher(daemon.clone(), Duration::from_secs(2)));
 
+    // 5b. Self-heal reconciler: every ~30s, re-bind outputs whose
+    //     LWE process has died (SIGCHLD left a stale pid in the map).
+    //     Cheap (one /proc read per output) and bounded (no I/O burst).
+    let reconcile_handle = tokio::spawn(reconcile_dispatcher(
+        daemon.clone(),
+        Duration::from_secs(30),
+    ));
+
     // 6. Wait for SIGINT/SIGTERM.
     let sig = wait_for_shutdown_signal().await?;
     tracing::info!("received {sig}; shutting down");
@@ -536,8 +578,10 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // 7. Graceful shutdown.
     dbus_handle.abort();
     hotplug_handle.abort();
+    reconcile_handle.abort();
     let _ = dbus_handle.await;
     let _ = hotplug_handle.await;
+    let _ = reconcile_handle.await;
 
     if let Err(e) = lwe_ops.backend().pool().shutdown().await {
         tracing::warn!("pool shutdown: {e}");
@@ -566,6 +610,31 @@ async fn hotplug_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Durati
         }
     }
     tracing::debug!(target: "paperforge", "hotplug dispatcher exiting");
+}
+
+/// Self-heal reconciler: periodically calls `daemon.reconcile()` to
+/// re-bind outputs whose LWE process has died (SIGCHLD leaks). Cheap
+/// (one `/proc/<pid>/status` read per output) and bounded (single
+/// spawn attempt per dead output per pass).
+async fn reconcile_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Duration) {
+    let mut ticker = tokio::time::interval(poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // First tick fires immediately; skip it so we don't reconcile
+    // before the daemon has finished its own startup (which sets
+    // `known_outputs` via hotplug).
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let respawned = daemon.reconcile().await;
+        if !respawned.is_empty() {
+            tracing::info!(
+                target: "paperforge",
+                "reconcile pass complete: {} output(s) re-spawned: {:?}",
+                respawned.len(),
+                respawned.iter().map(|(o, p)| format!("{o}={p}")).collect::<Vec<_>>()
+            );
+        }
+    }
 }
 
 /// Block SIGINT/SIGTERM/SIGHUP in a dedicated thread, then `sigwait`.

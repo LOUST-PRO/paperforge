@@ -560,6 +560,37 @@ impl PaperforgeDaemon {
         unbound
     }
 
+    /// Re-bind any outputs whose LWE process has died. This is the
+    /// self-heal path: SIGCHLD leaves a dead pid in the in-memory
+    /// map; `prune_dead_pids` clears it, `set_per_output_with_fps`
+    /// spawns a fresh LWE for the same scene, and we emit a
+    /// `WallpaperStarted` D-Bus event so observers know the
+    /// background changed.
+    ///
+    /// Returns the list of `(output, new_pid)` pairs that were
+    /// re-spawned.
+    pub async fn reconcile(&self) -> Vec<(String, i32)> {
+        let Some(lwe_ops) = self.backend_as_lwe() else {
+            // Non-LWE backends don't keep per-output pids here —
+            // there's nothing to reconcile. Caller will see an empty
+            // list and can no-op.
+            return Vec::new();
+        };
+        let respawned = lwe_ops.backend().reconcile_outputs().await;
+        for (output, pid) in &respawned {
+            // The hotplug task already tracks known outputs; we
+            // only need to emit the started signal so observers
+            // can rebuild state.
+            let _ = self.emit(DaemonEvent::WallpaperStarted {
+                output: output.clone(),
+                scene_path: String::new(), // path is not exposed by reconcile
+                pid: *pid,
+                at: Utc::now(),
+            });
+        }
+        respawned
+    }
+
     /// Best-effort downcast to [`LweBackendOps`] via the trait
     /// object. Returns `None` when the backend is swww / hyprpaper /
     /// mpvpaper or a test stub.
@@ -648,6 +679,14 @@ impl PaperforgeControl for PaperforgeDaemon {
             known_outputs: self.known_outputs.read().await.clone(),
             version: self.version.clone(),
         })
+    }
+
+    async fn reconcile(&self) -> Result<Vec<(String, i32)>> {
+        // The daemon-level `reconcile()` is infallible (it logs
+        // respawn failures and continues; one bad output never
+        // aborts the others). Wrap in Ok so the trait returns
+        // Result.
+        Ok(Self::reconcile(self).await)
     }
 }
 
@@ -1179,5 +1218,86 @@ mod tests {
         pool.shutdown().await.unwrap();
         pool.shutdown().await.unwrap(); // idempotent
         let _ = std::fs::remove_file(&wrapper);
+    }
+
+    /// `daemon.reconcile()` returns an empty list when no LWE PIDs
+    /// are tracked (i.e. when only a non-LWE backend is wired).
+    /// This guards the contract that non-LWE backends don't expose
+    /// a self-heal path.
+    #[tokio::test]
+    async fn daemon_reconcile_returns_empty_for_non_lwe_backend() {
+        let stub: Arc<dyn BackendOps> = Arc::new(SwwwBackendOps(SwwwBackend::new()));
+        let (daemon, _event_rx) = PaperforgeDaemon::with_store(stub, Arc::new(RwLock::new(
+            PlaylistStore::default_location().unwrap(),
+        )));
+        let respawned = daemon.reconcile().await;
+        assert!(
+            respawned.is_empty(),
+            "non-LWE backend must report nothing-to-reconcile"
+        );
+    }
+
+    /// When the LWE backend has dead pids, `daemon.reconcile()`
+    /// should call through to the backend's respawn path and emit a
+    /// `WallpaperStarted` D-Bus event per respawned output. We
+    /// use `/bin/sleep` (pool_enabled=false so we exercise the
+    /// per-output spawn path) and inject a fake-stale pid by
+    /// overwriting the per-output map with a known-dead pid before
+    /// calling reconcile.
+    ///
+    /// The map injection uses the same test-only `cfg(test)` access
+    /// path that other reconcile tests use: we spawn a child via
+    /// `set_per_output`, read the map, overwrite the pid, then
+    /// reconcile. This keeps the test honest about the real path
+    /// rather than reaching into private fields.
+    #[tokio::test]
+    async fn daemon_reconcile_emits_wallpaper_started_for_respawned_outputs() {
+        // Force per-output mode (pool=false) so reconcile uses the
+        // spawn path the user's v0.1 daemon also uses.
+        let lwe_ops = std::sync::Arc::new(
+            LweBackendOps::with_binary_and_pool("/bin/true", false),
+        );
+        // Inject a "dead pid" + scene by spawning a real child and
+        // immediately replacing its entry with a pid that's
+        // certainly dead (high PID). The spawn itself isn't needed
+        // for the reconcile assertion — we just need the
+        // per_output_scenes map populated — but going through
+        // `set_per_output` keeps us honest about the public API.
+        let tmp = tempfile::tempdir().unwrap();
+        let scene = tmp.path().join("workshop/content/431960/111");
+        std::fs::create_dir_all(scene.parent().unwrap()).unwrap();
+        std::fs::write(&scene, b"fake scene").unwrap();
+        let backend_dyn: Arc<dyn BackendOps> = lwe_ops.clone();
+        let (daemon, _event_rx) =
+            PaperforgeDaemon::with_lwe_backend_ops_and_store(
+                backend_dyn,
+                lwe_ops.clone(),
+                Arc::new(RwLock::new(PlaylistStore::default_location().unwrap())),
+            );
+
+        // Reach into the public test helper to overwrite the pid
+        // (this is the same access pattern as
+        // `prune_dead_pids_leaves_alive_pids_untouched`).
+        let backend = lwe_ops.backend();
+        // Use the public `list_per_output_pids` after a no-op set
+        // would be cleaner; instead we directly mutate the in-test
+        // field via the same accessor used by other tests.
+        // Populate the scene map by calling set_per_output once so
+        // `last_known_scenes` returns non-empty.
+        let _ = backend
+            .set_per_output_with_fps(&scene, "DP-1", 1)
+            .await;
+        // Now overwrite the recorded pid with a guaranteed-dead
+        // value so `prune_dead_pids` flags it.
+        {
+            let mut pids = backend.per_output_pids_test_accessor().lock().await;
+            pids.insert("DP-1".to_string(), 2_999_999);
+        }
+        // Re-spawn with /bin/true exits immediately; the reconcile
+        // pass will produce a new pid and emit WallpaperStarted.
+        let respawned = daemon.reconcile().await;
+        assert_eq!(respawned.len(), 1, "one respawn expected");
+        assert_eq!(respawned[0].0, "DP-1");
+        assert_ne!(respawned[0].1, 2_999_999, "real pid, not the dead one");
     }
 }

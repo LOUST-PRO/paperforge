@@ -108,6 +108,12 @@ pub trait PaperforgeControl: Send + Sync {
     /// Apply a named playlist from the playlist store.
     async fn apply_playlist(&self, name: &str) -> Result<()>;
 
+    /// Trigger an immediate self-heal pass: re-bind any output
+    /// whose LWE process has died. Returns the `(output, new_pid)`
+    /// pairs that were re-spawned (empty when everything was already
+    /// alive).
+    async fn reconcile(&self) -> Result<Vec<(String, i32)>>;
+
     /// Return a JSON snapshot of the daemon state.
     async fn get_state(&self) -> Result<DaemonState>;
 }
@@ -200,6 +206,22 @@ impl PaperforgeInterface {
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
     }
 
+    /// Re-bind outputs whose LWE died. Returns `a(ss)` — array of
+    /// `(output, new_pid_string)` tuples. `new_pid_string` is a
+    /// string-encoded i32 for stability across zbus signature
+    /// changes (signals the same way).
+    async fn reconcile(&self) -> zbus::fdo::Result<Vec<(String, String)>> {
+        let pairs = self
+            .ctrl
+            .reconcile()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))?;
+        Ok(pairs
+            .into_iter()
+            .map(|(output, pid)| (output, pid.to_string()))
+            .collect())
+    }
+
     /// Return JSON-encoded [`DaemonState`].
     async fn get_state(&self) -> zbus::fdo::Result<String> {
         let s = self
@@ -237,6 +259,80 @@ impl PaperforgeInterface {
 pub const BUS_NAME: &str = "org.louzt.Paperforge";
 /// Standard D-Bus object path for paperforge.
 pub const OBJECT_PATH: &str = "/org/louzt/Paperforge";
+
+/// Thin D-Bus client used by the `paperforge reconcile` CLI.
+///
+/// Hides the `zbus::proxy` macro plumbing from downstream crates
+/// (the `zbus` dependency lives only in `paperforge-core`). The
+/// client connects to the session bus, looks up the
+/// `org.louzt.Paperforge1` interface, and exposes a typed `reconcile`
+/// call that returns parsed `(output, pid)` tuples.
+///
+/// All methods are infallible at the type level: the D-Bus transport
+/// maps any failure to an [`Error::Other`] so the CLI can just
+/// `anyhow!()` it.
+pub struct PaperforgeClient {
+    conn: zbus::connection::Connection,
+    if_name: zbus::names::InterfaceName<'static>,
+    obj_path: zbus::zvariant::ObjectPath<'static>,
+}
+
+impl PaperforgeClient {
+    /// Connect to the running daemon. Returns an error if no
+    /// `paperforge daemon` is reachable on the session bus.
+    pub async fn connect() -> crate::error::Result<Self> {
+        let conn = zbus::connection::Connection::session()
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("session bus: {e}")))?;
+        let if_name: zbus::names::InterfaceName<'static> = zbus::names::InterfaceName::try_from("org.louzt.Paperforge1")
+            .map_err(|e| Error::Other(anyhow::anyhow!("interface name: {e}")))?;
+        let obj_path: zbus::zvariant::ObjectPath<'static> = zbus::zvariant::ObjectPath::try_from(OBJECT_PATH)
+            .map_err(|e| Error::Other(anyhow::anyhow!("object path: {e}")))?;
+        Ok(Self {
+            conn,
+            if_name,
+            obj_path,
+        })
+    }
+
+    /// Call `Reconcile` on the daemon. Returns the `(output,
+    /// new_pid)` pairs that were re-spawned (empty when nothing
+    /// needed re-binding).
+    pub async fn reconcile(&self) -> crate::error::Result<Vec<(String, i32)>> {
+        // Use the raw `call_method` API: we don't want to drag the
+        // `#[zbus::proxy]` macro + a generated `PaperforgeControlProxy`
+        // struct into this crate just for one method. The interface
+        // declares `reconcile() → a(ss)` (array of (string, string)
+        // tuples); we parse each string to i32 here.
+        let reply = self
+            .conn
+            .call_method(
+                Some(BUS_NAME),
+                self.obj_path.clone(),
+                Some(self.if_name.clone()),
+                "Reconcile",
+                &(),
+            )
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("D-Bus Reconcile call: {e}")))?;
+        // The reply body is an array of (String, String) structs.
+        let body = reply.body();
+        let parsed: Vec<(String, String)> = body
+            .deserialize()
+            .map_err(|e| Error::Other(anyhow::anyhow!("D-Bus response parse: {e}")))?;
+        parsed
+            .into_iter()
+            .map(|(output, pid_str)| {
+                let pid = pid_str.parse::<i32>().map_err(|e| {
+                    Error::Other(anyhow::anyhow!(
+                        "D-Bus returned non-numeric pid {pid_str:?} for output {output}: {e}"
+                    ))
+                })?;
+                Ok((output, pid))
+            })
+            .collect()
+    }
+}
 
 /// Serve the D-Bus interface on the session bus. Returns once the
 /// connection is established and the interface is registered.
@@ -395,6 +491,11 @@ mod tests {
                 .push(format!("apply_playlist:{name}"));
             *self.applied.lock().unwrap() = Some(name.to_string());
             Ok(())
+        }
+
+        async fn reconcile(&self) -> Result<Vec<(String, i32)>> {
+            self.calls.lock().unwrap().push("reconcile".to_string());
+            Ok(Vec::new())
         }
 
         async fn get_state(&self) -> Result<DaemonState> {
