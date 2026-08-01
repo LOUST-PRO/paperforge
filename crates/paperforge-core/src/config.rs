@@ -188,18 +188,23 @@ fn default_fallback_search_paths() -> Vec<PathBuf> {
 /// rationale and the trade-off matrix.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PauseConfig {
-    /// `hard` | `soft` | `throttle` (case-insensitive on load).
+    /// `hard` | `frame` | `throttle` (case-insensitive on load;
+    /// `soft` accepted as a legacy alias for `frame`).
+    #[serde(
+        default = "default_pause_mode",
+        deserialize_with = "deserialize_pause_mode"
+    )]
     pub mode: PauseMode,
-    /// Effective fps target when paused in `soft` mode. Drives the
+    /// Effective fps target when paused in `frame` mode. Drives the
     /// SIGSTOP/SIGCONT duty cycle.
     #[serde(default = "default_paused_fps")]
     pub paused_fps: u32,
-    /// `soft` mode: how long LWE is allowed to render before SIGSTOP
+    /// `frame` mode: how long LWE is allowed to render before SIGSTOP
     /// (milliseconds). Smaller = more responsive to resume, but more
     /// wake-up overhead. Default 100 ms.
     #[serde(default = "default_clock_awake_ms")]
     pub clock_awake_ms: u64,
-    /// `soft` mode: how long LWE is frozen before the next SIGCONT
+    /// `frame` mode: how long LWE is frozen before the next SIGCONT
     /// (milliseconds). Default 400 ms — combined with `clock_awake_ms`
     /// yields ~6 fps perceived.
     #[serde(default = "default_clock_asleep_ms")]
@@ -219,6 +224,10 @@ impl Default for PauseConfig {
 
 fn default_paused_fps() -> u32 {
     2
+}
+
+fn default_pause_mode() -> PauseMode {
+    PauseMode::Frame
 }
 
 fn default_clock_awake_ms() -> u64 {
@@ -246,8 +255,7 @@ fn default_clock_asleep_ms() -> u64 {
 /// - `throttle`: re-spawn LWE with `--fps 1`. Cleanest visual (frames
 ///   keep coming at 1 Hz so animation isn't fully frozen), but costs
 ///   ~2s respawn latency on pause / resume.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PauseMode {
     /// Pure SIGSTOP. Cheapest. Grey surface on niri.
     Hard,
@@ -279,6 +287,28 @@ impl std::fmt::Display for PauseMode {
             Self::Throttle => "throttle",
         })
     }
+}
+
+/// Custom `Serialize` so the on-disk representation matches what
+/// `FromStr` accepts (single token, case-insensitive).
+impl serde::Serialize for PauseMode {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.to_string())
+    }
+}
+
+/// Field-level deserializer for [`PauseMode`] (see `PauseConfig::mode`
+/// for the `#[serde(deserialize_with)]` wiring). Delegating to
+/// `FromStr` keeps CLI / config / future callers on the same parser.
+/// `Deserialize` is intentionally NOT derived on `PauseMode` because
+/// that would produce a competing impl that shadows the field-level
+/// one — we own this surface explicitly to avoid surprises.
+fn deserialize_pause_mode<'de, D>(de: D) -> std::result::Result<PauseMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(de)?;
+    s.parse().map_err(serde::de::Error::custom)
 }
 
 /// FPS cap configuration for the LWE process when active.
@@ -424,14 +454,16 @@ impl Config {
     pub fn backend(&self) -> LweBackend {
         match self.backend {
             BackendKind::LinuxWallpaperEngine => match &self.backend_binary {
-                Some(p) => LweBackend::with_binary(p),
-                None => LweBackend::new(),
+                Some(p) => LweBackend::with_binary_and_fps(p, self.fps.active_max),
+                None => {
+                    LweBackend::with_binary_and_fps("linux-wallpaperengine", self.fps.active_max)
+                }
             },
             // Future: route to SwwwBackend / HyprpaperBackend here.
             // Today the CLI is LWE-only; this branch is unreachable
             // in practice until we add a `--backend swww` flag.
             BackendKind::SwwwDaemon | BackendKind::Hyprpaper | BackendKind::Mpvpaper => {
-                LweBackend::new()
+                LweBackend::with_binary_and_fps("linux-wallpaperengine", self.fps.active_max)
             }
         }
     }
@@ -447,8 +479,12 @@ impl Config {
     ///    to the v0.1 per-output spawn path.
     pub fn build_backend_ops(&self) -> Arc<LweBackendOps> {
         let ops = match &self.backend_binary {
-            Some(p) => LweBackendOps::with_binary_and_pool(p, self.pool_enabled),
-            None => LweBackendOps::with_pool(self.pool_enabled),
+            Some(p) => LweBackendOps::with_binary_and_fps_and_pool(
+                p,
+                self.fps.active_max,
+                self.pool_enabled,
+            ),
+            None => LweBackendOps::with_fps_and_pool(self.fps.active_max, self.pool_enabled),
         };
         Arc::new(ops)
     }
@@ -654,6 +690,51 @@ mod tests {
         let mode: PauseMode = "throttle".parse().unwrap();
         assert_eq!(mode, PauseMode::Throttle);
         assert!("bogus".parse::<PauseMode>().is_err());
+    }
+
+    #[test]
+    fn pause_config_toml_soft_alias_deserializes_to_frame() {
+        // Legacy configs with `mode = "soft"` (pre-v0.3 spelling) must
+        // still load cleanly via toml. Without the FromStr-delegating
+        // Deserialize, the derived impl rejects "soft".
+        let toml_text = r#"
+            mode = "soft"
+            paused_fps = 3
+            clock_awake_ms = 120
+            clock_asleep_ms = 480
+        "#;
+        let cfg: PauseConfig = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.mode, PauseMode::Frame);
+        assert_eq!(cfg.paused_fps, 3);
+        assert_eq!(cfg.clock_awake_ms, 120);
+        assert_eq!(cfg.clock_asleep_ms, 480);
+    }
+
+    #[test]
+    fn pause_config_toml_omitted_mode_defaults_to_frame() {
+        // A `PauseConfig` without `mode` should deserialize using
+        // the documented default (`frame`), not fail.
+        let toml_text = r#"
+            paused_fps = 4
+        "#;
+        let cfg: PauseConfig = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            cfg.mode,
+            PauseMode::Frame,
+            "missing pause.mode must default to Frame via serde default"
+        );
+        assert_eq!(cfg.paused_fps, 4);
+    }
+
+    #[test]
+    fn pause_config_toml_case_insensitive() {
+        // CodeRabbit nitpick: case-insensitive parsing. Same logic
+        // as FromStr; verified end-to-end through Deserialize.
+        let toml_text = r#"
+            mode = "HARD"
+        "#;
+        let cfg: PauseConfig = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.mode, PauseMode::Hard);
     }
 
     #[test]

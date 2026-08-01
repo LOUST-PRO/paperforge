@@ -149,20 +149,27 @@ pub struct LweBackend {
     /// throttle-pause modes know which scene to re-spawn with
     /// after the SIGTERM/SIGSTOP cycle.
     per_output_scenes: Arc<Mutex<BTreeMap<String, PathBuf>>>,
+    /// Cancellation notify for the active per-output soft-pause
+    /// cycle. Fired by `resume_per_output` so the cycle task exits
+    /// cleanly instead of leaking until the next SIGCONT attempt.
+    soft_pause_cancel: Arc<tokio::sync::Notify>,
 }
 
 /// Async task that wakes LWE pids on a duty cycle so the layer-shell
 /// surface stays alive while "paused".
 ///
-/// The task holds a strong reference to the pids map; when
-/// `resume_per_output` clears the map (in v0.1 the daemon path), the
-/// cycle continues until the next SIGCONT attempt fails to find the
-/// pid and exits the loop.
+/// The task holds a strong reference to the pids map; the loop
+/// aborts when the cancellation notify fires (set by
+/// `resume_per_output`). Without the notify, the previous version
+/// leaked cycles when `pause_per_output_soft` was called multiple
+/// times in a row or resumed without the daemon dropping the
+/// handle.
 async fn soft_pause_cycle(
     pids: Arc<Mutex<BTreeMap<String, i32>>>,
     initial: Vec<i32>,
     awake_ms: u64,
     asleep_ms: u64,
+    cancel: Arc<tokio::sync::Notify>,
 ) {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
@@ -171,7 +178,6 @@ async fn soft_pause_cycle(
     let asleep = Duration::from_millis(asleep_ms);
 
     loop {
-        // Wake phase: SIGCONT, sleep `awake_ms`, then SIGSTOP.
         // Snapshot the current pids (the map may have rotated under
         // us if respawn_watcher added new entries).
         let current: Vec<i32> = {
@@ -181,23 +187,38 @@ async fn soft_pause_cycle(
         if current.is_empty() && initial.is_empty() {
             return;
         }
+        // Wake phase: SIGCONT, sleep `awake_ms` (or until cancelled),
+        // then SIGSTOP.
         for pid in &current {
             let _ = kill(Pid::from_raw(*pid), Signal::SIGCONT);
         }
-        tokio::time::sleep(awake).await;
+        tokio::select! {
+            _ = tokio::time::sleep(awake) => {}
+            _ = cancel.notified() => {
+                // Caller asked us to stop; leave the pids in their
+                // current SIGCONT state so resume completes cleanly.
+                return;
+            }
+        }
         for pid in &current {
             let _ = kill(Pid::from_raw(*pid), Signal::SIGSTOP);
         }
-        tokio::time::sleep(asleep).await;
+        tokio::select! {
+            _ = tokio::time::sleep(asleep) => {}
+            _ = cancel.notified() => return,
+        }
     }
 }
 
 /// Pool variant: cycle on the current pool pid, re-reading it each
-/// iteration so respawn-watcher rotations stay effective.
+/// iteration so respawn-watcher rotations stay effective. The cancel
+/// notify is owned by the pool (see `LweSinglePool::soft_pause_task`)
+/// so resume / shutdown abort the cycle.
 pub async fn soft_pause_cycle_pool(
     inner: Arc<Mutex<Option<crate::pool::PoolProcess>>>,
     awake_ms: u64,
     asleep_ms: u64,
+    cancel: Arc<tokio::sync::Notify>,
 ) {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
@@ -211,14 +232,22 @@ pub async fn soft_pause_cycle_pool(
             guard.as_ref().map(|p| p.pid)
         };
         let Some(pid) = current_pid else {
-            // No pool process — nothing to cycle on.
-            tokio::time::sleep(asleep).await;
+            tokio::select! {
+                _ = tokio::time::sleep(asleep) => {}
+                _ = cancel.notified() => return,
+            }
             continue;
         };
         let _ = kill(Pid::from_raw(pid), Signal::SIGCONT);
-        tokio::time::sleep(awake).await;
+        tokio::select! {
+            _ = tokio::time::sleep(awake) => {}
+            _ = cancel.notified() => return,
+        }
         let _ = kill(Pid::from_raw(pid), Signal::SIGSTOP);
-        tokio::time::sleep(asleep).await;
+        tokio::select! {
+            _ = tokio::time::sleep(asleep) => {}
+            _ = cancel.notified() => return,
+        }
     }
 }
 
@@ -270,7 +299,11 @@ pub(crate) fn workshop_content_id(scene: &Path) -> Option<String> {
 }
 
 impl LweBackend {
-    /// Construct with default binary resolution.
+    /// Construct with default binary resolution. Production code
+    /// should use [`Config::backend`](crate::config::Config::backend)
+    /// which honours `[fps].active_max` from config.toml; this
+    /// 30-fps default matches LWE's own default and is only safe
+    /// for tests and one-shot CLI runs.
     pub fn new() -> Self {
         let pool = LweSinglePool::new();
         Self {
@@ -278,11 +311,14 @@ impl LweBackend {
             pool: Arc::new(pool),
             per_output_pids: Arc::new(Mutex::new(BTreeMap::new())),
             per_output_scenes: Arc::new(Mutex::new(BTreeMap::new())),
+            soft_pause_cancel: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     /// Construct with an explicit binary path (used by tests or
-    /// operators with non-standard installs).
+    /// operators with non-standard installs). For production use
+    /// [`Self::with_binary_and_fps`] so the FPS cap flows from
+    /// config.
     pub fn with_binary(path: impl Into<PathBuf>) -> Self {
         let pb: PathBuf = path.into();
         let pool = LweSinglePool::with_binary(pb.clone());
@@ -291,6 +327,22 @@ impl LweBackend {
             pool: Arc::new(pool),
             per_output_pids: Arc::new(Mutex::new(BTreeMap::new())),
             per_output_scenes: Arc::new(Mutex::new(BTreeMap::new())),
+            soft_pause_cancel: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Construct with an explicit binary path AND initial FPS cap.
+    /// Production code path: `[fps].active_max` flows in via
+    /// [`crate::config::Config::backend`].
+    pub fn with_binary_and_fps(path: impl Into<PathBuf>, active_fps: u32) -> Self {
+        let pb: PathBuf = path.into();
+        let pool = LweSinglePool::with_binary_and_fps(pb.clone(), active_fps);
+        Self {
+            binary_path: Some(pb),
+            pool: Arc::new(pool),
+            per_output_pids: Arc::new(Mutex::new(BTreeMap::new())),
+            per_output_scenes: Arc::new(Mutex::new(BTreeMap::new())),
+            soft_pause_cancel: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -319,6 +371,7 @@ impl LweBackend {
             pool: Arc::new(new_pool),
             per_output_pids: self.per_output_pids,
             per_output_scenes: self.per_output_scenes,
+            soft_pause_cancel: self.soft_pause_cancel,
         }
     }
 
@@ -338,7 +391,25 @@ impl LweBackend {
     /// are bound at once). Cost: ~1 LWE process per monitor (~250 MiB
     /// RSS each on Wayland/CEF builds). Trade vs the pool is memory
     /// for stability.
+    ///
+    /// The FPS cap is taken from the pool's `active_fps()` at spawn
+    /// time. For runtime overrides (e.g. the throttle mode wants
+    /// `--fps 1`), use [`Self::set_per_output_with_fps`].
     pub async fn set_per_output(&self, scene: &Path, output: &str) -> Result<i32> {
+        let fps = self.pool.active_fps();
+        self.set_per_output_with_fps(scene, output, fps).await
+    }
+
+    /// Same as [`Self::set_per_output`] but with an explicit FPS
+    /// override. Used by `pause_per_output_throttle` to spawn with
+    /// `--fps 1` so the freshly-spawned LWE is already at the
+    /// throttled renderer cap (no SIGSTOP loop needed).
+    pub async fn set_per_output_with_fps(
+        &self,
+        scene: &Path,
+        output: &str,
+        fps: u32,
+    ) -> Result<i32> {
         if !scene.exists() {
             return Err(Error::BackendUnreachable {
                 kind: self.kind().process_pattern().to_string(),
@@ -386,16 +457,8 @@ impl LweBackend {
             .arg("--disable-mouse")
             .arg("--disable-parallax")
             .arg("--fullscreen-pause-only-active")
-            // Cap FPS at the configured `active_max`. LWE accepts
-            // `--fps <N>` natively; default 30 inside LWE if we
-            // omit it, which on a 144 Hz monitor wastes CPU/GPU.
-            // Read from the per-pool default set via
-            // `LweSinglePool::with_active_fps`; here we just stamp
-            // the active-fps flag derived from the pool's stored
-            // value when the pool was constructed with one. The
-            // pool's own argv handles pool-mode spawns.
             .arg("--fps")
-            .arg(self.pool.active_fps().to_string());
+            .arg(fps.to_string());
 
         let child = cmd.spawn().map_err(|e| Error::BackendFailure {
             kind: self.kind().process_pattern().to_string(),
@@ -407,7 +470,7 @@ impl LweBackend {
             output,
             content_id,
             pid,
-            self.pool.active_fps(),
+            fps,
         );
 
         let mut pids = self.per_output_pids.lock().await;
@@ -442,8 +505,11 @@ impl LweBackend {
     /// background (grey) when paused.
     ///
     /// Returns the count of pids that accepted SIGSTOP. The cycling
-    /// task keeps a strong Arc to `per_output_pids` so it stays
-    /// alive until `resume_per_output` clears the map.
+    /// task is registered with `self.soft_pause_cancel` so
+    /// `resume_per_output` aborts it cleanly. Re-entrant: each call
+    /// installs a fresh cancellation handle; the previous cycle
+    /// wakes via the new notify the next time it hits its
+    /// `tokio::select!`.
     ///
     /// `awake_ms` is the SIGCONT duration; `asleep_ms` is the SIGSTOP
     /// duration. Effective fps = `30 * awake_ms / (awake_ms + asleep_ms)`
@@ -465,11 +531,27 @@ impl LweBackend {
             (count, pids.values().copied().collect::<Vec<_>>())
         };
         if stopped > 0 {
+            // Each cycle owns its own Notify; the cycle reads the
+            // latest `self.soft_pause_cancel` value at every
+            // `notified().await` so a `resume_per_output` call can
+            // poke it without us wiring a JoinHandle here.
+            let cancel = Arc::new(tokio::sync::Notify::new());
+            let outer = self.soft_pause_cancel.clone();
+            // Bridge task: forward outer (backend-shared) → inner
+            // (cycle-local). The cycle only knows about `inner` so
+            // we keep that isolation and don't have to share the
+            // outer Notify across the cycle boundary.
+            let inner = cancel.clone();
+            tokio::spawn(async move {
+                outer.notified().await;
+                inner.notify_waiters();
+            });
             tokio::spawn(soft_pause_cycle(
                 self.per_output_pids.clone(),
                 pids_snapshot,
                 awake_ms,
                 asleep_ms,
+                cancel,
             ));
             tracing::info!(
                 "soft-pause cycle: stopped={} awake={}ms asleep={}ms",
@@ -481,22 +563,36 @@ impl LweBackend {
         Ok(stopped)
     }
 
-    /// Per-output throttle pause. Kills every recorded pid and
-    /// re-spawns LWE with `--fps 1` so the surface stays alive but
-    /// the renderer is barely ticking. Cost: ~2s respawn latency on
-    /// pause; resume is instant (the new spawn is already at `--fps
-    /// 1` so we just stop and re-spawn with `--fps <active_max>`).
+    /// Per-output throttle pause. SIGTERMs every recorded pid and
+    /// re-spawns LWE with `--fps 1` so the renderer is barely
+    /// ticking while the surface stays alive. Resume is instant
+    /// (the next `set_per_output` brings back the active FPS cap).
+    ///
+    /// `scene_resolver` is consulted for outputs whose scene isn't
+    /// in `per_output_scenes` (cold-start case where the daemon
+    /// spawned before any per-output `set()`). The closure is
+    /// `&str → Option<PathBuf>` so callers can plug in their own
+    /// inventory lookup without us depending on it here.
+    ///
+    /// Per-output errors are logged but **not** propagated: a
+    /// single respawn failure shouldn't prevent the rest of the
+    /// outputs from reaching the throttled state.
     pub async fn pause_per_output_throttle(
         &self,
         scene_resolver: impl Fn(&str) -> Option<PathBuf>,
     ) -> Result<usize> {
         // Collect (output, scene) pairs first so we don't hold the
-        // map lock across spawns.
+        // map lock across spawns. Outputs without a known scene
+        // fall back to the supplied resolver; outputs that still
+        // have no scene after the resolver are skipped (logged).
         let pairs: Vec<(String, PathBuf)> = {
             let pids = self.per_output_pids.lock().await;
             let scenes = self.per_output_scenes.lock().await;
             pids.keys()
-                .filter_map(|out| scenes.get(out).map(|scene| (out.clone(), scene.clone())))
+                .filter_map(|out| {
+                    let scene = scenes.get(out).cloned().or_else(|| scene_resolver(out));
+                    scene.map(|s| (out.clone(), s))
+                })
                 .collect()
         };
         // SIGTERM everything. We'll respawn below.
@@ -507,33 +603,27 @@ impl LweBackend {
             pids.clear();
         }
         let mut respawned = 0usize;
+        let mut skipped: Vec<(String, String)> = Vec::new();
         for (output, scene) in &pairs {
-            // We can't easily re-derive the live config fps here
-            // without plumbing; use the pool's active_fps as the
-            // respawn cap. The throttle intent is that the cycle
-            // downstream will SIGSTOP this pid, so the cap is
-            // cosmetic during the brief unpause windows.
-            let pid = self.set_per_output(scene, output).await?;
-            if pid > 0 {
-                respawned += 1;
+            // Spawn at fps=1 so the renderer is already at the
+            // throttled cap. No SIGSTOP loop needed (the new process
+            // is throttled by the `--fps` flag itself).
+            match self.set_per_output_with_fps(scene, output, 1).await {
+                Ok(pid) if pid > 0 => respawned += 1,
+                Ok(_) => {
+                    skipped.push((output.clone(), "spawn returned pid 0".into()));
+                }
+                Err(e) => {
+                    tracing::warn!("throttle-pause: respawn for output={} failed: {e}", output);
+                    skipped.push((output.clone(), e.to_string()));
+                }
             }
-            let _ = scene_resolver; // touch the resolver so the
-                                    // caller can supply one later
-                                    // without API churn.
-        }
-        // Immediately SIGSTOP the freshly spawned pids so the
-        // renderer is at a crawl (~1 fps).
-        let pids_now = self.per_output_pids.lock().await;
-        for &pid in pids_now.values() {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGSTOP,
-            );
         }
         tracing::info!(
-            "throttle-pause: stopped={} respawned={}",
+            "throttle-pause: stopped={} respawned={} skipped={}",
             stopped,
-            respawned
+            respawned,
+            skipped.len()
         );
         Ok(respawned)
     }
@@ -555,8 +645,18 @@ impl LweBackend {
         Ok(count)
     }
 
-    /// Per-output resume (v0.1). Sends SIGCONT to every recorded pid.
+    /// Per-output resume (v0.1). Sends SIGCONT to every recorded pid
+    /// and cancels any active soft-pause cycle so the cycling task
+    /// doesn't immediately SIGSTOP again. The forwarder task spawned
+    /// by [`Self::pause_per_output_soft`] wakes once on
+    /// `soft_pause_cancel.notified()` and notifies the cycle-local
+    /// handle, which the running cycle reads via `tokio::select!`.
     pub async fn resume_per_output(&self) -> Result<usize> {
+        // Cancel any active soft-pause cycle BEFORE sending SIGCONT
+        // so the cycle doesn't immediately re-apply SIGSTOP. We
+        // notify_waiters (rather than notify_one) so multiple cycles
+        // stacked from re-entrant pause calls all wake.
+        self.soft_pause_cancel.notify_waiters();
         let pids = self.per_output_pids.lock().await;
         let mut count = 0;
         for &pid in pids.values() {

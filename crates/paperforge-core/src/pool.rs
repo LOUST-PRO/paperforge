@@ -99,19 +99,47 @@ pub struct PoolProcess {
 /// `Clone` is explicit (rather than `#[derive(Clone)]`) so the
 /// future addition of expensive resources (e.g. a Child stdout pipe
 /// when we add native logging) doesn't silently copy them. Today
-/// the fields are all `PathBuf` + `Vec<String>` + `Arc<...>`, so
-/// clone is cheap.
-#[derive(Debug, Clone)]
+/// the fields are all `PathBuf` + `Vec<String>` + `Arc<...>` or
+/// interior-mutable atomics, so clone is cheap. `AtomicU32` and
+/// `tokio::task::JoinHandle` are NOT `Clone`, so we explicitly clone
+/// the `Arc<Mutex<...>>` wrappers that own them.
+#[derive(Debug)]
 pub struct LweSinglePool {
     binary: PathBuf,
     /// Common flags appended to every invocation (e.g. `--silent`,
     /// `--disable-particles`). Operator-overridable via constructor.
     common_flags: Vec<String>,
-    /// FPS cap passed as `--fps <N>` to LWE. Defaults to 30 (LWE's
-    /// own default). Smart calibration can override this at runtime
-    /// via [`Self::set_active_fps`].
-    active_fps: u32,
+    /// FPS cap passed as `--fps <N>` to LWE. `AtomicU32` so callers
+    /// holding `Arc<LweSinglePool>` (e.g. `LweBackend`) can mutate
+    /// it without `&mut self`. Smart calibration reaches this via
+    /// [`Self::set_active_fps`].
+    active_fps: std::sync::atomic::AtomicU32,
     inner: Arc<Mutex<Option<PoolProcess>>>,
+    /// Cancellation notify for the active soft-pause cycle, if any.
+    /// Fired by `resume` and `shutdown` so the cycle can exit
+    /// gracefully (the cycle SIGCONTs the pid before returning so
+    /// the LWE process isn't left frozen mid-cycle). Cleared by
+    /// `pause_soft` when it spawns a new cycle.
+    soft_pause_cancel: Arc<tokio::sync::Notify>,
+    /// Tokio task handle for the active soft-pause cycle, if any.
+    /// `None` when not paused. Set by `pause_soft`, cleared by
+    /// `resume` and `shutdown`. Re-entrant `pause_soft` calls abort
+    /// the existing handle before spawning a new one so we don't
+    /// accumulate cycle tasks.
+    soft_pause_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+impl Clone for LweSinglePool {
+    fn clone(&self) -> Self {
+        Self {
+            binary: self.binary.clone(),
+            common_flags: self.common_flags.clone(),
+            active_fps: std::sync::atomic::AtomicU32::new(self.active_fps()),
+            inner: self.inner.clone(),
+            soft_pause_cancel: self.soft_pause_cancel.clone(),
+            soft_pause_task: self.soft_pause_task.clone(),
+        }
+    }
 }
 
 impl LweSinglePool {
@@ -122,11 +150,21 @@ impl LweSinglePool {
 
     /// Construct with an explicit LWE binary path.
     pub fn with_binary(binary: impl Into<PathBuf>) -> Self {
+        Self::with_binary_and_fps(binary, 30)
+    }
+
+    /// Construct with an explicit LWE binary path AND initial FPS
+    /// cap. Production construction goes through here so the
+    /// `[fps].active_max` value flows in instead of being hardcoded
+    /// to LWE's own 30-fps default.
+    pub fn with_binary_and_fps(binary: impl Into<PathBuf>, active_fps: u32) -> Self {
         Self {
             binary: binary.into(),
             common_flags: default_flags(),
-            active_fps: 30,
+            active_fps: std::sync::atomic::AtomicU32::new(active_fps),
             inner: Arc::new(Mutex::new(None)),
+            soft_pause_cancel: Arc::new(tokio::sync::Notify::new()),
+            soft_pause_task: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -138,22 +176,44 @@ impl LweSinglePool {
         self
     }
 
-    /// Override the FPS cap (mostly for tests / smart calibration).
+    /// Override the initial FPS cap (mostly for tests / smart
+    /// calibration). For runtime updates on an existing pool use
+    /// [`Self::set_active_fps`] instead.
     pub fn with_active_fps(mut self, fps: u32) -> Self {
-        self.active_fps = fps;
+        self.active_fps = std::sync::atomic::AtomicU32::new(fps);
         self
     }
 
     /// Read the current FPS cap (passed as `--fps <N>` to LWE).
     pub fn active_fps(&self) -> u32 {
-        self.active_fps
+        use std::sync::atomic::Ordering;
+        self.active_fps.load(Ordering::Relaxed)
     }
 
     /// Update the FPS cap at runtime. The new value takes effect on
     /// the next respawn (current process keeps its existing
-    /// `--fps` argv until it's respawned).
-    pub fn set_active_fps(&mut self, fps: u32) {
-        self.active_fps = fps;
+    /// `--fps` argv until it's respawned). Interior-mutable so it
+    /// works through `Arc<LweSinglePool>`.
+    pub fn set_active_fps(&self, fps: u32) {
+        use std::sync::atomic::Ordering;
+        self.active_fps.store(fps, Ordering::Relaxed);
+    }
+
+    /// Cancel any active soft-pause cycle. Fires the cancellation
+    /// notify so the cycle can exit gracefully (SIGCONT before
+    /// return), then aborts the JoinHandle as a safety net for the
+    /// case where the cycle is blocked on a syscall and didn't see
+    /// the notify in time. Called from `pause_soft`, `resume`, and
+    /// `shutdown` so multiple cycles don't pile up.
+    pub async fn abort_soft_pause(&self) {
+        // Fire the notify FIRST so the cycle can SIGCONT the LWE
+        // pid before exiting. notify_waiters (not notify_one) so
+        // any stale cycles from re-entrant calls also wake.
+        self.soft_pause_cancel.notify_waiters();
+        let mut task_guard = self.soft_pause_task.lock().await;
+        if let Some(handle) = task_guard.take() {
+            handle.abort();
+        }
     }
 
     /// Return the in-memory current argv (one entry per flag), used by
@@ -165,7 +225,7 @@ impl LweSinglePool {
                 &self.binary,
                 &p.bindings,
                 &self.common_flags,
-                self.active_fps,
+                self.active_fps(),
             )
         })
     }
@@ -258,7 +318,7 @@ impl LweSinglePool {
             &self.binary,
             &new_bindings,
             &self.common_flags,
-            self.active_fps,
+            self.active_fps(),
         );
         let mut cmd = Command::new(&self.binary);
         cmd.args(&argv[1..]); // argv[0] is the binary itself; Command already has it
@@ -356,7 +416,7 @@ impl LweSinglePool {
             &self.binary,
             &new_bindings,
             &self.common_flags,
-            self.active_fps,
+            self.active_fps(),
         );
         let mut cmd = Command::new(&self.binary);
         cmd.args(&argv[1..]);
@@ -385,6 +445,11 @@ impl LweSinglePool {
     /// SIGSTOP the current LWE process (global pause — single process).
     /// Returns Ok(pid) if a process was signaled, Ok(None) if pool empty.
     pub async fn pause(&self) -> Result<Option<i32>> {
+        // Plain SIGSTOP also aborts any active soft-pause cycle, so
+        // the two pause modes are mutually exclusive. Without this,
+        // a `pause_soft` followed by `pause` would leave a zombie
+        // wake-up task still SIGSTOPing after resume.
+        self.abort_soft_pause().await;
         let guard = self.inner.lock().await;
         let Some(proc) = guard.as_ref() else {
             return Ok(None);
@@ -406,7 +471,17 @@ impl LweSinglePool {
     /// of `self.inner`. When the LWE process dies (respawn watcher
     /// replaces it under a new PID), the cycle continues with the
     /// new PID because we re-read `self.inner` at each iteration.
+    ///
+    /// Re-entrant: if a previous soft-pause cycle is still alive,
+    /// it's aborted first so we don't accumulate ghost tasks. The
+    /// cycle observes `self.soft_pause_cancel` so `resume` /
+    /// `shutdown` can fire it; the JoinHandle is stored in
+    /// `self.soft_pause_task` as a safety net.
     pub async fn pause_soft(&self, awake_ms: u64, asleep_ms: u64) -> Result<Option<i32>> {
+        // Abort any prior cycle first (fires its cancel notify too).
+        // Then SIGSTOP and spawn a fresh cycle that observes the
+        // pool's shared cancel notify.
+        self.abort_soft_pause().await;
         let (started, pid) = {
             let guard = self.inner.lock().await;
             let Some(proc) = guard.as_ref() else {
@@ -421,17 +496,22 @@ impl LweSinglePool {
             (true, proc.pid)
         };
         if started {
-            tokio::spawn(super::backend::soft_pause_cycle_pool(
-                self.inner.clone(),
-                awake_ms,
-                asleep_ms,
+            let inner = self.inner.clone();
+            let cancel = self.soft_pause_cancel.clone();
+            let handle = tokio::spawn(super::backend::soft_pause_cycle_pool(
+                inner, awake_ms, asleep_ms, cancel,
             ));
+            let mut task_guard = self.soft_pause_task.lock().await;
+            *task_guard = Some(handle);
         }
         Ok(Some(pid))
     }
 
     /// SIGCONT the current LWE process (global resume).
     pub async fn resume(&self) -> Result<Option<i32>> {
+        // Abort any active soft-pause cycle so the SIGCONT we send
+        // here isn't immediately followed by another SIGSTOP.
+        self.abort_soft_pause().await;
         let guard = self.inner.lock().await;
         let Some(proc) = guard.as_ref() else {
             return Ok(None);
@@ -447,6 +527,9 @@ impl LweSinglePool {
 
     /// Kill the LWE process and clear all bindings. Idempotent.
     pub async fn shutdown(&self) -> Result<()> {
+        // Abort any active soft-pause cycle first; otherwise the
+        // SIGTERM below races with the cycle's SIGCONT.
+        self.abort_soft_pause().await;
         let mut guard = self.inner.lock().await;
         if let Some(mut prev) = guard.take() {
             let _ = kill(Pid::from_raw(prev.pid), Signal::SIGTERM);
@@ -795,5 +878,42 @@ mod tests {
         assert_eq!(paused_pid, None);
         let resumed_pid = pool.resume().await.unwrap();
         assert_eq!(resumed_pid, None);
+    }
+
+    /// `set_active_fps` and `active_fps` must work through
+    /// `Arc<LweSinglePool>` so the daemon layer can mutate the FPS
+    /// cap from the smart-calibration path without taking `&mut self`
+    /// (the daemon already holds the pool through an Arc).
+    #[tokio::test]
+    async fn active_fps_round_trip_through_arc() {
+        let pool = LweSinglePool::with_binary_and_fps("/bin/sleep", 30);
+        let pool_arc = std::sync::Arc::new(pool);
+        let mutator = pool_arc.clone();
+        let reader = pool_arc.clone();
+        assert_eq!(reader.active_fps(), 30);
+        mutator.set_active_fps(60);
+        assert_eq!(
+            reader.active_fps(),
+            60,
+            "Arc-shared pool must observe FPS cap updates"
+        );
+        // Convoluted case: clone through Arc and mutate again.
+        let mutator2 = pool_arc.clone();
+        mutator2.set_active_fps(15);
+        assert_eq!(
+            reader.active_fps(),
+            15,
+            "any Arc handle must mutate the same AtomicU32"
+        );
+    }
+
+    /// Verify `with_binary_and_fps` constructor threads the initial
+    /// FPS cap into `active_fps()` correctly.
+    #[tokio::test]
+    async fn with_binary_and_fps_stores_initial_value() {
+        let pool = LweSinglePool::with_binary_and_fps("/bin/sleep", 24);
+        assert_eq!(pool.active_fps(), 24);
+        let pool2 = LweSinglePool::with_binary_and_fps("/bin/sleep", 1);
+        assert_eq!(pool2.active_fps(), 1);
     }
 }

@@ -201,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
             let mode = match mode {
                 Some(s) => s
                     .parse::<paperforge_core::config::PauseMode>()
-                    .expect("invalid --mode value (use hard|frame|throttle)"),
+                    .map_err(|e| anyhow::anyhow!("invalid --mode value: {e}"))?,
                 None => cfg.pause.mode,
             };
             let n = backend_ops

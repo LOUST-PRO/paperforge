@@ -94,7 +94,8 @@ pub struct LweBackendOps {
 
 impl LweBackendOps {
     /// Construct with the default LWE binary on PATH and the pool
-    /// enabled (v0.2 mode).
+    /// enabled (v0.2 mode). For production use [`Config::build_backend_ops`]
+    /// which honours `[fps].active_max` from config.toml.
     pub fn new() -> Self {
         Self::with_pool(true)
     }
@@ -102,6 +103,18 @@ impl LweBackendOps {
     /// Construct with the pool enabled/disabled flag.
     pub fn with_pool(use_pool: bool) -> Self {
         let backend = LweBackend::new();
+        let audio = LweAudioController::new(backend.clone());
+        Self {
+            backend,
+            audio,
+            use_pool,
+        }
+    }
+
+    /// Construct with the pool flag AND the configured FPS cap so
+    /// `[fps].active_max` reaches the underlying pool's argv builder.
+    pub fn with_fps_and_pool(active_fps: u32, use_pool: bool) -> Self {
+        let backend = LweBackend::with_binary_and_fps("linux-wallpaperengine", active_fps);
         let audio = LweAudioController::new(backend.clone());
         Self {
             backend,
@@ -127,6 +140,22 @@ impl LweBackendOps {
         }
     }
 
+    /// Construct with an explicit LWE binary path, FPS cap, and the
+    /// pool flag. Production code path: all three flow from config.
+    pub fn with_binary_and_fps_and_pool(
+        binary: impl Into<PathBuf>,
+        active_fps: u32,
+        use_pool: bool,
+    ) -> Self {
+        let backend = LweBackend::with_binary_and_fps(binary, active_fps);
+        let audio = LweAudioController::new(backend.clone());
+        Self {
+            backend,
+            audio,
+            use_pool,
+        }
+    }
+
     /// Access the underlying LWE backend (for signal control).
     pub fn backend(&self) -> &LweBackend {
         &self.backend
@@ -142,11 +171,33 @@ impl LweBackendOps {
         self.use_pool
     }
 
+    /// Update the FPS cap on the underlying pool. No-op for the
+    /// per-output path (each LWE keeps its spawn-time `--fps`
+    /// until it's re-spawned). The new value takes effect on the
+    /// next respawn.
+    pub fn set_active_fps(&self, fps: u32) {
+        if self.use_pool {
+            self.backend.pool().set_active_fps(fps);
+        }
+    }
+
     /// Pause with the v0.3 mode-aware semantics. Dispatches to the
-    /// pool's pause_soft / pause_throttle / pause based on `mode`,
-    /// or to the per-output variants when `use_pool` is false.
-    /// `paused_fps`, `clock_awake_ms`, and `clock_asleep_ms` are
-    /// ignored in `hard` / `throttle` modes.
+    /// pool's pause_soft / pause based on `mode`, or to the
+    /// per-output variants when `use_pool` is false. The `Throttle`
+    /// pool branch is currently routed through `pause_soft` as the
+    /// interim behaviour — a dedicated `pause_throttle` on the pool
+    /// would require a hot-swap with `--fps 1` on the current
+    /// process, which the pool's merged-argv path doesn't support
+    /// mid-flight.
+    ///
+    /// Timing precedence (CodeRabbit review):
+    ///   1. `clock_awake_ms` / `clock_asleep_ms` are authoritative
+    ///      whenever they sum to a non-zero cycle (i.e. the operator
+    ///      explicitly configured them).
+    ///   2. Otherwise the cycle is derived from `paused_fps` (with a
+    ///      floor of 50 ms so an absurdly high fps target can't
+    ///      crash with `instant::Duration` underflow).
+    ///   3. `paused_fps == 0` is treated as "use clock values".
     pub async fn pause_with_mode(
         &self,
         mode: crate::config::PauseMode,
@@ -154,14 +205,11 @@ impl LweBackendOps {
         clock_awake_ms: u64,
         clock_asleep_ms: u64,
     ) -> Result<usize> {
-        // Effective cycle derives from the configured fps target so
-        // a user wanting more responsive pause can lower
-        // `paused_fps` and the cycle adapts.
         let (awake_ms, asleep_ms): (u64, u64) = if paused_fps == 0 {
+            // Operator didn't pick a fps target → honour the clock.
             (clock_awake_ms, clock_asleep_ms)
         } else {
-            // 1000ms / paused_fps = total cycle; split as 20% awake,
-            // 80% asleep (matches defaults: 100/400 = 20%).
+            // Derive from fps. Total cycle = 1000/fps; split 20/80.
             let total = (1000_u64 / paused_fps as u64).max(50);
             let awake = total / 5;
             let asleep = total - awake;
@@ -177,8 +225,21 @@ impl LweBackendOps {
                     .pause_soft(awake_ms, asleep_ms)
                     .await
                     .map(|n| if n.is_some() { 1 } else { 0 }),
+                // Throttle in pool mode is unimplemented as a true
+                // mid-flight hot-swap. Routing through `pause_soft`
+                // keeps the surface alive (which is the documented
+                // intent of throttle) at the cost of losing the
+                // 1-FPS renderer cap until the next respawn. When
+                // the pool grows a hot-swap API this branch moves to
+                // it.
                 crate::config::PauseMode::Throttle => {
-                    pool.pause().await.map(|n| if n.is_some() { 1 } else { 0 })
+                    tracing::warn!(
+                        "pool-mode pause: throttle has no hot-swap path yet; \
+                         falling back to pause_soft (awake={awake_ms}ms asleep={asleep_ms}ms)"
+                    );
+                    pool.pause_soft(awake_ms, asleep_ms)
+                        .await
+                        .map(|n| if n.is_some() { 1 } else { 0 })
                 }
             }
         } else {
@@ -190,10 +251,11 @@ impl LweBackendOps {
                         .await
                 }
                 crate::config::PauseMode::Throttle => {
-                    // No scene resolver in the daemon path yet —
-                    // pass an identity closure that always returns
-                    // None; the throttle method gracefully skips
-                    // respawns whose scene can't be resolved.
+                    // Per-output throttle: pass an identity closure
+                    // that always returns None; the throttle method
+                    // gracefully skips respawns whose scene can't be
+                    // resolved (logs per-output, keeps going on
+                    // individual failures).
                     self.backend.pause_per_output_throttle(|_| None).await
                 }
             }
