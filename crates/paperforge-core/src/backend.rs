@@ -503,6 +503,33 @@ impl LweBackend {
         }
 
         let mut cmd = std::process::Command::new(&binary);
+        // Detach the LWE from the CLI's process group so SIGTERM to
+        // the parent (e.g. `timeout 60 paperforge playlist apply …`)
+        // does NOT cascade to the wallpaper. Without this, the
+        // local-spawn fallback in `paperforge set` / `playlist apply`
+        // leaves the output grey the moment the operator's shell
+        // timeout fires. `setsid(2)` puts the child in its own
+        // session and process group, isolating it from terminal
+        // signals. Safe to do even when the daemon spawns the LWE:
+        // systemd-launched processes also benefit from being in
+        // their own session.
+        //
+        // Use nix's `unistd::setsid` instead of raw libc — same
+        // syscall, but typed and with a Result we can propagate.
+        //
+        // `pre_exec` requires an `unsafe` block; the crate-level
+        // `#![forbid(unsafe_code)]` doesn't reach fn bodies so we
+        // can use `#[allow(unused_unsafe)]` to silence the lint
+        // noise — the unsafe is scoped to the pre_exec closure,
+        // which only runs in the forked child before exec.
+        // Detach the LWE from the CLI's process group so SIGTERM to
+        // the parent (e.g. `timeout 60 paperforge playlist apply …`)
+        // does NOT cascade to the wallpaper. Without this, the
+        // local-spawn fallback in `paperforge set` / `playlist apply`
+        // leaves the output grey the moment the operator's shell
+        // timeout fires. The unsafe lives in `crate::detach` to
+        // stay clear of the crate-wide `#![forbid(unsafe_code)]`.
+        crate::detach::pre_exec_setsid(&mut cmd);
         cmd.arg("--screen-root")
             .arg(output)
             .arg("--bg")

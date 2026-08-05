@@ -24,7 +24,12 @@
 //! - [`playlist`] — `Playlist` + `PlaylistStore` (JSON files)
 //! - [`config`] — runtime configuration paths
 
-#![forbid(unsafe_code)]
+// `#![deny(unsafe_code)]` rather than `#![forbid(unsafe_code)]` so
+// that the small `detach` helper module (which uses `pre_exec` to
+// call `setsid(2)` for the LWE process) can opt back in via a
+// scoped `#[allow(unsafe_code)]`. `forbid` is not overridable; `deny`
+// is. See crates/paperforge-core/src/detach.rs for the rationale.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod audio;
@@ -32,6 +37,7 @@ pub mod backend;
 pub mod config;
 pub mod daemon;
 pub mod dbus;
+pub mod detach;
 pub mod error;
 pub mod fullscreen;
 pub mod hotplug;
