@@ -1546,4 +1546,77 @@ mod tests {
             Ok(_) | Err(_) => {} // both fine — see comment above
         }
     }
+
+    /// `bind_external_pid` on a non-LWE backend returns `false`
+    /// without touching any internal state. The contract is
+    /// "non-LWE backends can't be adopted — adoption is LWE-only".
+    #[tokio::test]
+    async fn daemon_bind_external_pid_is_noop_for_non_lwe_backends() {
+        let stub: Arc<dyn BackendOps> = Arc::new(SwwwBackendOps(SwwwBackend::new()));
+        let (daemon, _event_rx) = PaperforgeDaemon::with_store(
+            stub,
+            Arc::new(RwLock::new(PlaylistStore::default_location().unwrap())),
+        );
+        let scene = std::env::temp_dir().join("paperforge-bind-non-lwe.scene");
+        std::fs::write(&scene, b"fake scene").unwrap();
+        let adopted = daemon
+            .bind_external_pid("DP-1", &scene, /* pid = */ 42)
+            .await;
+        assert!(
+            !adopted,
+            "non-LWE backend must report adoption refused (returns false)"
+        );
+        // outputs_with_pids must also reflect the empty map
+        // (delegator falls through to Default::default()).
+        let owned = daemon.outputs_with_pids().await;
+        assert!(
+            owned.is_empty(),
+            "non-LWE backend must report zero owned outputs"
+        );
+    }
+
+    /// `bind_external_pid` on an LWE-backed daemon actually records
+    /// the supplied pid + scene, and `outputs_with_pids` reflects
+    /// it. End-to-end check of the daemon-level delegator
+    /// (the daemon wrapper must not silently swallow the call).
+    #[tokio::test]
+    async fn daemon_bind_external_pid_round_trips_through_lwe_backend() {
+        // Pool-disabled: we don't want the test to actually spawn
+        // a real LWE process; we just want to exercise the binding
+        // path through the delegator.
+        let lwe_ops = Arc::new(LweBackendOps::with_binary_and_pool("/bin/true", false));
+        let backend_dyn: Arc<dyn BackendOps> = lwe_ops.clone();
+        let (daemon, _event_rx) = PaperforgeDaemon::with_lwe_backend_ops_and_store(
+            backend_dyn,
+            lwe_ops.clone(),
+            Arc::new(RwLock::new(PlaylistStore::default_location().unwrap())),
+        );
+        let scene = std::env::temp_dir().join("paperforge-daemon-bind-roundtrip.scene");
+        std::fs::write(&scene, b"fake scene").unwrap();
+        let adopted = daemon
+            .bind_external_pid("HDMI-A-1", &scene, /* pid = */ 17)
+            .await;
+        assert!(adopted, "LWE daemon must accept the external pid");
+        let owned = daemon.outputs_with_pids().await;
+        let got: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert_eq!(got, vec!["HDMI-A-1"]);
+    }
+
+    /// `outputs_with_pids` returns an empty set on a fresh
+    /// LWE-backed daemon (no adopted or set pids).
+    #[tokio::test]
+    async fn daemon_outputs_with_pids_empty_on_fresh_lwe_backend() {
+        let lwe_ops = Arc::new(LweBackendOps::with_binary_and_pool("/bin/true", false));
+        let backend_dyn: Arc<dyn BackendOps> = lwe_ops.clone();
+        let (daemon, _event_rx) = PaperforgeDaemon::with_lwe_backend_ops_and_store(
+            backend_dyn,
+            lwe_ops.clone(),
+            Arc::new(RwLock::new(PlaylistStore::default_location().unwrap())),
+        );
+        let owned = daemon.outputs_with_pids().await;
+        assert!(
+            owned.is_empty(),
+            "fresh LWE-backed daemon has no owned pids"
+        );
+    }
 }

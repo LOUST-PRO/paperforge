@@ -2777,4 +2777,127 @@ mod tests {
             "error must explain missing scene; got: {msg}"
         );
     }
+
+    /// `bind_external_pid` against an empty per-output map must
+    /// succeed and record the supplied pid + scene. This is the
+    /// happy path for `adopt_existing_lwes` when the daemon is
+    /// starting up against a pre-existing LWE child.
+    #[tokio::test]
+    async fn bind_external_pid_records_into_empty_map() {
+        let backend = LweBackend::with_binary("/bin/true");
+        let scene = std::env::temp_dir().join("paperforge-bind-external-empty.scene");
+        std::fs::write(&scene, b"fake scene").unwrap();
+        let adopted = backend
+            .bind_external_pid("DP-1", &scene, /* pid = */ 1)
+            .await;
+        assert!(adopted, "empty map must accept the external pid");
+
+        let pids = backend.per_output_pids.lock().await;
+        assert_eq!(pids.get("DP-1"), Some(&1));
+        drop(pids);
+
+        let scenes = backend.per_output_scenes.lock().await;
+        assert_eq!(scenes.get("DP-1"), Some(&scene));
+    }
+
+    /// `bind_external_pid` is idempotent against an already-live pid:
+    /// if the recorded pid is alive (Running or Paused), the call
+    /// is a no-op and returns `false`. Regression guard for "daemon
+    /// must not clobber its own state with an adoption candidate".
+    #[tokio::test]
+    async fn bind_external_pid_refuses_to_clobber_live_pid() {
+        let backend = LweBackend::with_binary("/bin/true");
+        let scene = std::env::temp_dir().join("paperforge-bind-external-clobber.scene");
+        std::fs::write(&scene, b"fake scene").unwrap();
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let live_pid = child.id() as i32;
+
+        let first = backend.bind_external_pid("DP-1", &scene, live_pid).await;
+        assert!(first, "first adopt must succeed");
+
+        // Second adopt with a DIFFERENT pid must be refused.
+        let second = backend
+            .bind_external_pid("DP-1", &scene, /* different pid = */ 2)
+            .await;
+        assert!(
+            !second,
+            "adopt must refuse when an alive pid is already recorded"
+        );
+
+        let pids = backend.per_output_pids.lock().await;
+        assert_eq!(
+            pids.get("DP-1"),
+            Some(&live_pid),
+            "recorded pid must be preserved against clobber attempt"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// When the recorded pid is dead, `bind_external_pid` must
+    /// succeed and replace the dead pid with the new one. Used by
+    /// `adopt_existing_lwes` after a daemon restart where the
+    /// previous daemon instance's tracked pid is gone.
+    #[tokio::test]
+    async fn bind_external_pid_replaces_dead_pid() {
+        let backend = LweBackend::with_binary("/bin/true");
+        let scene = std::env::temp_dir().join("paperforge-bind-external-dead.scene");
+        std::fs::write(&scene, b"fake scene").unwrap();
+
+        {
+            let mut pids = backend.per_output_pids.lock().await;
+            pids.insert("DP-1".to_string(), 2_999_999);
+            let mut scenes = backend.per_output_scenes.lock().await;
+            scenes.insert("DP-1".to_string(), scene.clone());
+        }
+
+        let adopted = backend
+            .bind_external_pid("DP-1", &scene, /* replacement pid = */ 3)
+            .await;
+        assert!(
+            adopted,
+            "dead pid in the map must be replaceable by an external pid"
+        );
+
+        let pids = backend.per_output_pids.lock().await;
+        assert_eq!(
+            pids.get("DP-1"),
+            Some(&3),
+            "dead pid must be replaced, not preserved"
+        );
+    }
+
+    /// `outputs_with_pids` returns a `BTreeSet` of output names
+    /// that have a recorded pid. Empty map → empty set.
+    #[tokio::test]
+    async fn outputs_with_pids_returns_empty_set_for_empty_map() {
+        let backend = LweBackend::with_binary("/bin/true");
+        let owned = backend.outputs_with_pids().await;
+        assert!(owned.is_empty(), "fresh backend has no owned pids");
+    }
+
+    /// `outputs_with_pids` returns the keys of the recorded pid map
+    /// in sorted order (BTreeSet contract).
+    #[tokio::test]
+    async fn outputs_with_pids_returns_keys_in_sorted_order() {
+        let backend = LweBackend::with_binary("/bin/true");
+        {
+            let mut pids = backend.per_output_pids.lock().await;
+            pids.insert("DP-1".to_string(), 11);
+            pids.insert("HDMI-A-1".to_string(), 22);
+            pids.insert("eDP-1".to_string(), 33);
+        }
+        let owned = backend.outputs_with_pids().await;
+        let got: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert_eq!(
+            got,
+            vec!["DP-1", "HDMI-A-1", "eDP-1"],
+            "BTreeSet must preserve sorted order"
+        );
+    }
 }

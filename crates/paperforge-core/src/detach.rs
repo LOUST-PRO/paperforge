@@ -23,3 +23,39 @@ pub fn pre_exec_setsid(cmd: &mut std::process::Command) {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test: the helper composes onto a `Command` without
+    /// panicking. The actual `setsid(2)` syscall runs in the forked
+    /// child, which is exercised end-to-end by the
+    /// `setsid_isolates_lwe_from_outer_signal_mask` integration
+    /// test in the CLI crate (real `timeout 12 paperforge …` flow).
+    /// Here we just verify the builder pattern compiles and the
+    /// `pre_exec` closure is wired (i.e. `Command::pre_exec`
+    /// accepts the closure without complaint).
+    #[test]
+    fn pre_exec_setsid_attaches_to_command() {
+        let mut cmd = std::process::Command::new("/bin/true");
+        pre_exec_setsid(&mut cmd);
+        // The Command is now wired with the setsid pre_exec. We
+        // don't execute it (we'd need a real fork for that) — just
+        // verify the function runs without panicking on a
+        // well-formed Command.
+        drop(cmd);
+    }
+
+    /// The helper is idempotent in the sense that calling it
+    /// twice on the same Command does not panic. (Internally
+    /// `Command::pre_exec` appends to a Vec; we want to be sure
+    /// the wrapper doesn't accidentally overwrite the slot.)
+    #[test]
+    fn pre_exec_setsid_is_idempotent() {
+        let mut cmd = std::process::Command::new("/bin/true");
+        pre_exec_setsid(&mut cmd);
+        pre_exec_setsid(&mut cmd);
+        drop(cmd);
+    }
+}
