@@ -947,10 +947,7 @@ impl LweBackend {
         let mut pruned = Vec::new();
         let mut pids = self.per_output_pids.lock().await;
         // Collect first so we don't hold the lock across /proc reads.
-        let candidates: Vec<(String, i32)> = pids
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
+        let candidates: Vec<(String, i32)> = pids.iter().map(|(k, v)| (k.clone(), *v)).collect();
         // We don't need to mutate `scenes` in this function (we
         // keep scenes for re-spawn via `reconcile_outputs`); bind
         // non-mut to silence the warn without changing behaviour.
