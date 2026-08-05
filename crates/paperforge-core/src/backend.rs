@@ -546,6 +546,23 @@ impl LweBackend {
             .arg("--fps")
             .arg(fps.to_string());
 
+        // Detach stdio from the parent CLI/daemon. Without this, the
+        // spawned LWE inherits the parent's stdout/stderr FDs, which
+        // keeps those file descriptors open for the lifetime of the
+        // wallpaper process. Tokio's `current_thread` runtime (used by
+        // the CLI's `#[tokio::main(flavor = "current_thread")]`)
+        // waits for all inherited FDs to close before the process can
+        // exit, so the CLI hangs indefinitely after a successful
+        // spawn. Daemon-side spawners (multi-threaded tokio) don't
+        // hang but still leak the pipe FDs into the daemon's FD
+        // table. Redirecting to /dev/null is the canonical fix and
+        // also matches the operator's `--silent` intent at the LWE
+        // level.
+        use std::process::Stdio;
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
         let child = cmd.spawn().map_err(|e| Error::BackendFailure {
             kind: self.kind().process_pattern().to_string(),
             message: format!("per-output spawn LWE failed: {e}"),
