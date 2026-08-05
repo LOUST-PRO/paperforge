@@ -16,6 +16,9 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
+
+use std::collections::BTreeMap;
 
 use paperforge_core::{
     audio::AudioCommand,
@@ -48,8 +51,16 @@ enum Cmd {
         #[arg(long)]
         output: Option<String>,
     },
-    /// SIGSTOP all LWE instances.
-    Pause,
+    /// Pause wallpapers. Default mode is `frame` (SIGSTOP/SIGCONT
+    /// clock so the layer-shell surface stays alive — no grey).
+    /// Override per-call with `--mode`.
+    Pause {
+        /// `hard` (pure SIGSTOP, grey surface), `frame` (default,
+        /// SIGSTOP/SIGCONT clock), or `throttle` (respawn with
+        /// `--fps 1`).
+        #[arg(long)]
+        mode: Option<String>,
+    },
     /// SIGCONT all LWE instances.
     Resume,
     /// List running LWE PIDs with their state.
@@ -81,6 +92,16 @@ enum Cmd {
     /// Start the LWE pool daemon (D-Bus service + hotplug watcher).
     /// Blocks until SIGINT/SIGTERM, then performs graceful shutdown.
     Daemon,
+    /// Manually trigger a self-heal pass: re-bind any output whose
+    /// LWE process has died. Useful when the background reconciler
+    /// in the daemon hasn't run yet (e.g. right after the daemon
+    /// starts, or after a manual kill of a single LWE process for
+    /// debugging).
+    ///
+    /// This talks to the running daemon over D-Bus — it does NOT
+    /// spawn its own LWE instances. If no daemon is running, the
+    /// command exits with an error.
+    Reconcile,
     /// Self-update: query, apply, or roll back a paperforge upgrade.
     /// Off-by-default; requires `enabled = true` in
     /// `~/.config/paperforge/updater.toml`.
@@ -173,7 +194,29 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Set { path, output } => {
             let p = std::path::PathBuf::from(&path);
-            // Route through BackendOps so `pool_enabled=false`
+            // Try to route through the running daemon first — when
+            // available, the daemon's LweBackendOps owns a single
+            // per_output_pids / per_output_scenes map shared with the
+            // fullscreen dispatcher + SIGCHLD reaper. Falling back to
+            // a local spawn only when no daemon is reachable ensures
+            // CLI mutations stay consistent with daemon-side state.
+            let routed = match output.as_deref() {
+                Some(o) => daemon_set_wallpaper(o, &path).await,
+                None => daemon_set_default_wallpaper(&path).await,
+            };
+            match routed {
+                Ok(true) => {
+                    println!("set {} on output {:?}", p.display(), output);
+                    return Ok(());
+                }
+                Ok(false) => {} // daemon unreachable, fall through to local
+                Err(e) => {
+                    tracing::warn!(
+                        "daemon SetWallpaper returned error: {e}; falling back to local spawn"
+                    );
+                }
+            }
+            // Local fallback: route through BackendOps so `pool_enabled=false`
             // actually triggers per-output spawn. Direct calls to
             // `backend.set()` (WallpaperBackend trait) ignore
             // `pool_enabled` and always go through the pool.
@@ -182,11 +225,29 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             println!("set {} on output {:?}", p.display(), output);
         }
-        Cmd::Pause => {
-            // Route through BackendOps so per-output children are
-            // signaled too (pool mode + per-output mode unified).
-            let n = backend_ops.pause().await?;
-            println!("paused {n} LWE instance(s)");
+        Cmd::Pause { mode } => {
+            // v0.3 supports three modes; `--mode` overrides the
+            // `[pause].mode` from config.toml.
+            let cfg = paperforge_core::config::Config::load(
+                &paperforge_core::config::ConfigPaths::defaults()
+                    .expect("config paths resolvable in CLI context"),
+            )
+            .unwrap_or_default();
+            let mode = match mode {
+                Some(s) => s
+                    .parse::<paperforge_core::config::PauseMode>()
+                    .map_err(|e| anyhow::anyhow!("invalid --mode value: {e}"))?,
+                None => cfg.pause.mode,
+            };
+            let n = backend_ops
+                .pause_with_mode(
+                    mode,
+                    cfg.pause.paused_fps,
+                    cfg.pause.clock_awake_ms,
+                    cfg.pause.clock_asleep_ms,
+                )
+                .await?;
+            println!("paused {n} LWE instance(s) (mode={mode})");
         }
         Cmd::Resume => {
             let n = backend_ops.resume().await?;
@@ -261,9 +322,51 @@ async fn main() -> anyhow::Result<()> {
             }
             PlaylistCmd::Apply { name } => {
                 let pl = store.load(&name)?;
-                let applied = store.apply(&pl, &backend).await?;
+                // Route through the running daemon first so all output
+                // binds land in the daemon's LweBackendOps state
+                // (the source of truth shared with fullscreen
+                // detection + SIGCHLD reaper). Fall back to local
+                // spawn only if no daemon is on the session bus.
+                match daemon_apply_playlist(&name).await {
+                    Ok(true) => {
+                        println!("applied playlist '{}' (via daemon):", pl.name);
+                        for (i, output) in pl.outputs.iter().enumerate() {
+                            let scene = &pl.wallpapers[i % pl.wallpapers.len()];
+                            println!("  {output}\t{}", scene.display());
+                        }
+                        return Ok(());
+                    }
+                    Ok(false) => {} // daemon unreachable, fall through
+                    Err(e) => {
+                        tracing::warn!(
+                            "daemon ApplyPlaylist returned error: {e}; falling back to local spawn"
+                        );
+                    }
+                }
+                if pl.wallpapers.is_empty() {
+                    anyhow::bail!("playlist '{}' has no wallpapers", pl.name);
+                }
+                if pl.outputs.is_empty() {
+                    anyhow::bail!(
+                        "playlist '{}' has empty outputs — provide explicit outputs",
+                        pl.name
+                    );
+                }
+                // Local fallback: route through `backend_ops` (which
+                // honours `pool_enabled`) instead of `store.apply(...
+                // &backend)`. `LweBackend::set` always uses the pool
+                // regardless of `pool_enabled`, so passing the raw
+                // backend there would bypass the operator's intent
+                // and re-introduce the upstream-LWE 2+-bindings crash.
+                let mut applied = BTreeMap::new();
+                for (i, output) in pl.outputs.iter().enumerate() {
+                    let scene = &pl.wallpapers[i % pl.wallpapers.len()];
+                    let scene_str = scene.to_string_lossy().to_string();
+                    backend_ops.set(output, &scene_str).await?;
+                    applied.insert(output.clone(), scene.clone());
+                }
                 println!("applied playlist '{}':", pl.name);
-                for (output, path) in applied {
+                for (output, path) in &applied {
                     println!("  {output}\t{}", path.display());
                 }
             }
@@ -325,6 +428,32 @@ async fn main() -> anyhow::Result<()> {
         },
         Cmd::Daemon => {
             run_daemon(cfg).await?;
+        }
+        Cmd::Reconcile => {
+            // Talk to the running daemon over D-Bus to trigger an
+            // immediate self-heal pass. If no daemon is up, the
+            // client surfaces a connection error instead of
+            // silently doing nothing.
+            let client = paperforge_core::dbus::PaperforgeClient::connect()
+                .await
+                .context(
+                    "connecting to paperforge D-Bus interface (is `paperforge daemon` running?)",
+                )?;
+            match client.reconcile().await {
+                Ok(pairs) => {
+                    if pairs.is_empty() {
+                        println!("reconcile: nothing to re-bind (all LWE PIDs alive)");
+                    } else {
+                        for (output, pid) in &pairs {
+                            println!("reconcile: re-bound {output} pid={pid}");
+                        }
+                        println!("reconcile: {} output(s) re-bound", pairs.len());
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("reconcile failed: {e}"));
+                }
+            }
         }
         Cmd::SelfUpdate {
             check,
@@ -492,16 +621,74 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // 1-3. Build LWE ops + daemon.
     let lwe_ops = cfg.build_backend_ops();
     let backend_dyn: Arc<dyn BackendOps> = lwe_ops.clone();
-    let (daemon, event_rx) = PaperforgeDaemon::with_lwe_backend_ops(backend_dyn, lwe_ops.clone())
-        .context("constructing PaperforgeDaemon")?;
+    // Load the configured pause mode so the daemon's D-Bus
+    // pause/resume honour `[pause]` from config.toml instead of
+    // always issuing plain SIGSTOP (which drops the surface to
+    // grey). Test contexts use the default mode if `cfg.pause`
+    // is absent.
+    let pause_cfg = paperforge_core::config::Config::load(
+        &paperforge_core::config::ConfigPaths::defaults()
+            .expect("config paths resolvable in CLI context"),
+    )
+    .map(|c| c.pause)
+    .unwrap_or_default();
+    let (daemon, event_rx) = PaperforgeDaemon::with_lwe_backend_ops_store_and_pause(
+        backend_dyn,
+        lwe_ops.clone(),
+        Arc::new(RwLock::new(PlaylistStore::default_location()?)),
+        Arc::new(RwLock::new(pause_cfg)),
+    );
 
     // 4. D-Bus layer (consumes event_rx).
     let ctrl: Arc<dyn PaperforgeControl> = daemon.clone();
     let dbus_handle = tokio::spawn(serve_dbus(ctrl, event_rx));
 
+    // 4b. Adopt any LWEs already running on the operator's outputs at
+    //     boot — without this, anything launched before the daemon
+    //     started (or by another tool that uses the same `--screen-root`
+    //     convention) is invisible to the per-output state, so the
+    //     fullscreen dispatcher + reaper would log a phantom kill and
+    //     then fail to respawn. Best-effort: errors are logged, not fatal.
+    if let Err(e) = adopt_existing_lwes(&daemon).await {
+        tracing::warn!("adopt_existing_lwes: {e}; continuing without adoption");
+    }
+
     // 5. Hotplug dispatcher (every 2s, matches the default in the
     //    hotplug module's doc comment).
     let hotplug_handle = tokio::spawn(hotplug_dispatcher(daemon.clone(), Duration::from_secs(2)));
+
+    // 5b. Self-heal reconciler: every ~30s, re-bind outputs whose
+    //     LWE process has died (SIGCHLD left a stale pid in the map).
+    //     Cheap (one /proc read per output) and bounded (no I/O burst).
+    let reconcile_handle = tokio::spawn(reconcile_dispatcher(
+        daemon.clone(),
+        Duration::from_secs(30),
+    ));
+
+    // 5a. Faster PID reaper (every 5s) — sits in front of the 30s
+    //     reconcile so a freshly-crashed LWE doesn't leave an output
+    //     grey for half a minute. Runs the SAME `daemon.reconcile()`
+    //     (which delegates to `LweBackendOps::reconcile_outputs()`)
+    //     so the policy stays in one place.
+    let reaper_handle = tokio::spawn(pid_reaper_dispatcher(
+        daemon.clone(),
+        Duration::from_secs(5),
+    ));
+
+    // 5c. Fullscreen-aware per-output pause/resume. Polls niri's
+    //     IPC every ~2s; when a window goes fullscreen on an
+    //     output, kill LWE for that output to free the GPU; when
+    //     fullscreen clears (e.g. user switches workspace), re-spawn
+    //     LWE with the last-known scene.
+    //
+    //     The watcher is best-effort: `niri msg --json` failures
+    //     are logged but don't abort the task (e.g. niri restart,
+    //     session bus hiccup). The previous state is preserved so
+    //     a transient miss doesn't thrash.
+    let fullscreen_handle = tokio::spawn(fullscreen_dispatcher(
+        daemon.clone(),
+        Duration::from_secs(2),
+    ));
 
     // 6. Wait for SIGINT/SIGTERM.
     let sig = wait_for_shutdown_signal().await?;
@@ -510,8 +697,13 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // 7. Graceful shutdown.
     dbus_handle.abort();
     hotplug_handle.abort();
+    reaper_handle.abort();
+    reconcile_handle.abort();
+    fullscreen_handle.abort();
     let _ = dbus_handle.await;
     let _ = hotplug_handle.await;
+    let _ = reconcile_handle.await;
+    let _ = fullscreen_handle.await;
 
     if let Err(e) = lwe_ops.backend().pool().shutdown().await {
         tracing::warn!("pool shutdown: {e}");
@@ -540,6 +732,257 @@ async fn hotplug_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Durati
         }
     }
     tracing::debug!(target: "paperforge", "hotplug dispatcher exiting");
+}
+
+/// Self-heal reconciler: periodically calls `daemon.reconcile()` to
+/// re-bind outputs whose LWE process has died (SIGCHLD leaks). Cheap
+/// (one `/proc/<pid>/status` read per output) and bounded (single
+/// spawn attempt per dead output per pass).
+async fn reconcile_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Duration) {
+    let mut ticker = tokio::time::interval(poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // First tick fires immediately; skip it so we don't reconcile
+    // before the daemon has finished its own startup (which sets
+    // `known_outputs` via hotplug).
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let respawned = daemon.reconcile().await;
+        if !respawned.is_empty() {
+            tracing::info!(
+                target: "paperforge",
+                "reconcile pass complete: {} output(s) re-spawned: {:?}",
+                respawned.len(),
+                respawned.iter().map(|(o, p)| format!("{o}={p}")).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// Per-output auto-pause driven by niri fullscreen detection.
+///
+/// Algorithm:
+/// 1. Every `poll_interval`, query niri's IPC for outputs /
+///    workspaces / windows.
+/// 2. Compute the set of outputs currently covered by a fullscreen
+///    window (window.tile_size ~= output.logical within 5px).
+/// 3. Diff against the previous snapshot.
+/// 4. For outputs that became fullscreen: `kill_per_output(name)`
+///    — SIGTERM the LWE child to free the GPU/DRM socket.
+/// 5. For outputs that stopped being fullscreen:
+///    `resume_per_output_specific(name)` — re-spawn LWE with the
+///    last-known scene so the wallpaper comes back smoothly.
+///
+/// Best-effort: niri IPC failures are logged at warn and the
+/// previous snapshot is preserved (no thrash from a transient
+/// hiccup). The watcher is intentionally idempotent — calling
+/// kill on an already-dead pid is a no-op.
+async fn fullscreen_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Duration) {
+    use std::collections::BTreeSet;
+    let mut ticker = tokio::time::interval(poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // First tick fires immediately; skip it so we don't poll
+    // before the daemon's hotplug task has registered known
+    // outputs.
+    ticker.tick().await;
+    let mut prev: BTreeSet<String> = BTreeSet::new();
+    loop {
+        ticker.tick().await;
+        let snap = match paperforge_core::fullscreen::snapshot().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "paperforge",
+                    "fullscreen snapshot failed (niri IPC): {e}; keeping previous state"
+                );
+                continue;
+            }
+        };
+        let current = snap.fullscreen_outputs();
+        // Compute transitions: fullscreen-on and fullscreen-off.
+        for output in current.difference(&prev) {
+            // Pre-check whether the daemon actually owns a pid for
+            // this output. The backend's `kill_per_output` already
+            // logs the per-pid outcome (SIGTERM sent vs no-op), so
+            // we just summarise here without lying about what happened.
+            let owned_pids = daemon.outputs_with_pids().await;
+            let had_pid = owned_pids.contains(output);
+            match daemon.kill_per_output(output).await {
+                Ok(()) => {
+                    if had_pid {
+                        tracing::info!(
+                            target: "paperforge",
+                            "fullscreen ON on {output}: kill_per_output dispatched; \
+                             see backend log for actual pid/SIGTERM outcome"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "paperforge",
+                            "fullscreen ON on {output}: kill_per_output was a no-op \
+                             (daemon owns no pid for this output — likely a fullscreen \
+                             window appeared on an output whose LWE was launched outside \
+                             the daemon, e.g. before paperforge daemon started; \
+                             adopt_existing_lwes() runs at boot to fix this)"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "paperforge",
+                    "kill_per_output({output}) failed: {e}"
+                ),
+            }
+        }
+        for output in prev.difference(&current) {
+            match daemon.resume_per_output_specific(output).await {
+                Ok(pid) => tracing::info!(
+                    target: "paperforge",
+                    "fullscreen OFF on {output}: re-spawned LWE pid={pid}"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "paperforge",
+                    "resume_per_output_specific({output}) failed: {e}"
+                ),
+            }
+        }
+        prev = current;
+    }
+}
+
+/// Faster-than-30s PID reaper: every `poll_interval`, run
+/// `daemon.reconcile()` which delegates to `LweBackendOps::reconcile_outputs()`
+/// to prune dead pids and re-bind them with their last-known scene.
+///
+/// Why two reapers: `reconcile_dispatcher` (30s) is the on-idle
+/// self-heal for long-running daemon uptime; this one is the
+/// freshness loop that keeps an output from sitting grey for up to
+/// 30s after an LWE crash. Both call the same `reconcile()` so the
+/// policy stays in one place.
+async fn pid_reaper_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Duration) {
+    let mut ticker = tokio::time::interval(poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the first immediate tick — let the daemon settle.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let respawned = daemon.reconcile().await;
+        if !respawned.is_empty() {
+            tracing::info!(
+                target: "paperforge",
+                "pid_reaper: re-spawned {} dead LWE(s): {:?}",
+                respawned.len(),
+                respawned
+            );
+        }
+    }
+}
+
+/// Walk `/proc/*/cmdline` looking for LWE processes launched outside
+/// the daemon (operator hand, another tool, leftover from a previous
+/// daemon lifetime) that match a known niri output. For each one,
+/// insert `(output, pid)` into the daemon's `per_output_pids` and
+/// `(output, scene_path)` into `per_output_scenes` derived from the
+/// `--bg <id>` numeric content id.
+///
+/// Without this, the fullscreen dispatcher (and the reaper) treats
+/// adopted processes as out-of-band and either fails to kill them or
+/// logs the "no scene recorded" error when it tries to resume. With
+/// it, an LWE started before `paperforge daemon` becomes a first-class
+/// member of the daemon's per-output state.
+///
+/// Best-effort: any single /proc probe failure is skipped, not
+/// propagated. Only **bona fide alive** processes are adopted — we
+/// read `/proc/<pid>/status` ourselves (the same source
+/// `pid_state_quick` reads in paperforge-core) so we don't pick up
+/// zombies and orphans.
+async fn adopt_existing_lwes(daemon: &PaperforgeDaemon) -> anyhow::Result<()> {
+    let known = daemon.known_outputs().await;
+    if known.is_empty() {
+        // Hotplug dispatcher hasn't reported outputs yet — skip; the
+        // first respawn cycle after the first hotplug tick will
+        // catch them naturally via `reconcile_outputs()`.
+        tracing::debug!("adopt_existing_lwes: no known outputs yet; skipping");
+        return Ok(());
+    }
+
+    let mut adopted = 0usize;
+    for entry in std::fs::read_dir("/proc").context("reading /proc")? {
+        let Ok(entry) = entry else { continue };
+        let pid_str = entry.file_name().to_string_lossy().to_string();
+        let pid: i32 = match pid_str.parse() {
+            Ok(n) => n,
+            Err(_) => continue, // not a pid dir (e.g. /proc/self)
+        };
+        let cmd_path = entry.path().join("cmdline");
+        let cmdline_raw = match std::fs::read(&cmd_path) {
+            Ok(b) => b,
+            Err(_) => continue, // gone between readdir + open
+        };
+        let cmdline = String::from_utf8_lossy(&cmdline_raw);
+        if !cmdline.contains("linux-wallpaperengine") {
+            continue;
+        }
+        // Cheap liveness check: read /proc/<pid>/status and look
+        // for the State field. Same logic paperforge-core uses; we
+        // duplicate here instead of exposing a public predicate
+        // from the core crate.
+        let status_raw = match std::fs::read_to_string(entry.path().join("status")) {
+            Ok(s) => s,
+            Err(_) => continue, // process gone
+        };
+        let state_field = status_raw
+            .lines()
+            .find_map(|l| l.strip_prefix("State:").map(str::to_string));
+        let state_letter = state_field
+            .as_deref()
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap_or("");
+        // 'R' = running, 'S' = sleeping, 'D' = uninterruptible sleep,
+        // 'T' = stopped (SIGSTOPped LWE still rendering — keep it).
+        // 'Z' = zombie, 'X' = dead. Anything else we skip.
+        if !matches!(state_letter, "R" | "S" | "D" | "T") {
+            continue;
+        }
+        // Parse `--screen-root <output> --bg <id>` from cmdline.
+        let parts: Vec<&str> = cmdline.split('\0').collect();
+        let mut output: Option<&str> = None;
+        let mut bg_id: Option<&str> = None;
+        let mut iter = parts.iter().copied();
+        while let Some(p) = iter.next() {
+            if p == "--screen-root" {
+                output = iter.next();
+            } else if p == "--bg" {
+                bg_id = iter.next();
+            }
+        }
+        let (Some(out), Some(bg)) = (output, bg_id) else {
+            continue;
+        };
+        if !known.contains(&out.to_string()) {
+            continue;
+        }
+        // Map numeric content id to workshop path.
+        let scene_path = std::path::PathBuf::from(format!(
+            "/home/lou/.steam/root/steamapps/workshop/content/431960/{bg}"
+        ));
+        if !scene_path.is_dir() {
+            continue;
+        }
+        // Adopt via the backend's `bind_external_pid`. Idempotent:
+        // refuses to clobber a still-running daemon-owned pid.
+        let did = daemon.bind_external_pid(out, &scene_path, pid).await;
+        if did {
+            adopted += 1;
+            tracing::info!(
+                target: "paperforge",
+                "adopted pre-existing LWE: output={} pid={} scene={}",
+                out,
+                pid,
+                scene_path.display()
+            );
+        }
+    }
+    tracing::info!("adopt_existing_lwes: {adopted} LWE process(es) adopted");
+    Ok(())
 }
 
 /// Block SIGINT/SIGTERM/SIGHUP in a dedicated thread, then `sigwait`.
@@ -620,4 +1063,69 @@ async fn list_via_dbus() -> Option<Vec<(i32, paperforge_core::backend::BackendSt
         out_vec.push((pid, state));
     }
     Some(out_vec)
+}
+
+/// Run a `gdbus call` against the daemon. Returns:
+///
+/// - `Ok(true)` if the daemon accepted the call (we routed through it).
+/// - `Ok(false)` if `gdbus` failed because no daemon is on the session
+///   bus (caller should fall back to local spawn).
+/// - `Err(anyhow::Error)` if the daemon *was* reachable but the
+///   method returned an error (caller decides whether to retry or
+///   surface the error).
+async fn gdbus_call(method: &str, args: &[&str]) -> anyhow::Result<bool> {
+    let mut cmd_args: Vec<String> = vec![
+        "call".into(),
+        "--session".into(),
+        "--dest".into(),
+        "org.louzt.Paperforge".into(),
+        "--object-path".into(),
+        "/org/louzt/Paperforge".into(),
+        "--method".into(),
+        method.into(),
+    ];
+    for a in args {
+        cmd_args.push(a.to_string());
+    }
+    let out = tokio::process::Command::new("gdbus")
+        .args(&cmd_args)
+        .output()
+        .await?;
+    if out.status.success() {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // `gdbus` returns "Can't find object /org/louzt/Paperforge" (or
+    // similar) when no daemon is on the bus. Treat that as "not
+    // reachable" rather than a real error so callers can fall back.
+    let lowered = stderr.to_lowercase();
+    if lowered.contains("can't find")
+        || lowered.contains("cannot find")
+        || lowered.contains("not found")
+        || lowered.contains("no such")
+        || lowered.contains("no connection")
+        || lowered.contains("service unknown")
+    {
+        return Ok(false);
+    }
+    anyhow::bail!("gdbus call {method} failed: {}", stderr.trim())
+}
+
+/// Forward `paperforge set <scene>` to the running daemon so the
+/// daemon's LweBackendOps owns the per-output state. Returns
+/// `Ok(true)` if daemon handled it, `Ok(false)` if no daemon is
+/// reachable (caller should fall back to local spawn).
+async fn daemon_set_wallpaper(output: &str, scene_path: &str) -> anyhow::Result<bool> {
+    gdbus_call("org.louzt.Paperforge1.SetWallpaper", &[output, scene_path]).await
+}
+
+/// Forward `paperforge set <scene>` (no `--output`) — daemon picks
+/// the default output (active workspace's output).
+async fn daemon_set_default_wallpaper(scene_path: &str) -> anyhow::Result<bool> {
+    gdbus_call("org.louzt.Paperforge1.SetWallpaper", &["", scene_path]).await
+}
+
+/// Forward `paperforge playlist apply <name>` to the daemon.
+async fn daemon_apply_playlist(name: &str) -> anyhow::Result<bool> {
+    gdbus_call("org.louzt.Paperforge1.ApplyPlaylist", &[name]).await
 }
