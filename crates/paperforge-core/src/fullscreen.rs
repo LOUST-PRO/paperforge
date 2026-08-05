@@ -195,11 +195,9 @@ fn parse_outputs(raw: &str) -> Result<BTreeMap<String, OutputInfo>> {
     // name, each value carrying name, logical, etc. Use a permissive
     // parser (serde_json::Value) so a future schema addition
     // doesn't break us.
-    let val: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
-        Error::BackendFailure {
-            kind: "niri-ipc".to_string(),
-            message: format!("outputs JSON parse: {e}"),
-        }
+    let val: serde_json::Value = serde_json::from_str(raw).map_err(|e| Error::BackendFailure {
+        kind: "niri-ipc".to_string(),
+        message: format!("outputs JSON parse: {e}"),
     })?;
     let obj = val.as_object().ok_or_else(|| Error::BackendFailure {
         kind: "niri-ipc".to_string(),
@@ -207,12 +205,10 @@ fn parse_outputs(raw: &str) -> Result<BTreeMap<String, OutputInfo>> {
     })?;
     let mut out = BTreeMap::new();
     for (name, info) in obj {
-        let logical = info
-            .get("logical")
-            .ok_or_else(|| Error::BackendFailure {
-                kind: "niri-ipc".to_string(),
-                message: format!("output {name}: no logical field"),
-            })?;
+        let logical = info.get("logical").ok_or_else(|| Error::BackendFailure {
+            kind: "niri-ipc".to_string(),
+            message: format!("output {name}: no logical field"),
+        })?;
         let width = logical
             .get("width")
             .and_then(serde_json::Value::as_i64)
@@ -248,11 +244,9 @@ fn parse_outputs(raw: &str) -> Result<BTreeMap<String, OutputInfo>> {
 }
 
 fn parse_workspaces(raw: &str) -> Result<BTreeMap<u64, WorkspaceInfo>> {
-    let val: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
-        Error::BackendFailure {
-            kind: "niri-ipc".to_string(),
-            message: format!("workspaces JSON parse: {e}"),
-        }
+    let val: serde_json::Value = serde_json::from_str(raw).map_err(|e| Error::BackendFailure {
+        kind: "niri-ipc".to_string(),
+        message: format!("workspaces JSON parse: {e}"),
     })?;
     let arr = val.as_array().ok_or_else(|| Error::BackendFailure {
         kind: "niri-ipc".to_string(),
@@ -288,11 +282,9 @@ fn parse_workspaces(raw: &str) -> Result<BTreeMap<u64, WorkspaceInfo>> {
 }
 
 fn parse_windows(raw: &str) -> Result<Vec<WindowInfo>> {
-    let val: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
-        Error::BackendFailure {
-            kind: "niri-ipc".to_string(),
-            message: format!("windows JSON parse: {e}"),
-        }
+    let val: serde_json::Value = serde_json::from_str(raw).map_err(|e| Error::BackendFailure {
+        kind: "niri-ipc".to_string(),
+        message: format!("windows JSON parse: {e}"),
     })?;
     let arr = val.as_array().ok_or_else(|| Error::BackendFailure {
         kind: "niri-ipc".to_string(),
@@ -307,9 +299,7 @@ fn parse_windows(raw: &str) -> Result<Vec<WindowInfo>> {
                 kind: "niri-ipc".to_string(),
                 message: "window: id not u64".to_string(),
             })?;
-        let workspace_id = w
-            .get("workspace_id")
-            .and_then(serde_json::Value::as_u64);
+        let workspace_id = w.get("workspace_id").and_then(serde_json::Value::as_u64);
         let app_id = w
             .get("app_id")
             .and_then(serde_json::Value::as_str)

@@ -284,10 +284,12 @@ impl PaperforgeClient {
         let conn = zbus::connection::Connection::session()
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("session bus: {e}")))?;
-        let if_name: zbus::names::InterfaceName<'static> = zbus::names::InterfaceName::try_from("org.louzt.Paperforge1")
-            .map_err(|e| Error::Other(anyhow::anyhow!("interface name: {e}")))?;
-        let obj_path: zbus::zvariant::ObjectPath<'static> = zbus::zvariant::ObjectPath::try_from(OBJECT_PATH)
-            .map_err(|e| Error::Other(anyhow::anyhow!("object path: {e}")))?;
+        let if_name: zbus::names::InterfaceName<'static> =
+            zbus::names::InterfaceName::try_from("org.louzt.Paperforge1")
+                .map_err(|e| Error::Other(anyhow::anyhow!("interface name: {e}")))?;
+        let obj_path: zbus::zvariant::ObjectPath<'static> =
+            zbus::zvariant::ObjectPath::try_from(OBJECT_PATH)
+                .map_err(|e| Error::Other(anyhow::anyhow!("object path: {e}")))?;
         Ok(Self {
             conn,
             if_name,

@@ -211,7 +211,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(false) => {} // daemon unreachable, fall through to local
                 Err(e) => {
-                    tracing::warn!("daemon SetWallpaper returned error: {e}; falling back to local spawn");
+                    tracing::warn!(
+                        "daemon SetWallpaper returned error: {e}; falling back to local spawn"
+                    );
                 }
             }
             // Local fallback: route through BackendOps so `pool_enabled=false`
@@ -434,7 +436,9 @@ async fn main() -> anyhow::Result<()> {
             // silently doing nothing.
             let client = paperforge_core::dbus::PaperforgeClient::connect()
                 .await
-                .context("connecting to paperforge D-Bus interface (is `paperforge daemon` running?)")?;
+                .context(
+                    "connecting to paperforge D-Bus interface (is `paperforge daemon` running?)",
+                )?;
             match client.reconcile().await {
                 Ok(pairs) => {
                     if pairs.is_empty() {
@@ -921,9 +925,7 @@ async fn adopt_existing_lwes(daemon: &PaperforgeDaemon) -> anyhow::Result<()> {
         // for the State field. Same logic paperforge-core uses; we
         // duplicate here instead of exposing a public predicate
         // from the core crate.
-        let status_raw = match std::fs::read_to_string(
-            entry.path().join("status"),
-        ) {
+        let status_raw = match std::fs::read_to_string(entry.path().join("status")) {
             Ok(s) => s,
             Err(_) => continue, // process gone
         };
@@ -967,9 +969,7 @@ async fn adopt_existing_lwes(daemon: &PaperforgeDaemon) -> anyhow::Result<()> {
         }
         // Adopt via the backend's `bind_external_pid`. Idempotent:
         // refuses to clobber a still-running daemon-owned pid.
-        let did = daemon
-            .bind_external_pid(out, &scene_path, pid)
-            .await;
+        let did = daemon.bind_external_pid(out, &scene_path, pid).await;
         if did {
             adopted += 1;
             tracing::info!(
@@ -1116,11 +1116,7 @@ async fn gdbus_call(method: &str, args: &[&str]) -> anyhow::Result<bool> {
 /// `Ok(true)` if daemon handled it, `Ok(false)` if no daemon is
 /// reachable (caller should fall back to local spawn).
 async fn daemon_set_wallpaper(output: &str, scene_path: &str) -> anyhow::Result<bool> {
-    gdbus_call(
-        "org.louzt.Paperforge1.SetWallpaper",
-        &[output, scene_path],
-    )
-    .await
+    gdbus_call("org.louzt.Paperforge1.SetWallpaper", &[output, scene_path]).await
 }
 
 /// Forward `paperforge set <scene>` (no `--output`) — daemon picks

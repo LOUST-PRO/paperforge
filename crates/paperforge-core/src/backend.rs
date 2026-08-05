@@ -352,7 +352,9 @@ impl LweBackend {
     /// never touches this directly — it goes through
     /// `set_per_output` + the reaper task.
     #[cfg(test)]
-    pub fn per_output_pids_test_accessor(&self) -> &Arc<Mutex<std::collections::BTreeMap<String, i32>>> {
+    pub fn per_output_pids_test_accessor(
+        &self,
+    ) -> &Arc<Mutex<std::collections::BTreeMap<String, i32>>> {
         &self.per_output_pids
     }
 
@@ -488,19 +490,17 @@ impl LweBackend {
         // ~immediately so a hung child is OK. We `remove()` from the
         // map so the reaper task doesn't try to reap it again — and
         // so the next SIGCHLD doesn't see a stale pid.
-        let _ = {
-            let mut pids = self.per_output_pids.lock().await;
-            if let Some(old) = pids.remove(output) {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(old),
-                    nix::sys::signal::Signal::SIGTERM,
-                );
-                // Also clear the scene map so a re-spawn with a
-                // different scene doesn't get confused.
-                let mut scenes = self.per_output_scenes.lock().await;
-                scenes.remove(output);
-            }
-        };
+        let mut pids = self.per_output_pids.lock().await;
+        if let Some(old) = pids.remove(output) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(old),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+            // Also clear the scene map so a re-spawn with a
+            // different scene doesn't get confused.
+            let mut scenes = self.per_output_scenes.lock().await;
+            scenes.remove(output);
+        }
 
         let mut cmd = std::process::Command::new(&binary);
         cmd.arg("--screen-root")
@@ -790,10 +790,7 @@ impl LweBackend {
                 Ok(pid) if pid > 0 => respawned += 1,
                 Ok(_) => skipped.push((output.clone(), "spawn returned pid 0".into())),
                 Err(e) => {
-                    tracing::warn!(
-                        "throttle-resume: respawn for output={} failed: {e}",
-                        output
-                    );
+                    tracing::warn!("throttle-resume: respawn for output={} failed: {e}", output);
                     skipped.push((output.clone(), e.to_string()));
                 }
             }
@@ -864,12 +861,7 @@ impl LweBackend {
     /// it gets replaced by the external pid. This prevents the
     /// reaper from spawning a duplicate over a still-running
     /// adopted LWE.
-    pub async fn bind_external_pid(
-        &self,
-        output: &str,
-        scene: &Path,
-        pid: i32,
-    ) -> bool {
+    pub async fn bind_external_pid(&self, output: &str, scene: &Path, pid: i32) -> bool {
         let already_live = {
             let pids = self.per_output_pids.lock().await;
             match pids.get(output) {
@@ -957,7 +949,7 @@ impl LweBackend {
         // Collect first so we don't hold the lock across /proc reads.
         let candidates: Vec<(String, i32)> = pids
             .iter()
-            .filter_map(|(k, v)| Some((k.clone(), *v)))
+            .map(|(k, v)| (k.clone(), *v))
             .collect();
         // We don't need to mutate `scenes` in this function (we
         // keep scenes for re-spawn via `reconcile_outputs`); bind
@@ -1053,10 +1045,7 @@ impl LweBackend {
                 );
                 continue;
             };
-            match self
-                .set_per_output_with_fps(scene, &output, fps)
-                .await
-            {
+            match self.set_per_output_with_fps(scene, &output, fps).await {
                 Ok(new_pid) => {
                     tracing::info!(
                         target: "paperforge",
@@ -2522,7 +2511,10 @@ mod tests {
     async fn prune_dead_pids_leaves_alive_pids_untouched() {
         let backend = LweBackend::with_binary("/bin/sleep");
         // Spawn a real child so /proc/<pid>/status is valid.
-        let mut child = std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
         let live_pid = child.id() as i32;
 
         {
@@ -2546,6 +2538,7 @@ mod tests {
         assert_eq!(pids.get("DP-1"), Some(&live_pid), "live pid must remain");
 
         let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// `last_known_scenes` is the canonical "which scene was this
@@ -2628,7 +2621,10 @@ mod tests {
     #[tokio::test]
     async fn reconcile_outputs_noop_when_all_alive() {
         let backend = LweBackend::with_binary("/bin/sleep");
-        let mut child = std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
         let live_pid = child.id() as i32;
 
         {
@@ -2654,6 +2650,7 @@ mod tests {
         );
 
         let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// `kill_per_output` SIGTERMs the recorded pid and removes it
@@ -2663,7 +2660,10 @@ mod tests {
     #[tokio::test]
     async fn kill_per_output_sends_sigterm_and_clears_pid_keeps_scene() {
         let backend = LweBackend::with_binary("/bin/sleep");
-        let mut child = std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
         let live_pid = child.id() as i32;
 
         {
@@ -2680,10 +2680,7 @@ mod tests {
 
         // Pid is gone from the map.
         let pids = backend.per_output_pids.lock().await;
-        assert!(
-            pids.get("DP-1").is_none(),
-            "kill must remove pid from map"
-        );
+        assert!(pids.get("DP-1").is_none(), "kill must remove pid from map");
         drop(pids);
         // Scene stays (re-spawn target).
         let scenes = backend.per_output_scenes.lock().await;
@@ -2694,10 +2691,14 @@ mod tests {
         );
 
         // Idempotent: second kill is a no-op.
-        backend.kill_per_output("DP-1").await.expect("kill idempotent");
+        backend
+            .kill_per_output("DP-1")
+            .await
+            .expect("kill idempotent");
 
         // Cleanup the actual child.
         let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// `resume_per_output_specific` re-spawns LWE with the

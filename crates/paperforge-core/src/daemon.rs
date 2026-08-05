@@ -267,10 +267,7 @@ impl LweBackendOps {
     /// `--fps 1` respawn) according to `mode`. For Hard mode this
     /// is just `backend.resume()` (SIGCONT everyone). For Throttle
     /// mode it re-spawns LWE at the original FPS cap.
-    pub async fn resume_with_mode(
-        &self,
-        mode: crate::config::PauseMode,
-    ) -> Result<usize> {
+    pub async fn resume_with_mode(&self, mode: crate::config::PauseMode) -> Result<usize> {
         if self.use_pool {
             match mode {
                 crate::config::PauseMode::Hard
@@ -280,7 +277,11 @@ impl LweBackendOps {
                     // (see `pause_with_mode`); resume is just the
                     // plain SIGCONT which cancels any pause_soft
                     // cycle + wakes the pool.
-                    self.backend.pool().resume().await.map(|n| if n.is_some() { 1 } else { 0 })
+                    self.backend
+                        .pool()
+                        .resume()
+                        .await
+                        .map(|n| if n.is_some() { 1 } else { 0 })
                 }
             }
         } else {
@@ -709,14 +710,12 @@ impl PaperforgeDaemon {
     /// fullscreen dispatcher and the reaper can treat the adopted
     /// process as first-class state instead of logging "no scene
     /// recorded" when they try to resume it.
-    pub async fn bind_external_pid(
-        &self,
-        output: &str,
-        scene: &std::path::Path,
-        pid: i32,
-    ) -> bool {
+    pub async fn bind_external_pid(&self, output: &str, scene: &std::path::Path, pid: i32) -> bool {
         if let Some(lwe_ops) = self.backend_as_lwe() {
-            lwe_ops.backend().bind_external_pid(output, scene, pid).await
+            lwe_ops
+                .backend()
+                .bind_external_pid(output, scene, pid)
+                .await
         } else {
             tracing::debug!(
                 target: "paperforge",
@@ -1400,9 +1399,10 @@ mod tests {
     #[tokio::test]
     async fn daemon_reconcile_returns_empty_for_non_lwe_backend() {
         let stub: Arc<dyn BackendOps> = Arc::new(SwwwBackendOps(SwwwBackend::new()));
-        let (daemon, _event_rx) = PaperforgeDaemon::with_store(stub, Arc::new(RwLock::new(
-            PlaylistStore::default_location().unwrap(),
-        )));
+        let (daemon, _event_rx) = PaperforgeDaemon::with_store(
+            stub,
+            Arc::new(RwLock::new(PlaylistStore::default_location().unwrap())),
+        );
         let respawned = daemon.reconcile().await;
         assert!(
             respawned.is_empty(),
@@ -1427,9 +1427,7 @@ mod tests {
     async fn daemon_reconcile_emits_wallpaper_started_for_respawned_outputs() {
         // Force per-output mode (pool=false) so reconcile uses the
         // spawn path the user's v0.1 daemon also uses.
-        let lwe_ops = std::sync::Arc::new(
-            LweBackendOps::with_binary_and_pool("/bin/true", false),
-        );
+        let lwe_ops = std::sync::Arc::new(LweBackendOps::with_binary_and_pool("/bin/true", false));
         // Inject a "dead pid" + scene by spawning a real child and
         // immediately replacing its entry with a pid that's
         // certainly dead (high PID). The spawn itself isn't needed
@@ -1441,12 +1439,11 @@ mod tests {
         std::fs::create_dir_all(scene.parent().unwrap()).unwrap();
         std::fs::write(&scene, b"fake scene").unwrap();
         let backend_dyn: Arc<dyn BackendOps> = lwe_ops.clone();
-        let (daemon, _event_rx) =
-            PaperforgeDaemon::with_lwe_backend_ops_and_store(
-                backend_dyn,
-                lwe_ops.clone(),
-                Arc::new(RwLock::new(PlaylistStore::default_location().unwrap())),
-            );
+        let (daemon, _event_rx) = PaperforgeDaemon::with_lwe_backend_ops_and_store(
+            backend_dyn,
+            lwe_ops.clone(),
+            Arc::new(RwLock::new(PlaylistStore::default_location().unwrap())),
+        );
 
         // Reach into the public test helper to overwrite the pid
         // (this is the same access pattern as
@@ -1457,9 +1454,7 @@ mod tests {
         // field via the same accessor used by other tests.
         // Populate the scene map by calling set_per_output once so
         // `last_known_scenes` returns non-empty.
-        let _ = backend
-            .set_per_output_with_fps(&scene, "DP-1", 1)
-            .await;
+        let _ = backend.set_per_output_with_fps(&scene, "DP-1", 1).await;
         // Now overwrite the recorded pid with a guaranteed-dead
         // value so `prune_dead_pids` flags it.
         {
@@ -1493,9 +1488,7 @@ mod tests {
         )
         .unwrap();
 
-        let lwe_ops = std::sync::Arc::new(
-            LweBackendOps::with_binary(&wrapper),
-        );
+        let lwe_ops = std::sync::Arc::new(LweBackendOps::with_binary(&wrapper));
         // Spawn a real LWE proxy so pool.pause() has something to
         // act on. We bind to a fake output name; only the pool
         // argv matters for this test.
@@ -1505,15 +1498,16 @@ mod tests {
         // SIGSTOP'd; with the config honoured, the pool's pause
         // state machine cycles soft-pause (which we observe by
         // looking at the pool's internal cancel token state).
-        let mut pause_cfg = crate::config::PauseConfig::default();
-        pause_cfg.mode = crate::config::PauseMode::Frame;
-        let (daemon, _event_rx) =
-            PaperforgeDaemon::with_lwe_backend_ops_store_and_pause(
-                backend_dyn,
-                lwe_ops.clone(),
-                Arc::new(RwLock::new(PlaylistStore::default_location().unwrap())),
-                Arc::new(RwLock::new(pause_cfg)),
-            );
+        let pause_cfg = crate::config::PauseConfig {
+            mode: crate::config::PauseMode::Frame,
+            ..Default::default()
+        };
+        let (daemon, _event_rx) = PaperforgeDaemon::with_lwe_backend_ops_store_and_pause(
+            backend_dyn,
+            lwe_ops.clone(),
+            Arc::new(RwLock::new(PlaylistStore::default_location().unwrap())),
+            Arc::new(RwLock::new(pause_cfg)),
+        );
 
         // The D-Bus layer exercises the same `pause()` impl the
         // daemon's PaperforgeControl trait exposes. Direct call
@@ -1532,14 +1526,15 @@ mod tests {
     #[tokio::test]
     async fn daemon_dbus_pause_falls_back_for_non_lwe_backends() {
         let stub: Arc<dyn BackendOps> = Arc::new(SwwwBackendOps(SwwwBackend::new()));
-        let mut pause_cfg = crate::config::PauseConfig::default();
-        pause_cfg.mode = crate::config::PauseMode::Throttle;
-        let (daemon, _event_rx) =
-            PaperforgeDaemon::with_store_and_pause(
-                stub,
-                Arc::new(RwLock::new(PlaylistStore::default_location().unwrap())),
-                Arc::new(RwLock::new(pause_cfg)),
-            );
+        let pause_cfg = crate::config::PauseConfig {
+            mode: crate::config::PauseMode::Throttle,
+            ..Default::default()
+        };
+        let (daemon, _event_rx) = PaperforgeDaemon::with_store_and_pause(
+            stub,
+            Arc::new(RwLock::new(PlaylistStore::default_location().unwrap())),
+            Arc::new(RwLock::new(pause_cfg)),
+        );
         // swww's pause() returns a BackendFailure explaining swww
         // doesn't support pause. The contract under test is "doesn't
         // error out trying to route through LweBackendOps on a
