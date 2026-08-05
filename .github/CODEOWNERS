@@ -1,0 +1,7 @@
+# Default owners for everything
+* @louzt
+
+# Security-sensitive paths (CI, secrets, releases)
+/.github/ @louzt
+*.toml @louzt
+*.lock @louzt

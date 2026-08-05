@@ -172,3 +172,15 @@ MIT — see [`LICENSE`](LICENSE).
 ## Translations
 
 - [Español](docs/README.es.md)
+
+## LZT hardening fork
+
+This repository is a Lou-maintained fork with hardening applied:
+
+- Defensive defaults (fail-closed, no silent fallbacks)
+- Sanitization gate on public-facing files
+- No telemetry by default
+
+See [LICENSE-FORK.md](./LICENSE-FORK.md) for the full hardening addendum
+and [ci-debug-lab](https://github.com/louzt/ci-debug-lab) for the broader
+verification toolkit (cgroups v2, /dev/shm sizing, canary probes).
