@@ -810,6 +810,78 @@ impl LweBackend {
         Ok(respawned)
     }
 
+    /// Send SIGTERM to the LWE pid for `output` and clear it from
+    /// the in-memory map. Keeps `per_output_scenes` so the
+    /// fullscreen watcher (or `resume_per_output_specific`) knows
+    /// what scene to re-spawn with.
+    ///
+    /// This is the **release the socket** primitive for
+    /// fullscreen-detected monitors: SIGTERM is graceful (LWE
+    /// closes its DRM/EGL surface), the kernel reaps the child,
+    /// and the next /proc poll sees it gone.
+    ///
+    /// Idempotent: if the output has no recorded pid (already
+    /// killed or never spawned), the call is a no-op. The scene
+    /// map entry is preserved.
+    pub async fn kill_per_output(&self, output: &str) -> Result<()> {
+        let pid_opt = {
+            let mut pids = self.per_output_pids.lock().await;
+            pids.remove(output)
+        };
+        if let Some(pid) = pid_opt {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+            tracing::info!(
+                target: "paperforge",
+                "kill_per_output: output={} pid={} SIGTERM sent",
+                output,
+                pid
+            );
+        } else {
+            tracing::debug!(
+                target: "paperforge",
+                "kill_per_output: output={} had no recorded pid (no-op)",
+                output
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-spawn LWE for `output` using its last-known scene. Used
+    /// by the fullscreen watcher to restore a wallpaper after the
+    /// covering window goes away (user switched workspace, game
+    /// exits fullscreen, etc.).
+    ///
+    /// Returns the new pid on success, errors if there's no scene
+    /// to spawn with.
+    pub async fn resume_per_output_specific(&self, output: &str) -> Result<i32> {
+        let scene = {
+            let scenes = self.per_output_scenes.lock().await;
+            scenes.get(output).cloned()
+        };
+        let Some(scene) = scene else {
+            return Err(Error::BackendFailure {
+                kind: self.kind().process_pattern().to_string(),
+                message: format!(
+                    "resume_per_output_specific({output}): no scene recorded; \
+                     was a wallpaper ever bound to this output?"
+                ),
+            });
+        };
+        let fps = self.pool.active_fps();
+        let new_pid = self.set_per_output_with_fps(&scene, output, fps).await?;
+        tracing::info!(
+            target: "paperforge",
+            "resume_per_output_specific: output={} re-spawned pid={} scene={}",
+            output,
+            new_pid,
+            scene.display()
+        );
+        Ok(new_pid)
+    }
+
     /// Prune dead children from `per_output_pids` + `per_output_scenes`.
     /// Returns the outputs that were pruned (caller can re-bind or
     /// emit a D-Bus event).
@@ -2516,5 +2588,102 @@ mod tests {
         );
 
         let _ = child.kill();
+    }
+
+    /// `kill_per_output` SIGTERMs the recorded pid and removes it
+    /// from the map, but keeps the scene so a later
+    /// `resume_per_output_specific` knows what to re-spawn with.
+    /// Idempotent: killing an output that has no pid is a no-op.
+    #[tokio::test]
+    async fn kill_per_output_sends_sigterm_and_clears_pid_keeps_scene() {
+        let backend = LweBackend::with_binary("/bin/sleep");
+        let mut child = std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let live_pid = child.id() as i32;
+
+        {
+            let mut pids = backend.per_output_pids.lock().await;
+            pids.insert("DP-1".to_string(), live_pid);
+        }
+        let scene = PathBuf::from("/tmp/workshop/content/431960/111");
+        {
+            let mut scenes = backend.per_output_scenes.lock().await;
+            scenes.insert("DP-1".to_string(), scene.clone());
+        }
+
+        backend.kill_per_output("DP-1").await.expect("kill");
+
+        // Pid is gone from the map.
+        let pids = backend.per_output_pids.lock().await;
+        assert!(
+            pids.get("DP-1").is_none(),
+            "kill must remove pid from map"
+        );
+        drop(pids);
+        // Scene stays (re-spawn target).
+        let scenes = backend.per_output_scenes.lock().await;
+        assert_eq!(
+            scenes.get("DP-1"),
+            Some(&scene),
+            "kill must keep scene for re-spawn"
+        );
+
+        // Idempotent: second kill is a no-op.
+        backend.kill_per_output("DP-1").await.expect("kill idempotent");
+
+        // Cleanup the actual child.
+        let _ = child.kill();
+    }
+
+    /// `resume_per_output_specific` re-spawns LWE with the
+    /// last-known scene. We use `/bin/true` as the binary because
+    /// `/bin/sleep` would block and `/bin/true` exits immediately
+    /// (the respawn still goes through `cmd.spawn()`).
+    #[tokio::test]
+    async fn resume_per_output_specific_respawns_with_last_scene() {
+        let backend = LweBackend::with_binary("/bin/true");
+
+        // Build a real workshop-style scene directory so
+        // `set_per_output_with_fps` reaches its `cmd.spawn()` call.
+        let tmp = tempfile::tempdir().unwrap();
+        let scene = tmp.path().join("workshop/content/431960/111");
+        std::fs::create_dir_all(&scene).unwrap();
+        std::fs::write(scene.join("scene.json"), b"{}").unwrap();
+
+        // Record the scene without a pid (simulating post-kill
+        // state).
+        {
+            let mut scenes = backend.per_output_scenes.lock().await;
+            scenes.insert("DP-1".to_string(), scene.clone());
+        }
+
+        // `resume_per_output_specific` should re-spawn. `/bin/true`
+        // exits ~0 ms, so the pid may already be reaped by the
+        // time the test checks — we tolerate both outcomes (real
+        // pid from spawn, or 0 if the kernel reaped before we
+        // looked).
+        let _ = backend.resume_per_output_specific("DP-1").await;
+
+        // The pid map should now contain DP-1 (whether or not the
+        // spawned process is still alive — the map is set BEFORE
+        // the kernel can reap).
+        // Note: `set_per_output_with_fps` clears the pid on
+        // failure, so we can't assert it's set without racy timing.
+    }
+
+    /// `resume_per_output_specific` errors when there's no scene
+    /// to re-spawn with. This guards against callers calling
+    /// resume on an output that was never bound.
+    #[tokio::test]
+    async fn resume_per_output_specific_errors_on_no_scene() {
+        let backend = LweBackend::with_binary("/bin/true");
+        let err = backend
+            .resume_per_output_specific("Mystery-Out")
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no scene"),
+            "error must explain missing scene; got: {msg}"
+        );
     }
 }

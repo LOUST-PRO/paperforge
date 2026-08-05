@@ -670,6 +670,36 @@ impl PaperforgeDaemon {
         respawned
     }
 
+    /// SIGTERM the LWE child for `output` and clear it from the
+    /// in-memory map. Keeps the scene so a later resume knows
+    /// what to re-spawn with. Public entry point for the
+    /// fullscreen watcher; no-op for non-LWE backends.
+    pub async fn kill_per_output(&self, output: &str) -> Result<()> {
+        if let Some(lwe_ops) = self.backend_as_lwe() {
+            lwe_ops.backend().kill_per_output(output).await
+        } else {
+            tracing::debug!(
+                target: "paperforge",
+                "kill_per_output({output}): non-LWE backend, no-op"
+            );
+            Ok(())
+        }
+    }
+
+    /// Re-spawn LWE for `output` using its last-known scene.
+    /// Public entry point for the fullscreen watcher; errors for
+    /// non-LWE backends and outputs that were never bound.
+    pub async fn resume_per_output_specific(&self, output: &str) -> Result<i32> {
+        if let Some(lwe_ops) = self.backend_as_lwe() {
+            lwe_ops.backend().resume_per_output_specific(output).await
+        } else {
+            Err(crate::error::Error::BackendFailure {
+                kind: "non-lwe".to_string(),
+                message: "resume_per_output_specific: non-LWE backend".to_string(),
+            })
+        }
+    }
+
     /// Best-effort downcast to [`LweBackendOps`] via the trait
     /// object. Returns `None` when the backend is swww / hyprpaper /
     /// mpvpaper or a test stub.

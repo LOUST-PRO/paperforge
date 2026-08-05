@@ -33,6 +33,7 @@ pub mod config;
 pub mod daemon;
 pub mod dbus;
 pub mod error;
+pub mod fullscreen;
 pub mod hotplug;
 pub mod inventory;
 pub mod lwe_probe;

@@ -587,6 +587,21 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         Duration::from_secs(30),
     ));
 
+    // 5c. Fullscreen-aware per-output pause/resume. Polls niri's
+    //     IPC every ~2s; when a window goes fullscreen on an
+    //     output, kill LWE for that output to free the GPU; when
+    //     fullscreen clears (e.g. user switches workspace), re-spawn
+    //     LWE with the last-known scene.
+    //
+    //     The watcher is best-effort: `niri msg --json` failures
+    //     are logged but don't abort the task (e.g. niri restart,
+    //     session bus hiccup). The previous state is preserved so
+    //     a transient miss doesn't thrash.
+    let fullscreen_handle = tokio::spawn(fullscreen_dispatcher(
+        daemon.clone(),
+        Duration::from_secs(2),
+    ));
+
     // 6. Wait for SIGINT/SIGTERM.
     let sig = wait_for_shutdown_signal().await?;
     tracing::info!("received {sig}; shutting down");
@@ -595,9 +610,11 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     dbus_handle.abort();
     hotplug_handle.abort();
     reconcile_handle.abort();
+    fullscreen_handle.abort();
     let _ = dbus_handle.await;
     let _ = hotplug_handle.await;
     let _ = reconcile_handle.await;
+    let _ = fullscreen_handle.await;
 
     if let Err(e) = lwe_ops.backend().pool().shutdown().await {
         tracing::warn!("pool shutdown: {e}");
@@ -650,6 +667,75 @@ async fn reconcile_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Dura
                 respawned.iter().map(|(o, p)| format!("{o}={p}")).collect::<Vec<_>>()
             );
         }
+    }
+}
+
+/// Per-output auto-pause driven by niri fullscreen detection.
+///
+/// Algorithm:
+/// 1. Every `poll_interval`, query niri's IPC for outputs /
+///    workspaces / windows.
+/// 2. Compute the set of outputs currently covered by a fullscreen
+///    window (window.tile_size ~= output.logical within 5px).
+/// 3. Diff against the previous snapshot.
+/// 4. For outputs that became fullscreen: `kill_per_output(name)`
+///    — SIGTERM the LWE child to free the GPU/DRM socket.
+/// 5. For outputs that stopped being fullscreen:
+///    `resume_per_output_specific(name)` — re-spawn LWE with the
+///    last-known scene so the wallpaper comes back smoothly.
+///
+/// Best-effort: niri IPC failures are logged at warn and the
+/// previous snapshot is preserved (no thrash from a transient
+/// hiccup). The watcher is intentionally idempotent — calling
+/// kill on an already-dead pid is a no-op.
+async fn fullscreen_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Duration) {
+    use std::collections::BTreeSet;
+    let mut ticker = tokio::time::interval(poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // First tick fires immediately; skip it so we don't poll
+    // before the daemon's hotplug task has registered known
+    // outputs.
+    ticker.tick().await;
+    let mut prev: BTreeSet<String> = BTreeSet::new();
+    loop {
+        ticker.tick().await;
+        let snap = match paperforge_core::fullscreen::snapshot().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "paperforge",
+                    "fullscreen snapshot failed (niri IPC): {e}; keeping previous state"
+                );
+                continue;
+            }
+        };
+        let current = snap.fullscreen_outputs();
+        // Compute transitions: fullscreen-on and fullscreen-off.
+        for output in current.difference(&prev) {
+            match daemon.kill_per_output(output).await {
+                Ok(()) => tracing::info!(
+                    target: "paperforge",
+                    "fullscreen ON on {output}: killed LWE to free GPU/DRM socket"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "paperforge",
+                    "kill_per_output({output}) failed: {e}"
+                ),
+            }
+        }
+        for output in prev.difference(&current) {
+            match daemon.resume_per_output_specific(output).await {
+                Ok(pid) => tracing::info!(
+                    target: "paperforge",
+                    "fullscreen OFF on {output}: re-spawned LWE pid={pid}"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "paperforge",
+                    "resume_per_output_specific({output}) failed: {e}"
+                ),
+            }
+        }
+        prev = current;
     }
 }
 
