@@ -194,7 +194,27 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Set { path, output } => {
             let p = std::path::PathBuf::from(&path);
-            // Route through BackendOps so `pool_enabled=false`
+            // Try to route through the running daemon first — when
+            // available, the daemon's LweBackendOps owns a single
+            // per_output_pids / per_output_scenes map shared with the
+            // fullscreen dispatcher + SIGCHLD reaper. Falling back to
+            // a local spawn only when no daemon is reachable ensures
+            // CLI mutations stay consistent with daemon-side state.
+            let routed = match output.as_deref() {
+                Some(o) => daemon_set_wallpaper(o, &path).await,
+                None => daemon_set_default_wallpaper(&path).await,
+            };
+            match routed {
+                Ok(true) => {
+                    println!("set {} on output {:?}", p.display(), output);
+                    return Ok(());
+                }
+                Ok(false) => {} // daemon unreachable, fall through to local
+                Err(e) => {
+                    tracing::warn!("daemon SetWallpaper returned error: {e}; falling back to local spawn");
+                }
+            }
+            // Local fallback: route through BackendOps so `pool_enabled=false`
             // actually triggers per-output spawn. Direct calls to
             // `backend.set()` (WallpaperBackend trait) ignore
             // `pool_enabled` and always go through the pool.
@@ -300,6 +320,27 @@ async fn main() -> anyhow::Result<()> {
             }
             PlaylistCmd::Apply { name } => {
                 let pl = store.load(&name)?;
+                // Route through the running daemon first so all output
+                // binds land in the daemon's LweBackendOps state
+                // (the source of truth shared with fullscreen
+                // detection + SIGCHLD reaper). Fall back to local
+                // spawn only if no daemon is on the session bus.
+                match daemon_apply_playlist(&name).await {
+                    Ok(true) => {
+                        println!("applied playlist '{}' (via daemon):", pl.name);
+                        for (i, output) in pl.outputs.iter().enumerate() {
+                            let scene = &pl.wallpapers[i % pl.wallpapers.len()];
+                            println!("  {output}\t{}", scene.display());
+                        }
+                        return Ok(());
+                    }
+                    Ok(false) => {} // daemon unreachable, fall through
+                    Err(e) => {
+                        tracing::warn!(
+                            "daemon ApplyPlaylist returned error: {e}; falling back to local spawn"
+                        );
+                    }
+                }
                 if pl.wallpapers.is_empty() {
                     anyhow::bail!("playlist '{}' has no wallpapers", pl.name);
                 }
@@ -309,12 +350,12 @@ async fn main() -> anyhow::Result<()> {
                         pl.name
                     );
                 }
-                // Route through `backend_ops` (which honours `pool_enabled`
-                // in config.toml) instead of `store.apply(... &backend)` —
-                // `LweBackend::set` always uses the pool regardless of
-                // `pool_enabled`, so passing the raw backend there would
-                // bypass the operator's intent and re-introduce the
-                // upstream-LWE 2+-bindings crash.
+                // Local fallback: route through `backend_ops` (which
+                // honours `pool_enabled`) instead of `store.apply(...
+                // &backend)`. `LweBackend::set` always uses the pool
+                // regardless of `pool_enabled`, so passing the raw
+                // backend there would bypass the operator's intent
+                // and re-introduce the upstream-LWE 2+-bindings crash.
                 let mut applied = BTreeMap::new();
                 for (i, output) in pl.outputs.iter().enumerate() {
                     let scene = &pl.wallpapers[i % pl.wallpapers.len()];
@@ -840,4 +881,73 @@ async fn list_via_dbus() -> Option<Vec<(i32, paperforge_core::backend::BackendSt
         out_vec.push((pid, state));
     }
     Some(out_vec)
+}
+
+/// Run a `gdbus call` against the daemon. Returns:
+///
+/// - `Ok(true)` if the daemon accepted the call (we routed through it).
+/// - `Ok(false)` if `gdbus` failed because no daemon is on the session
+///   bus (caller should fall back to local spawn).
+/// - `Err(anyhow::Error)` if the daemon *was* reachable but the
+///   method returned an error (caller decides whether to retry or
+///   surface the error).
+async fn gdbus_call(method: &str, args: &[&str]) -> anyhow::Result<bool> {
+    let mut cmd_args: Vec<String> = vec![
+        "call".into(),
+        "--session".into(),
+        "--dest".into(),
+        "org.louzt.Paperforge".into(),
+        "--object-path".into(),
+        "/org/louzt/Paperforge".into(),
+        "--method".into(),
+        method.into(),
+    ];
+    for a in args {
+        cmd_args.push(a.to_string());
+    }
+    let out = tokio::process::Command::new("gdbus")
+        .args(&cmd_args)
+        .output()
+        .await?;
+    if out.status.success() {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // `gdbus` returns "Can't find object /org/louzt/Paperforge" (or
+    // similar) when no daemon is on the bus. Treat that as "not
+    // reachable" rather than a real error so callers can fall back.
+    let lowered = stderr.to_lowercase();
+    if lowered.contains("can't find")
+        || lowered.contains("cannot find")
+        || lowered.contains("not found")
+        || lowered.contains("no such")
+        || lowered.contains("no connection")
+        || lowered.contains("service unknown")
+    {
+        return Ok(false);
+    }
+    anyhow::bail!("gdbus call {method} failed: {}", stderr.trim())
+}
+
+/// Forward `paperforge set <scene>` to the running daemon so the
+/// daemon's LweBackendOps owns the per-output state. Returns
+/// `Ok(true)` if daemon handled it, `Ok(false)` if no daemon is
+/// reachable (caller should fall back to local spawn).
+async fn daemon_set_wallpaper(output: &str, scene_path: &str) -> anyhow::Result<bool> {
+    gdbus_call(
+        "org.louzt.Paperforge1.SetWallpaper",
+        &[output, scene_path],
+    )
+    .await
+}
+
+/// Forward `paperforge set <scene>` (no `--output`) — daemon picks
+/// the default output (active workspace's output).
+async fn daemon_set_default_wallpaper(scene_path: &str) -> anyhow::Result<bool> {
+    gdbus_call("org.louzt.Paperforge1.SetWallpaper", &["", scene_path]).await
+}
+
+/// Forward `paperforge playlist apply <name>` to the daemon.
+async fn daemon_apply_playlist(name: &str) -> anyhow::Result<bool> {
+    gdbus_call("org.louzt.Paperforge1.ApplyPlaylist", &[name]).await
 }
