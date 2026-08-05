@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+use std::collections::BTreeMap;
+
 use paperforge_core::{
     audio::AudioCommand,
     backend::BackendState,
@@ -298,9 +300,30 @@ async fn main() -> anyhow::Result<()> {
             }
             PlaylistCmd::Apply { name } => {
                 let pl = store.load(&name)?;
-                let applied = store.apply(&pl, &backend).await?;
+                if pl.wallpapers.is_empty() {
+                    anyhow::bail!("playlist '{}' has no wallpapers", pl.name);
+                }
+                if pl.outputs.is_empty() {
+                    anyhow::bail!(
+                        "playlist '{}' has empty outputs — provide explicit outputs",
+                        pl.name
+                    );
+                }
+                // Route through `backend_ops` (which honours `pool_enabled`
+                // in config.toml) instead of `store.apply(... &backend)` —
+                // `LweBackend::set` always uses the pool regardless of
+                // `pool_enabled`, so passing the raw backend there would
+                // bypass the operator's intent and re-introduce the
+                // upstream-LWE 2+-bindings crash.
+                let mut applied = BTreeMap::new();
+                for (i, output) in pl.outputs.iter().enumerate() {
+                    let scene = &pl.wallpapers[i % pl.wallpapers.len()];
+                    let scene_str = scene.to_string_lossy().to_string();
+                    backend_ops.set(output, &scene_str).await?;
+                    applied.insert(output.clone(), scene.clone());
+                }
                 println!("applied playlist '{}':", pl.name);
-                for (output, path) in applied {
+                for (output, path) in &applied {
                     println!("  {output}\t{}", path.display());
                 }
             }
