@@ -700,6 +700,44 @@ impl PaperforgeDaemon {
         }
     }
 
+    /// Adopt a pre-existing LWE process launched outside the daemon
+    /// (operator by hand, leftover from a previous daemon lifetime)
+    /// into the per-output pid + scene maps. No-op for non-LWE
+    /// backends. Returns `true` if the bind actually took effect.
+    ///
+    /// Used by `adopt_existing_lwes` in paperforge-cli so the
+    /// fullscreen dispatcher and the reaper can treat the adopted
+    /// process as first-class state instead of logging "no scene
+    /// recorded" when they try to resume it.
+    pub async fn bind_external_pid(
+        &self,
+        output: &str,
+        scene: &std::path::Path,
+        pid: i32,
+    ) -> bool {
+        if let Some(lwe_ops) = self.backend_as_lwe() {
+            lwe_ops.backend().bind_external_pid(output, scene, pid).await
+        } else {
+            tracing::debug!(
+                target: "paperforge",
+                "bind_external_pid({output}): non-LWE backend, no-op"
+            );
+            false
+        }
+    }
+
+    /// Snapshot of the `per_output_pids` map keys for the LWE
+    /// backend. Used by the CLI's fullscreen dispatcher to decide
+    /// whether a `kill_per_output` would be a real kill vs a no-op
+    /// (so the log line is honest instead of misleading).
+    pub async fn outputs_with_pids(&self) -> std::collections::BTreeSet<String> {
+        if let Some(lwe_ops) = self.backend_as_lwe() {
+            lwe_ops.backend().outputs_with_pids().await
+        } else {
+            Default::default()
+        }
+    }
+
     /// Best-effort downcast to [`LweBackendOps`] via the trait
     /// object. Returns `None` when the backend is swww / hyprpaper /
     /// mpvpaper or a test stub.

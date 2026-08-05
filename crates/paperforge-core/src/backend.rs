@@ -849,6 +849,61 @@ impl LweBackend {
         Ok(())
     }
 
+    /// Adopt a pre-existing LWE process that was launched outside
+    /// the daemon (operator by hand, another tool, leftover from a
+    /// previous daemon lifetime) into our per-output maps.
+    ///
+    /// Used by `adopt_existing_lwes` in `paperforge-cli` so the
+    /// daemon's fullscreen dispatcher, reaper, and reconcile task
+    /// treat the adopted process as first-class state instead of
+    /// logging "no scene recorded" when they try to resume it.
+    ///
+    /// Idempotent: if the output already has a live pid recorded,
+    /// this is a no-op (the alive pid wins — the daemon should
+    /// have been the source of truth). If the recorded pid is dead,
+    /// it gets replaced by the external pid. This prevents the
+    /// reaper from spawning a duplicate over a still-running
+    /// adopted LWE.
+    pub async fn bind_external_pid(
+        &self,
+        output: &str,
+        scene: &Path,
+        pid: i32,
+    ) -> bool {
+        let already_live = {
+            let pids = self.per_output_pids.lock().await;
+            match pids.get(output) {
+                Some(existing) => matches!(
+                    pid_state_quick(*existing),
+                    Ok(BackendState::Running) | Ok(BackendState::Paused)
+                ),
+                None => false,
+            }
+        };
+        if already_live {
+            tracing::debug!(
+                target: "paperforge",
+                "bind_external_pid: output={} already has a live pid; \
+                 refusing to replace with external pid={}",
+                output,
+                pid
+            );
+            return false;
+        }
+        let mut pids = self.per_output_pids.lock().await;
+        let mut scenes = self.per_output_scenes.lock().await;
+        pids.insert(output.to_string(), pid);
+        scenes.insert(output.to_string(), scene.to_path_buf());
+        tracing::info!(
+            target: "paperforge",
+            "bind_external_pid: output={} pid={} scene={} adopted",
+            output,
+            pid,
+            scene.display()
+        );
+        true
+    }
+
     /// Re-spawn LWE for `output` using its last-known scene. Used
     /// by the fullscreen watcher to restore a wallpaper after the
     /// covering window goes away (user switched workspace, game
@@ -942,6 +997,17 @@ impl LweBackend {
     /// previously-bound scene.
     pub async fn last_known_scenes(&self) -> std::collections::BTreeMap<String, PathBuf> {
         self.per_output_scenes.lock().await.clone()
+    }
+
+    /// Set of outputs that have a recorded pid. Used by the
+    /// fullscreen dispatcher to decide whether `kill_per_output`
+    /// would be a real kill vs a no-op. The daemon log line for
+    /// "fullscreen ON on X: killed LWE" was misleading when X had
+    /// no recorded pid — this helper lets the caller pre-check
+    /// and surface the actual outcome honestly.
+    pub async fn outputs_with_pids(&self) -> std::collections::BTreeSet<String> {
+        let pids = self.per_output_pids.lock().await;
+        pids.keys().cloned().collect()
     }
 
     /// Re-bind any outputs whose LWE process has died, using the
