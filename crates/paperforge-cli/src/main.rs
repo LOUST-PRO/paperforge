@@ -1087,10 +1087,30 @@ async fn gdbus_call(method: &str, args: &[&str]) -> anyhow::Result<bool> {
     for a in args {
         cmd_args.push(a.to_string());
     }
-    let out = tokio::process::Command::new("gdbus")
+    // Bound the call with a 5s timeout. `gdbus` itself defaults to
+    // an infinite reply timeout, which means a daemon-side hang
+    // (e.g. `apply_playlist` blocked on slow LWE spawn) blocks the
+    // CLI indefinitely until the operator Ctrl-Cs. With this
+    // cap, the CLI falls back to a local spawn after 5s of silence
+    // — the LWE still ends up owned by the daemon because the
+    // daemon received the message and started spawning before the
+    // reply. (See notes in PR #11 review on the gdbus hang root
+    // cause: zbus mpsc channel backpressure when the handler
+    // outlives the reply; tracked as a follow-up in #12.)
+    let call_fut = tokio::process::Command::new("gdbus")
         .args(&cmd_args)
-        .output()
-        .await?;
+        .output();
+    let out = match tokio::time::timeout(Duration::from_secs(5), call_fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => {
+            tracing::debug!(
+                target: "paperforge",
+                "gdbus_call({method}) timed out after 5s; treating as unreachable"
+            );
+            return Ok(false);
+        }
+    };
     if out.status.success() {
         return Ok(true);
     }
