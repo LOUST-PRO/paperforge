@@ -1097,8 +1097,21 @@ async fn gdbus_call(method: &str, args: &[&str]) -> anyhow::Result<bool> {
     // reply. (See notes in PR #11 review on the gdbus hang root
     // cause: zbus mpsc channel backpressure when the handler
     // outlives the reply; tracked as a follow-up in #12.)
+    // Detach stdio from the parent CLI. Without this, the spawned
+    // gdbus inherits the parent's stdout/stderr FDs and the
+    // tokio `current_thread` runtime waits for those FDs to close
+    // before the process can exit. With a 5s internal timeout the
+    // call_fut resolves early, but the gdbus subprocess keeps
+    // running until the daemon replies — its open stdout/stderr
+    // FDs hold the CLI's runtime open indefinitely. Redirect to
+    // /dev/null so dropping the future lets the subprocess exit
+    // naturally when the daemon eventually replies (or when gdbus
+    // hits its own --timeout below).
     let call_fut = tokio::process::Command::new("gdbus")
         .args(&cmd_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .output();
     let out = match tokio::time::timeout(Duration::from_secs(5), call_fut).await {
         Ok(Ok(o)) => o,
