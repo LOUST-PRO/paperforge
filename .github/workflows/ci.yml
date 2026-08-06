@@ -167,16 +167,32 @@ jobs:
         # host. The github-hosted jobs install these per-run; the
         # self-hosted runner needs them once-and-for-all via apt-get.
         # Equivalent block as the `clippy` / `test` / `build` jobs.
+        # Best-effort: if `sudo -n` (non-interactive sudo) fails because
+        # the runner user lacks NOPASSWD, we assume the deps are
+        # already pre-installed on the host (the operator installed
+        # them manually with `apt-get install -y ...`).
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libsoup-3.0-dev \
-            libxdo-dev
+          if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            sudo -n apt-get update
+            sudo -n apt-get install -y --no-install-recommends \
+              libglib2.0-dev \
+              libgtk-3-dev \
+              libwebkit2gtk-4.1-dev \
+              libayatana-appindicator3-dev \
+              librsvg2-dev \
+              libsoup-3.0-dev \
+              libxdo-dev
+          else
+            echo "info: sudo -n unavailable — assuming deps are pre-installed on the runner host"
+            for pkg in libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+                       libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev libxdo-dev; do
+              if dpkg -s "$pkg" >/dev/null 2>&1; then
+                echo "  ok: $pkg already installed"
+              else
+                echo "  MISSING: $pkg (must be installed on the runner host with: apt-get install -y $pkg)"
+              fi
+            done
+          fi
       - name: Probe environment
         run: |
           echo "::group::runtime probe"
