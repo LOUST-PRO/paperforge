@@ -159,6 +159,24 @@ jobs:
           # Cache lives on the runner's persistent target/ dir; share by
           # workspace path so multiple jobs reuse the same cache.
           shared-key: ${{ runner.os }}-paperforge-realtime
+      - name: Install system dependencies (GUI scaffold)
+        # The realtime job does `cargo test --all` which compiles every
+        # crate in the workspace including paperforge-gui (Dioxus
+        # scaffold). The GUI crate links against glib-2.0/gobject-2.0
+        # via pkg-config, so the deps must be present on the runner
+        # host. The github-hosted jobs install these per-run; the
+        # self-hosted runner needs them once-and-for-all via apt-get.
+        # Equivalent block as the `clippy` / `test` / `build` jobs.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libxdo-dev
       - name: Probe environment
         run: |
           echo "::group::runtime probe"
