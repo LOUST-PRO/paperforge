@@ -5,6 +5,27 @@ on:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      focus:
+        description: "Optional test name substring to filter"
+        required: false
+        type: string
+      full_realtime:
+        description: "Run the 4 real-process tests that touch zbus mpsc (PR #12 wedge)"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Nightly 03:00 UTC = 22:00 CST (random jitter up to 30 min via
+    # runner's --startup-jitter; we don't pin the minute to avoid
+    # synchronized traffic spikes).
+    - cron: "0 3 * * *"
+
+# Cancel in-progress runs when a new push lands on the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -97,3 +118,89 @@ jobs:
           ./target/release/paperforge --version
           ./target/release/paperforge --help
           ./target/release/paperforge paths
+
+  # ============================================================================
+  # Realtime job — runs on the dedicated paperforge self-hosted runner on the
+  # VPS. Validates paths that GitHub-hosted ubuntu-latest cannot:
+  #   - Real LWE + niri + 3-monitor wiring (DP-1, eDP-1, HDMI-A-1)
+  #   - D-Bus / zbus mpsc round-trip (the 4 tests that hang on PR #12 wedge)
+  #   - Playlist rotation smoke (paperforge-rotate.sh dry-run)
+  #
+  # Triggers:
+  #   - workflow_dispatch (manual, with optional `focus` and `full_realtime`)
+  #   - schedule (nightly 03:00 UTC)
+  #   - NOT push / NOT pull_request (too expensive for the feedback loop;
+  #     GitHub-hosted catches regressions on those)
+  #
+  # Security:
+  #   - Labels are explicit: `self-hosted, paperforge, linux, X64` — the
+  #     `paperforge` label scopes this job to the dedicated runner. The bare
+  #     `self-hosted` label is a footgun that grabs every shared runner in the
+  #     org; never use it alone.
+  #   - No `pull_request` trigger on this job, so PRs from forks can never
+  #     trigger code execution on our VPS.
+  # ============================================================================
+  realtime:
+    name: realtime (self-hosted)
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: [self-hosted, paperforge, linux, X64]
+    timeout-minutes: 30
+    concurrency:
+      group: realtime-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Cache lives on the runner's persistent target/ dir; share by
+          # workspace path so multiple jobs reuse the same cache.
+          shared-key: ${{ runner.os }}-paperforge-realtime
+      - name: Probe environment
+        run: |
+          echo "::group::runtime probe"
+          uname -a
+          cargo --version
+          rustc --version
+          # Spot-check LWE binary — the realtime tests assume it's installed.
+          command -v linux-wallpaperengine || echo "WARN: linux-wallpaperengine not in PATH"
+          # niri config detection — the daemon tests query this via IPC.
+          command -v niri || echo "INFO: niri not present in this runner (some tests skip)"
+          echo "::endgroup::"
+      - name: Run unit + integration tests
+        run: |
+          cargo test --all --no-fail-fast \
+            ${{ inputs.focus && format('-- {0}', inputs.focus) || '' }}
+      - name: Run realtime (real-process) tests
+        if: inputs.full_realtime == true || github.event_name == 'schedule'
+        run: |
+          # PR #12 mpsc wedge — these tests must be run on the real runner
+          # because they touch zbus mpsc channels against an actual LWE
+          # process. Filter list mirrors the known-hung set documented in
+          # memory `paperforge-fase3-pool-wiring-2026-07-30`.
+          cargo test -p paperforge-core --lib --no-fail-fast -- \
+            --include-ignored \
+            reconcile_outputs_respawns_only_dead_pids \
+            resume_per_output_specific_respawns_with_last_scene \
+            daemon_reconcile_emits_wallpaper_started_for_respawned_outputs \
+            lwe_backend_ops_pool_disabled_returns_real_pid
+      - name: Rotation script dry-run
+        run: |
+          # Verify the rotation script parses the runtime config and would
+          # advance state correctly. The script is operator-local on the
+          # runner host (not installed by this workflow); if absent, we
+          # skip cleanly. Real apply requires a live niri output, which
+          # CI doesn't have — but the dry-run path is exercised.
+          if command -v paperforge-rotate.sh > /dev/null 2>&1; then
+            paperforge-rotate.sh --dry-run
+          else
+            echo "INFO: paperforge-rotate.sh not in PATH on this runner"
+          fi
+      - name: Upload state file on success
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paperforge-rotate-state
+          path: /run/user/$UID/paperforge-rotate-state.json
+          if-no-files-found: ignore
+          retention-days: 7
