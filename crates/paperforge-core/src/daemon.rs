@@ -437,6 +437,11 @@ pub struct PaperforgeDaemon {
     /// `monitor_changed` events to the D-Bus layer. The receiver
     /// lives in the D-Bus adapter (not here).
     event_tx: mpsc::UnboundedSender<DaemonEvent>,
+    /// Live metrics ring buffer. Shared with the
+    /// `metrics_dispatcher` background task which samples every
+    /// 10s. `Arc<RwLock<_>>` because the dispatcher needs to
+    /// mutate it from a different tokio task.
+    metrics: Arc<RwLock<crate::metrics::MetricsCollector>>,
     version: String,
 }
 
@@ -484,6 +489,7 @@ impl PaperforgeDaemon {
             known_outputs: Arc::new(RwLock::new(Vec::new())),
             pause_cfg,
             event_tx,
+            metrics: Arc::new(RwLock::new(crate::metrics::MetricsCollector::new())),
             version: crate::VERSION.to_string(),
         });
         (daemon, event_rx)
@@ -538,6 +544,7 @@ impl PaperforgeDaemon {
             known_outputs: Arc::new(RwLock::new(Vec::new())),
             pause_cfg,
             event_tx,
+            metrics: Arc::new(RwLock::new(crate::metrics::MetricsCollector::new())),
             version: crate::VERSION.to_string(),
         });
         (daemon, event_rx)
@@ -859,6 +866,37 @@ impl PaperforgeControl for PaperforgeDaemon {
         // aborts the others). Wrap in Ok so the trait returns
         // Result.
         Ok(Self::reconcile(self).await)
+    }
+
+    async fn get_metrics(&self) -> Result<String> {
+        let collector = self.metrics.read().await;
+        let snap = match collector.latest() {
+            Some(s) => s,
+            None => crate::metrics::MetricsSnapshot {
+                timestamp_secs: 0,
+                outputs: Vec::new(),
+                daemon: crate::metrics::DaemonMetrics {
+                    pid: std::process::id() as i32,
+                    rss_kb: None,
+                    thread_count: None,
+                },
+                gpu: crate::metrics::GpuMetrics {
+                    card_count: 0,
+                    busy_percent_sum: 0,
+                    vram_total_kb: None,
+                },
+                read_errors: 0,
+            },
+        };
+        serde_json::to_string(&snap)
+            .map_err(|e| Error::Other(anyhow::anyhow!("metrics: serialize: {e}")))
+    }
+
+    async fn get_metrics_history(&self, n: u32) -> Result<String> {
+        let collector = self.metrics.read().await;
+        let snaps = collector.history(n as usize);
+        serde_json::to_string(&snaps)
+            .map_err(|e| Error::Other(anyhow::anyhow!("metrics history: serialize: {e}")))
     }
 }
 

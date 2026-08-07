@@ -23,6 +23,7 @@
 //! - [`audio`] — `LweAudioController` (mute/unmute via SIGUSR)
 //! - [`playlist`] — `Playlist` + `PlaylistStore` (JSON files)
 //! - [`config`] — runtime configuration paths
+//! - [`metrics`] — runtime metrics collector (per-output CPU/RSS, GPU, ring buffer + JSONL)
 
 // `#![deny(unsafe_code)]` rather than `#![forbid(unsafe_code)]` so
 // that the small `detach` helper module (which uses `pre_exec` to
@@ -43,6 +44,7 @@ pub mod fullscreen;
 pub mod hotplug;
 pub mod inventory;
 pub mod lwe_probe;
+pub mod metrics;
 pub mod paths;
 pub mod playlist;
 pub mod pool;
@@ -62,6 +64,9 @@ pub use error::{Error, Result};
 pub use hotplug::{CompositorHotplugSource, HotplugEvent, HotplugSource, HotplugWatcher, Output};
 pub use inventory::{Inventory, WallpaperEntry, WallpaperKind};
 pub use lwe_probe::{probe_lwe_binary, LweBuildKind};
+pub use metrics::{
+    DaemonMetrics, GpuMetrics, MetricsCollector, MetricsSnapshot, OutputMetrics,
+};
 pub use paths::{default_paths, WorkshopPaths};
 pub use playlist::{Playlist, PlaylistStore};
 pub use pool::LweSinglePool;

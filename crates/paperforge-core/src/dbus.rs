@@ -116,6 +116,24 @@ pub trait PaperforgeControl: Send + Sync {
 
     /// Return a JSON snapshot of the daemon state.
     async fn get_state(&self) -> Result<DaemonState>;
+
+    /// Latest metrics snapshot as JSON. Default impl returns
+    /// `Err(NotSupported)` so existing stubs compile without
+    /// having to wire metrics. Production `LweDaemonControl`
+    /// overrides this to read from the live collector.
+    async fn get_metrics(&self) -> Result<String> {
+        Err(Error::Other(anyhow::anyhow!(
+            "metrics: not supported by this control impl"
+        )))
+    }
+
+    /// Return the last `n` snapshots (or all if `n = 0`),
+    /// oldest first, as JSON. Same default as `get_metrics`.
+    async fn get_metrics_history(&self, _n: u32) -> Result<String> {
+        Err(Error::Other(anyhow::anyhow!(
+            "metrics history: not supported by this control impl"
+        )))
+    }
 }
 
 /// The D-Bus interface object. Adapts a [`PaperforgeControl`] to the
@@ -230,6 +248,23 @@ impl PaperforgeInterface {
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))?;
         serde_json::to_string(&s).map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
+    }
+
+    /// Return the latest metrics snapshot as JSON.
+    async fn get_metrics(&self) -> zbus::fdo::Result<String> {
+        self.ctrl
+            .get_metrics()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
+    }
+
+    /// Return the last `n` metrics snapshots (or all of them when
+    /// `n = 0`), oldest first, JSON-encoded.
+    async fn get_metrics_history(&self, n: u32) -> zbus::fdo::Result<String> {
+        self.ctrl
+            .get_metrics_history(n)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
     }
 
     /// Signal: a wallpaper instance just started rendering on `output`
