@@ -23,7 +23,11 @@
 //! - [`audio`] — `LweAudioController` (mute/unmute via SIGUSR)
 //! - [`playlist`] — `Playlist` + `PlaylistStore` (JSON files)
 //! - [`config`] — runtime configuration paths
-//! - [`metrics`] — runtime metrics collector (per-output CPU/RSS, GPU, ring buffer + JSONL)
+//! - [`fps_control`] — `FpsController` trait + `LweFpsController`
+//!   + `FakeFpsController` (POSIX signal shim for LWE)
+//! - [`governor`] — load-aware FPS/pause governor
+//! - [`governor_provider`] — `MetricsReader` trait + D-Bus / sysfs
+//!   / fake metric sources for the governor
 
 // `#![deny(unsafe_code)]` rather than `#![forbid(unsafe_code)]` so
 // that the small `detach` helper module (which uses `pre_exec` to
@@ -40,7 +44,10 @@ pub mod daemon;
 pub mod dbus;
 pub mod detach;
 pub mod error;
+pub mod fps_control;
 pub mod fullscreen;
+pub mod governor;
+pub mod governor_provider;
 pub mod hotplug;
 pub mod inventory;
 pub mod lwe_probe;
@@ -61,11 +68,17 @@ pub use dbus::{
     serve_dbus, DaemonState, PaperforgeControl, PaperforgeInterface, BUS_NAME, OBJECT_PATH,
 };
 pub use error::{Error, Result};
+pub use fps_control::{FakeFpsController, FpsCall, FpsController, LweFpsController};
+pub use governor::{FpsTier, GovernorConfig, GovernorEvent, GovernorState, LoadAwareGovernor};
+pub use governor_provider::{
+    FakeMetricsProvider, MetricsReader, PidSource, SysfsMetricsProvider, SystemMetricsProvider,
+};
 pub use hotplug::{CompositorHotplugSource, HotplugEvent, HotplugSource, HotplugWatcher, Output};
 pub use inventory::{Inventory, WallpaperEntry, WallpaperKind};
 pub use lwe_probe::{probe_lwe_binary, LweBuildKind};
 pub use metrics::{
-    DaemonMetrics, GpuMetrics, MetricsCollector, MetricsSnapshot, OutputMetrics,
+    persist_snapshots, rotate_older_than, DaemonMetrics, GpuMetrics, MetricsCollector,
+    MetricsSnapshot, OutputMetrics,
 };
 pub use paths::{default_paths, WorkshopPaths};
 pub use playlist::{Playlist, PlaylistStore};

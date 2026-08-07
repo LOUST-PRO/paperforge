@@ -521,17 +521,12 @@ pub fn rotate_older_than(dir: &Path, keep_days: u64) -> Result<usize> {
         let Ok(d) = chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d") else {
             continue;
         };
-        let dt = d.and_hms_opt(0, 0, 0).and_then(|dt| {
-            Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                dt,
-                chrono::Utc,
-            ))
-        });
+        let dt = d
+            .and_hms_opt(0, 0, 0)
+            .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
         let Some(dt) = dt else { continue };
-        if dt < cutoff {
-            if fs::remove_file(&p).is_ok() {
-                removed += 1;
-            }
+        if dt < cutoff && fs::remove_file(&p).is_ok() {
+            removed += 1;
         }
     }
     Ok(removed)
@@ -687,7 +682,7 @@ mod tests {
                 outputs: Vec::new(),
                 daemon: DaemonMetrics {
                     pid: 1,
-                    rss_kb: Some(1024 * (i + 1) as u64),
+                    rss_kb: Some(1024 * (i + 1)),
                     thread_count: Some(2),
                 },
                 gpu: GpuMetrics {
