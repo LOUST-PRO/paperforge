@@ -85,6 +85,20 @@ pub enum BackendState {
     NotRunning,
 }
 
+/// Result of [`LweBackend::health_check`]. The reconciler maps this
+/// directly to an error variant or a respawn trigger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoolHealth {
+    /// Pool tracks a PID and `/proc/<pid>/status` reports it running.
+    Alive(i32),
+    /// Pool tracks a PID but it's gone (segfault, OOM-killed, manually
+    /// killed). Caller should respawn.
+    Dead(i32),
+    /// Pool has no PID at all. Caller should rebuild pool state from
+    /// the daemon's known outputs + last-set scenes.
+    Untracked,
+}
+
 /// Abstraction over a wallpaper daemon.
 ///
 /// All methods take `&self` (no interior mutability needed); backends
@@ -363,6 +377,40 @@ impl LweBackend {
     /// going through the `WallpaperBackend` trait shim.
     pub fn pool(&self) -> &LweSinglePool {
         &self.pool
+    }
+
+    /// Snapshot the LWE pool's process state for the daemon's reconciler.
+    /// Reads `/proc/<pool_pid>/status` once via `pid_state_quick`. Returns
+    /// `PoolHealth::Alive(pid, state)` if the pool is tracked and the
+    /// process responds to a stat probe; `PoolHealth::Dead(pid)` if the
+    /// tracked PID is gone; `PoolHealth::Untracked` if no pool PID is
+    /// recorded (the daemon should treat this as a stale-state bug and
+    /// rebuild from scratch).
+    ///
+    /// This does NOT touch the network or signal LWE — pure procfs read.
+    /// Cheap enough to call on every reconcile tick.
+    pub async fn health_check(&self) -> PoolHealth {
+        // For now the per-output pid map is the canonical pool state.
+        // When the single-pool path is fully wired (component B lands),
+        // switch this to consult `self.pool.current_pid()` instead.
+        let pids = self.per_output_pids.lock().await;
+        if pids.is_empty() {
+            return PoolHealth::Untracked;
+        }
+        // Use the first pid as the canonical "pool is alive" indicator.
+        // Per-output pids are usually 1 process (the pool) on the v0.2
+        // single-process path; the map has one entry per output only when
+        // each output runs its own LWE (the legacy v0.1 fallback).
+        let mut pids_sorted: Vec<i32> = pids.values().copied().collect();
+        pids_sorted.sort_unstable();
+        let canonical_pid = pids_sorted[0];
+        match pid_state_quick(canonical_pid) {
+            Ok(BackendState::Running) | Ok(BackendState::Paused) => {
+                PoolHealth::Alive(canonical_pid)
+            }
+            Ok(BackendState::NotRunning) => PoolHealth::Dead(canonical_pid),
+            Err(_) => PoolHealth::Dead(canonical_pid),
+        }
     }
 
     /// Test helper: replace the pool's flag list with an empty vec,

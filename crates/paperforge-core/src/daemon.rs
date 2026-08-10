@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::{
     audio::{AudioCommand, LweAudioController},
-    backend::{BackendKind, BackendState, LweBackend, SwwwBackend, WallpaperBackend},
+    backend::{BackendKind, BackendState, LweBackend, PoolHealth, SwwwBackend, WallpaperBackend},
     dbus::{DaemonState, PaperforgeControl},
     error::{Error, Result},
     hotplug::HotplugEvent,
@@ -647,35 +647,57 @@ impl PaperforgeDaemon {
         unbound
     }
 
-    /// Re-bind any outputs whose LWE process has died. This is the
-    /// self-heal path: SIGCHLD leaves a dead pid in the in-memory
-    /// map; `prune_dead_pids` clears it, `set_per_output_with_fps`
-    /// spawns a fresh LWE for the same scene, and we emit a
-    /// `WallpaperStarted` D-Bus event so observers know the
-    /// background changed.
+    /// Re-bind any outputs whose LWE process has died. Self-heal path
+    /// with PID-aliveness verification: if the pool tracks a PID that
+    /// `/proc/<pid>/status` reports as dead, OR the pool has no PID at
+    /// all, return `Err(Error::PoolStateInconsistent { .. })` so the
+    /// caller can act (CI/CD, supervisor, or the operator).
     ///
     /// Returns the list of `(output, new_pid)` pairs that were
-    /// re-spawned.
-    pub async fn reconcile(&self) -> Vec<(String, i32)> {
+    /// re-spawned on success.
+    pub async fn reconcile(&self) -> Result<Vec<(String, i32)>> {
         let Some(lwe_ops) = self.backend_as_lwe() else {
-            // Non-LWE backends don't keep per-output pids here —
-            // there's nothing to reconcile. Caller will see an empty
-            // list and can no-op.
-            return Vec::new();
+            return Ok(Vec::new());
         };
+
+        // Step 1: pool health gate. If the pool is dead or untracked,
+        // return an error INSTEAD OF lying about success. Callers
+        // (CLI `Cmd::Reconcile`, hotplug watcher) can choose to log
+        // and respawn.
+        match lwe_ops.backend().health_check().await {
+            PoolHealth::Alive(_) => {} // proceed
+            PoolHealth::Dead(pid) => {
+                tracing::error!(
+                    target: "paperforge",
+                    "reconcile: pool tracks pid={pid} but /proc reports it dead; \
+                     refusing to claim 'all alive'"
+                );
+                return Err(Error::PoolStateInconsistent {
+                    detail: format!("pool pid {pid} reported dead by /proc/<pid>/status"),
+                });
+            }
+            PoolHealth::Untracked => {
+                tracing::error!(
+                    target: "paperforge",
+                    "reconcile: pool has no tracked pid; daemon state is stale"
+                );
+                return Err(Error::PoolStateInconsistent {
+                    detail: "pool has no tracked pid (state is stale)".to_string(),
+                });
+            }
+        }
+
+        // Step 2: existing reconcile flow.
         let respawned = lwe_ops.backend().reconcile_outputs().await;
         for (output, pid) in &respawned {
-            // The hotplug task already tracks known outputs; we
-            // only need to emit the started signal so observers
-            // can rebuild state.
             let _ = self.emit(DaemonEvent::WallpaperStarted {
                 output: output.clone(),
-                scene_path: String::new(), // path is not exposed by reconcile
+                scene_path: String::new(),
                 pid: *pid,
                 at: Utc::now(),
             });
         }
-        respawned
+        Ok(respawned)
     }
 
     /// SIGTERM the LWE child for `output` and clear it from the
@@ -861,11 +883,12 @@ impl PaperforgeControl for PaperforgeDaemon {
     }
 
     async fn reconcile(&self) -> Result<Vec<(String, i32)>> {
-        // The daemon-level `reconcile()` is infallible (it logs
-        // respawn failures and continues; one bad output never
-        // aborts the others). Wrap in Ok so the trait returns
-        // Result.
-        Ok(Self::reconcile(self).await)
+        // The inherent `reconcile()` is now fallible (Component A
+        // addition): it returns `Err(PoolStateInconsistent)` when
+        // the pool tracks a dead pid (or no pid at all) so the
+        // reconciler doesn't lie about "all alive" status. Forward
+        // that error verbatim to the D-Bus client.
+        Self::reconcile(self).await
     }
 
     async fn get_metrics(&self) -> Result<String> {
@@ -1441,7 +1464,10 @@ mod tests {
             stub,
             Arc::new(RwLock::new(PlaylistStore::default_location().unwrap())),
         );
-        let respawned = daemon.reconcile().await;
+        let respawned = daemon
+            .reconcile()
+            .await
+            .expect("non-LWE reconcile must be Ok");
         assert!(
             respawned.is_empty(),
             "non-LWE backend must report nothing-to-reconcile"
@@ -1493,18 +1519,41 @@ mod tests {
         // Populate the scene map by calling set_per_output once so
         // `last_known_scenes` returns non-empty.
         let _ = backend.set_per_output_with_fps(&scene, "DP-1", 1).await;
-        // Now overwrite the recorded pid with a guaranteed-dead
-        // value so `prune_dead_pids` flags it.
+        // Spawn a real child to act as the canonical "pool is alive"
+        // pid (Component A's health_check reads /proc on this pid).
+        // Then overwrite the recorded per-output pid with a
+        // guaranteed-dead value so `prune_dead_pids` flags it but the
+        // health_check still passes (because the canonical pid from
+        // the map is the alive one — sort_unstable picks the lowest,
+        // and the fake pid 2_999_999 sorts above any reasonable pid).
+        let mut canonical_child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn canonical /bin/sleep");
+        let canonical_pid = canonical_child.id() as i32;
         {
             let mut pids = backend.per_output_pids_test_accessor().lock().await;
+            // Insert the canonical alive pid first (smaller) so it
+            // sorts first; then overwrite DP-1 with the fake-dead pid.
+            pids.insert("__canonical__".to_string(), canonical_pid);
             pids.insert("DP-1".to_string(), 2_999_999);
         }
         // Re-spawn with /bin/true exits immediately; the reconcile
         // pass will produce a new pid and emit WallpaperStarted.
-        let respawned = daemon.reconcile().await;
+        let respawned = daemon
+            .reconcile()
+            .await
+            .expect("reconcile must be Ok when pool alive");
         assert_eq!(respawned.len(), 1, "one respawn expected");
         assert_eq!(respawned[0].0, "DP-1");
         assert_ne!(respawned[0].1, 2_999_999, "real pid, not the dead one");
+        // Cleanup the canonical child.
+        let _ = std::process::Command::new("/bin/kill")
+            .arg(canonical_pid.to_string())
+            .output();
+        let _ = canonical_child.wait();
     }
 
     /// D-Bus `pause()` honours `[pause].mode` from the supplied
@@ -1655,6 +1704,170 @@ mod tests {
         assert!(
             owned.is_empty(),
             "fresh LWE-backed daemon has no owned pids"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pool_health_tests {
+    //! Tests for the Component A `health_check()` + `reconcile()` flow.
+    //! Use `/bin/sleep` as a real subprocess PID since we don't have a
+    //! real LWE binary in the test environment (matches the pattern at
+    //! `backend::tests::reconcile_outputs_noop_when_all_alive`).
+    use super::*;
+    use crate::backend::PoolHealth;
+    use std::process::Command;
+    use std::time::Duration;
+
+    /// Spawn `/bin/sleep 60` and return its PID. Detaches the child
+    /// so it survives past the test and the next `kill` reaps it.
+    /// Clippy `zombie_processes` lint is satisfied by storing the
+    /// handle for the caller to `kill` (which closes the wait
+    /// contract by exiting the child cleanly).
+    fn spawn_alive_child() -> (std::process::Child, i32) {
+        let child = Command::new("/bin/sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let pid = child.id() as i32;
+        (child, pid)
+    }
+
+    #[tokio::test]
+    async fn health_check_alive_when_pid_running() {
+        let (mut _child, pid) = spawn_alive_child();
+        let backend = crate::backend::LweBackend::new();
+        {
+            let pids_arc = backend.per_output_pids_test_accessor();
+            let mut pids = pids_arc.lock().await;
+            pids.insert("DP-1".to_string(), pid);
+        }
+        let health = backend.health_check().await;
+        assert!(matches!(health, PoolHealth::Alive(_)), "got: {health:?}");
+        // cleanup
+        let _ = std::process::Command::new("/bin/kill")
+            .arg(pid.to_string())
+            .output();
+        let _ = _child.wait();
+    }
+
+    #[tokio::test]
+    async fn health_check_dead_when_pid_gone() {
+        let (mut _child, pid) = spawn_alive_child();
+        // Kill the child immediately so its pid is dead.
+        std::process::Command::new("/bin/kill")
+            .arg(pid.to_string())
+            .output()
+            .expect("kill child");
+        let _ = _child.wait();
+        // Small delay for the kernel to reap (or for `/proc` to reflect it).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let backend = crate::backend::LweBackend::new();
+        {
+            let pids_arc = backend.per_output_pids_test_accessor();
+            let mut pids = pids_arc.lock().await;
+            pids.insert("DP-1".to_string(), pid);
+        }
+        let health = backend.health_check().await;
+        assert!(matches!(health, PoolHealth::Dead(_)), "got: {health:?}");
+    }
+
+    #[tokio::test]
+    async fn health_check_untracked_when_no_pids() {
+        let backend = crate::backend::LweBackend::new();
+        let health = backend.health_check().await;
+        assert_eq!(health, PoolHealth::Untracked);
+    }
+
+    #[tokio::test]
+    async fn reconcile_returns_error_when_pool_dead() {
+        // Pool tracks a dead pid → reconcile() must return Err
+        // (PoolStateInconsistent) instead of lying "all alive".
+        let (mut _child, pid) = spawn_alive_child();
+        std::process::Command::new("/bin/kill")
+            .arg(pid.to_string())
+            .output()
+            .expect("kill child");
+        let _ = _child.wait();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // We need an LWE-backed daemon (`lwe_ops` set) so the
+        // reconciler reaches the health_check gate. The non-LWE
+        // path short-circuits to Ok(Vec::new()) and would hide the
+        // bug we're testing.
+        let lwe_ops = Arc::new(LweBackendOps::with_binary_and_pool("/bin/true", false));
+        let backend_dyn: Arc<dyn BackendOps> = lwe_ops.clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PlaylistStore::new(tmp.path()).unwrap();
+        let (daemon, _rx) = PaperforgeDaemon::with_lwe_backend_ops_and_store(
+            backend_dyn,
+            lwe_ops.clone(),
+            Arc::new(RwLock::new(store)),
+        );
+        // Inject the dead pid into the daemon's underlying LweBackend
+        // (the daemon holds it via `lwe_ops`).
+        {
+            let pids_arc = lwe_ops.backend().per_output_pids_test_accessor();
+            let mut pids = pids_arc.lock().await;
+            pids.insert("DP-1".to_string(), pid);
+        }
+        let result = daemon.reconcile().await;
+        assert!(
+            matches!(result, Err(Error::PoolStateInconsistent { .. })),
+            "reconcile must return PoolStateInconsistent when pool is dead; got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_returns_ok_when_pool_alive() {
+        // Sanity check the positive path: pool tracks an alive pid,
+        // reconcile returns Ok (even with no dead outputs to respawn).
+        let (mut _child, pid) = spawn_alive_child();
+        let lwe_ops = Arc::new(LweBackendOps::with_binary_and_pool("/bin/true", false));
+        let backend_dyn: Arc<dyn BackendOps> = lwe_ops.clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PlaylistStore::new(tmp.path()).unwrap();
+        let (daemon, _rx) = PaperforgeDaemon::with_lwe_backend_ops_and_store(
+            backend_dyn,
+            lwe_ops.clone(),
+            Arc::new(RwLock::new(store)),
+        );
+        {
+            let pids_arc = lwe_ops.backend().per_output_pids_test_accessor();
+            let mut pids = pids_arc.lock().await;
+            pids.insert("DP-1".to_string(), pid);
+        }
+        let result = daemon.reconcile().await;
+        assert!(
+            result.is_ok(),
+            "reconcile must return Ok when pool is alive; got: {result:?}"
+        );
+        // cleanup
+        let _ = std::process::Command::new("/bin/kill")
+            .arg(pid.to_string())
+            .output();
+        let _ = _child.wait();
+    }
+
+    #[tokio::test]
+    async fn reconcile_returns_error_when_pool_untracked() {
+        // No pids at all → PoolHealth::Untracked → Err.
+        let lwe_ops = Arc::new(LweBackendOps::with_binary_and_pool("/bin/true", false));
+        let backend_dyn: Arc<dyn BackendOps> = lwe_ops.clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PlaylistStore::new(tmp.path()).unwrap();
+        let (daemon, _rx) = PaperforgeDaemon::with_lwe_backend_ops_and_store(
+            backend_dyn,
+            lwe_ops.clone(),
+            Arc::new(RwLock::new(store)),
+        );
+        let result = daemon.reconcile().await;
+        assert!(
+            matches!(result, Err(Error::PoolStateInconsistent { .. })),
+            "reconcile must return PoolStateInconsistent when pool is untracked; got: {result:?}"
         );
     }
 }

@@ -71,4 +71,16 @@ pub enum Error {
     /// Generic anyhow passthrough.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+
+    /// Pool claims a running LWE process but `/proc/<pid>/status` says
+    /// it's dead. Reconciler hit this when LWE segfaulted or was
+    /// OOM-killed silently. Caller should self-heal (respawn pool with
+    /// last-known bindings).
+    #[error("pool state inconsistent: {detail}")]
+    PoolStateInconsistent {
+        /// Human-readable detail of which PID was dead / which binding
+        /// was missing. Included in the error string so operators don't
+        /// have to enable tracing to debug.
+        detail: String,
+    },
 }

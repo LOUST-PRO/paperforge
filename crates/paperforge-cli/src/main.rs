@@ -563,6 +563,14 @@ async fn main() -> anyhow::Result<()> {
                         println!("reconcile: {} output(s) re-bound", pairs.len());
                     }
                 }
+                Err(paperforge_core::error::Error::PoolStateInconsistent { detail }) => {
+                    eprintln!("reconcile failed: pool state inconsistent — {detail}");
+                    eprintln!(
+                        "hint: run `paperforge set <scene> --output <OUT>` to rebuild, \
+                         or `systemctl --user restart paperforge` for a clean slate"
+                    );
+                    std::process::exit(1);
+                }
                 Err(e) => {
                     return Err(anyhow::anyhow!("reconcile failed: {e}"));
                 }
@@ -884,7 +892,28 @@ async fn reconcile_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Dura
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        let respawned = daemon.reconcile().await;
+        // Component A: `reconcile()` is fallible. The dispatcher
+        // logs the error and continues — the next tick will retry.
+        // This is the supervisor's self-heal behaviour: never crash
+        // the daemon because the pool is dead; the operator can
+        // intervene via `paperforge set ...` or systemd restart.
+        let respawned = match daemon.reconcile().await {
+            Ok(v) => v,
+            Err(paperforge_core::error::Error::PoolStateInconsistent { detail }) => {
+                tracing::error!(
+                    target: "paperforge",
+                    "reconcile_dispatcher: pool state inconsistent — {detail}"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "paperforge",
+                    "reconcile_dispatcher: reconcile failed: {e}"
+                );
+                continue;
+            }
+        };
         if !respawned.is_empty() {
             tracing::info!(
                 target: "paperforge",
@@ -1001,7 +1030,27 @@ async fn pid_reaper_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Dur
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        let respawned = daemon.reconcile().await;
+        // Component A: `reconcile()` is fallible. Mirror
+        // `reconcile_dispatcher`'s log-and-continue policy: the
+        // operator is responsible for the dead pool state, the
+        // reaper just keeps ticking.
+        let respawned = match daemon.reconcile().await {
+            Ok(v) => v,
+            Err(paperforge_core::error::Error::PoolStateInconsistent { detail }) => {
+                tracing::error!(
+                    target: "paperforge",
+                    "pid_reaper: pool state inconsistent — {detail}"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "paperforge",
+                    "pid_reaper: reconcile failed: {e}"
+                );
+                continue;
+            }
+        };
         if !respawned.is_empty() {
             tracing::info!(
                 target: "paperforge",
