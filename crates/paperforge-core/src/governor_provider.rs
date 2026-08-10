@@ -745,4 +745,18 @@ mod tests {
         assert_eq!(snap.outputs.len(), 1);
         assert_eq!(snap.outputs[0].output, "pid-9999");
     }
+
+    /// `SystemMetricsProvider::latest()` returns `None` when the
+    /// injected `gdbus` binary exits non-zero (simulating the
+    /// daemon being unreachable on the session bus). `/bin/false`
+    /// is a guaranteed-available binary that exits 1 immediately
+    /// on any POSIX system, so this test is hermetic — no
+    /// daemon, no session bus, no network. Exercises the same
+    /// fallback path the CLI uses to switch from `System` to
+    /// `Sysfs` providers.
+    #[test]
+    fn system_metrics_provider_returns_none_when_gdbus_unavailable() {
+        let provider = SystemMetricsProvider::with_gdbus(PathBuf::from("/bin/false"));
+        assert!(provider.latest().is_none());
+    }
 }

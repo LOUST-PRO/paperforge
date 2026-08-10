@@ -359,6 +359,37 @@ mod tests {
         assert!(ctrl.cycle_up("ignored").await.is_ok());
     }
 
+    /// `pause_hard` records into the fake's call log — verify it
+    /// emits the `PauseHard(output)` variant in isolation, separate
+    /// from the combined `fake_records_all_calls` smoke test.
+    #[tokio::test]
+    async fn fake_records_pause_hard() {
+        let fake = FakeFpsController::new();
+        FpsController::pause_hard(&fake, "HDMI-A-1").await.unwrap();
+        let calls = fake.calls_snapshot();
+        assert_eq!(calls, vec![FpsCall::PauseHard("HDMI-A-1".to_string())]);
+    }
+
+    /// `resume_hard` records into the fake's call log — verify it
+    /// emits the `ResumeHard(output)` variant in isolation.
+    #[tokio::test]
+    async fn fake_records_resume_hard() {
+        let fake = FakeFpsController::new();
+        FpsController::resume_hard(&fake, "HDMI-A-1").await.unwrap();
+        let calls = fake.calls_snapshot();
+        assert_eq!(calls, vec![FpsCall::ResumeHard("HDMI-A-1".to_string())]);
+    }
+
+    /// `pause_frame` records into the fake's call log — verify it
+    /// emits the `PauseFrame(output)` variant in isolation.
+    #[tokio::test]
+    async fn fake_records_pause_frame() {
+        let fake = FakeFpsController::new();
+        FpsController::pause_frame(&fake, "eDP-1").await.unwrap();
+        let calls = fake.calls_snapshot();
+        assert_eq!(calls, vec![FpsCall::PauseFrame("eDP-1".to_string())]);
+    }
+
     /// `LweFpsController` is a stub today but must construct +
     /// route through `Arc<dyn FpsController>`. The trait surface
     /// has 5 methods; only `cycle_up` returns `Ok(())` today.

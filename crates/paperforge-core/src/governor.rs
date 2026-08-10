@@ -1325,4 +1325,25 @@ mod tests {
         assert_eq!(pct, 0.0);
         assert_eq!(state.last_cpu_jiffies, Some(100));
     }
+
+    /// `LoadAwareGovernor::config()` returns the same
+    /// `GovernorConfig` that was passed to `new()`. With the
+    /// default config the getter surfaces every documented
+    /// default value — covers the CLI / future D-Bus layer's
+    /// read-only view of the governor's settings.
+    #[test]
+    fn config_returns_default_values() {
+        let metrics = Arc::new(FakeMetricsProvider::new());
+        let fps = Arc::new(FakeFpsController::new());
+        let gov = LoadAwareGovernor::new(GovernorConfig::default(), metrics, fps);
+        let cfg = gov.config();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.cpu_low_threshold_pct, 60.0);
+        assert_eq!(cfg.cpu_high_threshold_pct, 80.0);
+        assert_eq!(cfg.gpu_high_threshold_pct, 85.0);
+        assert_eq!(cfg.hysteresis_pct, 10.0);
+        assert_eq!(cfg.min_change_interval_s, 15);
+        assert_eq!(cfg.sustained_high_for_s, 5);
+        assert_eq!(cfg.sustained_critical_for_s, 30);
+    }
 }
