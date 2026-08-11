@@ -1,5 +1,7 @@
 //! Crate-wide error type.
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 /// Result alias for `paperforge-core`.
@@ -82,5 +84,16 @@ pub enum Error {
         /// was missing. Included in the error string so operators don't
         /// have to enable tracing to debug.
         detail: String,
+    },
+
+    /// LWE binary not found in any of the standard locations. Surface
+    /// the paths we tried so the operator can either install the
+    /// binary or set `binary_path` in config.toml.
+    #[error("linux-wallpaperengine binary not found in any of: {paths_tried:?}")]
+    LweBinaryNotFound {
+        /// Absolute paths the resolver checked. Includes `$HOME/.local/bin/...`,
+        /// `$HOME/linux-wallpaperengine/build/output/linux-wallpaperengine`,
+        /// `/usr/bin/linux-wallpaperengine`, and each `$PATH` directory.
+        paths_tried: Vec<PathBuf>,
     },
 }

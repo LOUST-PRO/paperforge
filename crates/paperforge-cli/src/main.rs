@@ -220,6 +220,38 @@ async fn main() -> anyhow::Result<()> {
         .compact()
         .init();
 
+    // Resolve the LWE binary path early so we can fail fast with an
+    // actionable error if it's missing. This avoids the 2026-08-10
+    // incident where systemd-launched daemon had no $PATH including
+    // ~/.local/bin and the spawn silently produced "os error 2".
+    match paperforge_core::lwe_locator::resolve() {
+        Ok(p) => tracing::info!(
+            target: "paperforge",
+            "lwe binary resolved at {}",
+            p.display()
+        ),
+        Err(paperforge_core::error::Error::LweBinaryNotFound { paths_tried }) => {
+            eprintln!(
+                "linux-wallpaperengine binary not found.\n\
+                 Tried these locations:\n  {}\n\n\
+                 Install via one of:\n  \
+                 • `cargo install --path ~/linux-wallpaperengine` (puts it in ~/.local/bin)\n  \
+                 • Build the Almamu/louzt fork and symlink: `ln -sf $PWD/build/output/linux-wallpaperengine ~/.local/bin/`\n  \
+                 • Set `binary_path` in ~/.config/paperforge/config.toml",
+                paths_tried
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n  "),
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("lwe locator error: {e}");
+            std::process::exit(1);
+        }
+    }
+
     let cli = Cli::parse();
     let paths = ConfigPaths::defaults().context("resolving config paths")?;
     let cfg = Config::load(&paths).context("loading config")?;

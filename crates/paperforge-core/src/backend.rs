@@ -420,11 +420,9 @@ impl LweBackend {
     /// `--fullscreen-pause-only-active` etc.
     #[cfg(test)]
     pub fn with_empty_pool_flags(self) -> Self {
-        let new_pool = LweSinglePool::with_binary(
-            self.binary_path
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("linux-wallpaperengine")),
-        )
+        let new_pool = LweSinglePool::with_binary(self.binary_path.clone().unwrap_or_else(|| {
+            crate::lwe_locator::resolve().unwrap_or_else(|_| PathBuf::from("linux-wallpaperengine"))
+        }))
         .with_flags(Vec::new());
         Self {
             binary_path: self.binary_path,
@@ -494,10 +492,19 @@ impl LweBackend {
             ),
         })?;
 
-        let binary = self
-            .binary_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("linux-wallpaperengine"));
+        let binary =
+            self.binary_path
+                .clone()
+                .unwrap_or_else(|| match crate::lwe_locator::resolve() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "paperforge",
+                            "lwe binary auto-detect failed: {e}"
+                        );
+                        PathBuf::from("linux-wallpaperengine")
+                    }
+                });
 
         // Idempotent fast path: same output + same content_id + same
         // FPS cap AND existing pid still alive → return existing pid.

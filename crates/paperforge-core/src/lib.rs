@@ -50,6 +50,7 @@ pub mod governor;
 pub mod governor_provider;
 pub mod hotplug;
 pub mod inventory;
+pub mod lwe_locator;
 pub mod lwe_probe;
 pub mod metrics;
 pub mod paths;
