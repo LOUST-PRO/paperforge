@@ -39,6 +39,7 @@
 
 pub mod audio;
 pub mod backend;
+pub mod compositor_watch;
 pub mod config;
 pub mod daemon;
 pub mod dbus;
@@ -51,6 +52,7 @@ pub mod governor_provider;
 pub mod hotplug;
 pub mod inventory;
 pub mod lwe_locator;
+pub mod lwe_orphan_cleanup;
 pub mod lwe_probe;
 pub mod metrics;
 pub mod paths;
@@ -62,6 +64,9 @@ pub use audio::{AudioCommand, LweAudioController};
 pub use backend::{
     BackendKind, BackendState, HyprpaperBackend, LweBackend, MpvpaperBackend, SwwwBackend,
     WallpaperBackend,
+};
+pub use compositor_watch::{
+    diff_outputs, parse_niri_outputs, query_niri_outputs, watch_loop, CompositorOutputs,
 };
 pub use config::{Config, ConfigPaths};
 pub use daemon::{BackendOps, DaemonEvent, LweBackendOps, PaperforgeDaemon};
@@ -76,6 +81,10 @@ pub use governor_provider::{
 };
 pub use hotplug::{CompositorHotplugSource, HotplugEvent, HotplugSource, HotplugWatcher, Output};
 pub use inventory::{Inventory, WallpaperEntry, WallpaperKind};
+pub use lwe_orphan_cleanup::{
+    find_orphans, find_orphans_in, kill_orphan, reap_all_orphans, reap_orphan, KillOutcome,
+    OrphanLwe,
+};
 pub use lwe_probe::{probe_lwe_binary, LweBuildKind};
 pub use metrics::{
     persist_snapshots, rotate_older_than, DaemonMetrics, GpuMetrics, MetricsCollector,

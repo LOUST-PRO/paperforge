@@ -324,10 +324,12 @@ impl BackendOps for LweBackendOps {
             let path = std::path::Path::new(scene);
             let pid = self.backend.set_per_output(path, output).await?;
             tracing::info!(
-                "per-output spawn: output={} scene={} pid={}",
-                output,
-                scene,
-                pid,
+                target: "paperforge",
+                event = "lwe_spawned_per_output_via_daemon",
+                output = output,
+                scene = scene,
+                pid = pid,
+                "per-output spawn routed through daemon BackendOps::set"
             );
         }
         Ok(())
@@ -669,8 +671,9 @@ impl PaperforgeDaemon {
             PoolHealth::Dead(pid) => {
                 tracing::error!(
                     target: "paperforge",
-                    "reconcile: pool tracks pid={pid} but /proc reports it dead; \
-                     refusing to claim 'all alive'"
+                    event = "reconcile_pool_dead",
+                    pid = pid,
+                    "pool pid reported dead by /proc/<pid>/status; refusing to claim 'all alive'"
                 );
                 return Err(Error::PoolStateInconsistent {
                     detail: format!("pool pid {pid} reported dead by /proc/<pid>/status"),
@@ -679,7 +682,8 @@ impl PaperforgeDaemon {
             PoolHealth::Untracked => {
                 tracing::error!(
                     target: "paperforge",
-                    "reconcile: pool has no tracked pid; daemon state is stale"
+                    event = "reconcile_pool_untracked",
+                    "pool has no tracked pid; daemon state is stale"
                 );
                 return Err(Error::PoolStateInconsistent {
                     detail: "pool has no tracked pid (state is stale)".to_string(),
@@ -690,6 +694,14 @@ impl PaperforgeDaemon {
         // Step 2: existing reconcile flow.
         let respawned = lwe_ops.backend().reconcile_outputs().await;
         for (output, pid) in &respawned {
+            tracing::info!(
+                target: "paperforge",
+                event = "reconcile_outputs_respawned",
+                output = output.as_str(),
+                pid = *pid,
+                count = respawned.len(),
+                "reconcile respawned lwe for output"
+            );
             let _ = self.emit(DaemonEvent::WallpaperStarted {
                 output: output.clone(),
                 scene_path: String::new(),
