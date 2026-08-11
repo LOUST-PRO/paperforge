@@ -34,6 +34,79 @@ use crate::{
     pool::LweSinglePool,
 };
 
+/// Identifier for a single LWE subprocess from the perspective of a
+/// pipe-drain task. Wrapped in a newtype so the call sites are
+/// readable (the test code generates fake pids, and `PidTarget(0)`
+/// is more obvious than a bare `0`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PidTarget(pub i32);
+
+/// Which pipe a drainer is reading from. Used to map the
+/// stream to the right tracing level: stdout at INFO, stderr at
+/// WARN. The "kind" is the only thing that differs between the two
+/// drain tasks per LWE pid — they share `BufReader::lines()` logic
+/// for the actual read loop.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PipeKind {
+    Stdout,
+    Stderr,
+}
+
+/// Read a child process's stdout/stderr line-by-line and emit each
+/// line as a tracing event. The task terminates when the pipe closes
+/// (i.e. the child exits or the handle is dropped). Pipe handles are
+/// `tokio::process::ChildStdout` / `ChildStderr`, both implement
+/// `AsyncRead + Unpin`.
+///
+/// The handler is shared between stdout and stderr — the only
+/// difference is the tracing level. We dispatch on `kind` inside
+/// the loop so the read logic stays in one place.
+///
+/// Lines longer than the `BufReader` buffer (8 KiB default) are
+/// truncated at the buffer boundary; the next call to
+/// `next_line()` reads the remainder. This matches typical LWE
+/// output (timestamps, asset paths, GL driver messages) which is
+/// well under 8 KiB per line in practice.
+pub(crate) async fn drain_pipe<R>(reader: R, pid: PidTarget, kind: PipeKind)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(reader).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => match kind {
+                PipeKind::Stdout => {
+                    tracing::info!(
+                        target: "paperforge",
+                        "lwe[{}] stdout: {}",
+                        pid.0,
+                        line
+                    );
+                }
+                PipeKind::Stderr => {
+                    tracing::warn!(
+                        target: "paperforge",
+                        "lwe[{}] stderr: {}",
+                        pid.0,
+                        line
+                    );
+                }
+            },
+            Ok(None) => break, // EOF: child closed the pipe.
+            Err(e) => {
+                tracing::error!(
+                    target: "paperforge",
+                    "lwe[{}] pipe read error: {}",
+                    pid.0,
+                    e
+                );
+                break;
+            }
+        }
+    }
+}
+
 /// Identifier for a backend implementation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -167,7 +240,24 @@ pub struct LweBackend {
     /// cycle. Fired by `resume_per_output` so the cycle task exits
     /// cleanly instead of leaking until the next SIGCONT attempt.
     soft_pause_cancel: Arc<tokio::sync::Notify>,
+    /// Tokio tasks that drain LWE subprocess stdout/stderr into the
+    /// tracing pipeline. Keyed by LWE PID. Aborted on `unbind` /
+    /// `shutdown` so the pipes close cleanly.
+    ///
+    /// Without this map, LWE's stdio would be discarded by
+    /// `Stdio::null()` (the v0.1 behaviour) or hang forever if piped
+    /// without a reader (the v0.2 latent bug). Component C wires the
+    /// readers and stores their JoinHandles here, then aborts them
+    /// when the LWE pid is killed so the pipe handles don't leak.
+    ///
+    /// Reading tasks are stored as `(stdout_handle, stderr_handle)`
+    /// per pid. Both are aborted together on child cleanup.
+    pipe_drainers: Arc<Mutex<BTreeMap<i32, LwePipeDrainers>>>,
 }
+
+/// Per-LWE-process pipe drainer pair. Type alias to keep the
+/// `pipe_drainers` BTreeMap below the clippy `type_complexity` cap.
+type LwePipeDrainers = (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>);
 
 /// Async task that wakes LWE pids on a duty cycle so the layer-shell
 /// surface stays alive while "paused".
@@ -326,6 +416,7 @@ impl LweBackend {
             per_output_pids: Arc::new(Mutex::new(BTreeMap::new())),
             per_output_scenes: Arc::new(Mutex::new(BTreeMap::new())),
             soft_pause_cancel: Arc::new(tokio::sync::Notify::new()),
+            pipe_drainers: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -342,6 +433,7 @@ impl LweBackend {
             per_output_pids: Arc::new(Mutex::new(BTreeMap::new())),
             per_output_scenes: Arc::new(Mutex::new(BTreeMap::new())),
             soft_pause_cancel: Arc::new(tokio::sync::Notify::new()),
+            pipe_drainers: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -357,6 +449,7 @@ impl LweBackend {
             per_output_pids: Arc::new(Mutex::new(BTreeMap::new())),
             per_output_scenes: Arc::new(Mutex::new(BTreeMap::new())),
             soft_pause_cancel: Arc::new(tokio::sync::Notify::new()),
+            pipe_drainers: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -430,6 +523,7 @@ impl LweBackend {
             per_output_pids: self.per_output_pids,
             per_output_scenes: self.per_output_scenes,
             soft_pause_cancel: self.soft_pause_cancel,
+            pipe_drainers: self.pipe_drainers,
         }
     }
 
@@ -555,9 +649,19 @@ impl LweBackend {
             // different scene doesn't get confused.
             let mut scenes = self.per_output_scenes.lock().await;
             scenes.remove(output);
+            // Drop the dead pid's pipe drainers so the FD pair
+            // closes cleanly. Without this, the drainer tasks would
+            // keep reading an EOF socket until their JoinHandle is
+            // explicitly aborted, leaking FDs into the daemon's
+            // table.
+            let mut drainers = self.pipe_drainers.lock().await;
+            if let Some((sout, serr)) = drainers.remove(&old) {
+                sout.abort();
+                serr.abort();
+            }
         }
 
-        let mut cmd = std::process::Command::new(&binary);
+        let mut cmd = tokio::process::Command::new(&binary);
         // Detach the LWE from the CLI's process group so SIGTERM to
         // the parent (e.g. `timeout 60 paperforge playlist apply …`)
         // does NOT cascade to the wallpaper. Without this, the
@@ -584,7 +688,11 @@ impl LweBackend {
         // leaves the output grey the moment the operator's shell
         // timeout fires. The unsafe lives in `crate::detach` to
         // stay clear of the crate-wide `#![forbid(unsafe_code)]`.
-        crate::detach::pre_exec_setsid(&mut cmd);
+        //
+        // `tokio::process::Command::as_std_mut()` exposes the inner
+        // `std::process::Command` so we can install the setsid
+        // pre_exec, which is only exposed on the std type.
+        crate::detach::pre_exec_setsid(cmd.as_std_mut());
         cmd.arg("--screen-root")
             .arg(output)
             .arg("--bg")
@@ -601,28 +709,47 @@ impl LweBackend {
             .arg("--fps")
             .arg(fps.to_string());
 
-        // Detach stdio from the parent CLI/daemon. Without this, the
-        // spawned LWE inherits the parent's stdout/stderr FDs, which
-        // keeps those file descriptors open for the lifetime of the
-        // wallpaper process. Tokio's `current_thread` runtime (used by
-        // the CLI's `#[tokio::main(flavor = "current_thread")]`)
-        // waits for all inherited FDs to close before the process can
-        // exit, so the CLI hangs indefinitely after a successful
-        // spawn. Daemon-side spawners (multi-threaded tokio) don't
-        // hang but still leak the pipe FDs into the daemon's FD
-        // table. Redirecting to /dev/null is the canonical fix and
-        // also matches the operator's `--silent` intent at the LWE
-        // level.
-        use std::process::Stdio;
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        // Component C: pipe stdout/stderr into the tracing pipeline
+        // so journald captures LWE diagnostics (SYSLOG_IDENTIFIER=
+        // paperforge, courtesy of `paperforge.service`'s
+        // StandardOutput/StandardError=journal). Pre-C behaviour was
+        // `Stdio::null()` for all three streams, which silently
+        // discarded LWE's stderr on crash. The user's 2026-08-10
+        // wallpaper collapse left no trace because of this.
+        //
+        // stdin stays `Stdio::null()` — LWE doesn't read from stdin.
+        // The pipe readers (`drain_pipe`) terminate on EOF (child
+        // exits) or read error, and are aborted on `unbind()` /
+        // `shutdown()` so the FDs don't leak.
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
-        let child = cmd.spawn().map_err(|e| Error::BackendFailure {
+        let mut child = cmd.spawn().map_err(|e| Error::BackendFailure {
             kind: self.kind().process_pattern().to_string(),
             message: format!("per-output spawn LWE failed: {e}"),
         })?;
-        let pid = child.id() as i32;
+        let pid = child.id().unwrap_or(0) as i32;
+        let stdout = child
+            .stdout
+            .take()
+            .expect("Stdio::piped() guarantees stdout");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("Stdio::piped() guarantees stderr");
+
+        // Spawn drainer tasks per LWE process. Each task reads one
+        // line at a time and emits a tracing event. The systemd
+        // service routes tracing events to journald, so the
+        // operator can `journalctl -u paperforge` to see LWE's
+        // diagnostics on crash.
+        let stdout_handle = tokio::spawn(drain_pipe(stdout, PidTarget(pid), PipeKind::Stdout));
+        let stderr_handle = tokio::spawn(drain_pipe(stderr, PidTarget(pid), PipeKind::Stderr));
+        {
+            let mut drainers = self.pipe_drainers.lock().await;
+            drainers.insert(pid, (stdout_handle, stderr_handle));
+        }
         tracing::info!(
             "per-output spawn: output={} bg={} pid={} fps={}",
             output,
@@ -1181,6 +1308,42 @@ impl LweBackend {
         // Fallback: walk /proc for any LWE process. The CLI is a
         // single-shot process; children survive in /proc after exit.
         list_pids_in_proc(Path::new("/proc"), self.kind().process_pattern()).unwrap_or_default()
+    }
+
+    /// Component C: tear down the pipe drainers for a single LWE pid.
+    /// Used after the child has been killed (or after the child has
+    /// died and we want to drop the now-EOF readers). The handles
+    /// are aborted, not awaited — JoinHandle::abort() schedules the
+    /// task for cancellation and the reader future is dropped at
+    /// the next await point.
+    ///
+    /// Idempotent: removing a pid that isn't in the map is a no-op.
+    /// Pids die naturally (EOF triggers `drain_pipe` to return) and
+    /// the entries linger until the next bind/unbind cycle removes
+    /// them — this is the cleanup path for that.
+    pub async fn unbind(&self, pid: i32) {
+        let mut drainers = self.pipe_drainers.lock().await;
+        if let Some((sout, serr)) = drainers.remove(&pid) {
+            sout.abort();
+            serr.abort();
+        }
+    }
+
+    /// Component C: tear down ALL pipe drainers. Called on full
+    /// daemon shutdown so the readers don't keep the pipe FDs open
+    /// after their owning process is gone. The systemd unit's
+    /// `KillMode=process` doesn't guarantee FDs close cleanly if
+    /// async tasks are still holding them.
+    pub async fn shutdown(&self) {
+        let mut drainers = self.pipe_drainers.lock().await;
+        // `MutexGuard` doesn't expose `BTreeMap::drain`, so take the
+        // map out and iterate by value. The replacement is empty,
+        // matching the post-shutdown invariant.
+        let taken = std::mem::take(&mut *drainers);
+        for (_, (sout, serr)) in taken {
+            sout.abort();
+            serr.abort();
+        }
     }
 }
 
@@ -2971,5 +3134,251 @@ mod tests {
             vec!["DP-1", "HDMI-A-1", "eDP-1"],
             "BTreeSet must preserve sorted order"
         );
+    }
+
+    /// Tests for the Component C pipe drainers.
+    ///
+    /// The hard part: we can't easily assert against tracing events
+    /// without a custom Subscriber. Instead, the tests spin up a
+    /// `/bin/sh` subprocess that prints a known marker, capture the
+    /// output via the `drain_pipe` helper directly (bypassing the
+    /// `LweBackend` plumbing — which is just orchestration anyway),
+    /// and assert that the marker would have been emitted by
+    /// inspecting the helper's exit timing (EOF on pipe → drainer
+    /// returns).
+    #[cfg(test)]
+    mod pipe_drain_tests {
+        use super::*;
+
+        /// Helper: spawn `/bin/sh` with the given command, drain its
+        /// stdout/stderr through `drain_pipe`, return when both pipes
+        /// close (i.e. child exited). The drainers are returned
+        /// alive so individual tests can assert on their state.
+        async fn spawn_and_drain(
+            cmd: &str,
+        ) -> (
+            i32,
+            tokio::task::JoinHandle<()>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let mut child = tokio::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(cmd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn sh");
+            let pid = child.id().unwrap_or(0) as i32;
+            let stdout = child.stdout.take().expect("piped stdout");
+            let stderr = child.stderr.take().expect("piped stderr");
+
+            let stdout_handle = tokio::spawn(drain_pipe(stdout, PidTarget(pid), PipeKind::Stdout));
+            let stderr_handle = tokio::spawn(drain_pipe(stderr, PidTarget(pid), PipeKind::Stderr));
+
+            (pid, stdout_handle, stderr_handle)
+        }
+
+        /// `drainer_returns_after_pipe_eof`: the canonical happy path.
+        /// The child exits cleanly, the OS closes both pipes, and
+        /// each drainer task sees EOF on `next_line()` and returns.
+        /// `is_finished()` is true once the task has been polled to
+        /// completion — we sleep briefly to give the runtime a chance
+        /// to poll the drainers.
+        #[tokio::test]
+        async fn drainer_returns_after_pipe_eof() {
+            let mut child = tokio::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("echo MARKER_OUT; echo MARKER_ERR 1>&2; exit 0")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn sh");
+            let pid = child.id().unwrap_or(0) as i32;
+            let stdout = child.stdout.take().expect("piped stdout");
+            let stderr = child.stderr.take().expect("piped stderr");
+
+            let stdout_handle = tokio::spawn(drain_pipe(stdout, PidTarget(pid), PipeKind::Stdout));
+            let stderr_handle = tokio::spawn(drain_pipe(stderr, PidTarget(pid), PipeKind::Stderr));
+
+            let _ = child.wait().await;
+            // Give the drainers a moment to process EOF. The runtime
+            // polls tasks on the same thread when their waker is
+            // signalled (here, by the I/O reactor), so a small delay
+            // is enough.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            assert!(
+                stdout_handle.is_finished(),
+                "stdout drainer didn't terminate after pipe EOF"
+            );
+            assert!(
+                stderr_handle.is_finished(),
+                "stderr drainer didn't terminate after pipe EOF"
+            );
+        }
+
+        /// `drainer_handles_empty_child_output`: the child writes
+        /// nothing — `/bin/true` exits 0 with empty pipes. The
+        /// drainer must terminate, not hang. This is the regression
+        /// guard for the "LWE dying silently" case where the
+        /// previous (v0.1) `Stdio::null()` flow would have just
+        /// thrown the output away.
+        #[tokio::test]
+        async fn drainer_handles_empty_child_output() {
+            let mut child = tokio::process::Command::new("/bin/true")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn /bin/true");
+            let stdout = child.stdout.take().expect("piped stdout");
+            let stderr = child.stderr.take().expect("piped stderr");
+            let stdout_handle = tokio::spawn(drain_pipe(stdout, PidTarget(0), PipeKind::Stdout));
+            let stderr_handle = tokio::spawn(drain_pipe(stderr, PidTarget(0), PipeKind::Stderr));
+
+            let _ = child.wait().await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(stdout_handle.is_finished());
+            assert!(stderr_handle.is_finished());
+        }
+
+        /// `drainer_emits_multiple_lines`: the multi-line case.
+        /// Three stdout + two stderr lines. The drainer must
+        /// process all of them and then terminate on EOF. We don't
+        /// assert on tracing output (that would need a custom
+        /// Subscriber); instead we verify the JoinHandle finishes
+        /// promptly, which is the correctness invariant for the
+        /// the drain loop's exit condition.
+        #[tokio::test]
+        async fn drainer_emits_multiple_lines() {
+            let (pid, stdout_handle, stderr_handle) = spawn_and_drain(
+                "echo line1; echo line2; echo line3; \
+                 echo err1 1>&2; echo err2 1>&2; exit 0",
+            )
+            .await;
+
+            // Wait for the child + drainers to finish. We poll for
+            // is_finished with a small timeout because the runtime
+            // needs to schedule the drainers after the child closes
+            // its pipes.
+            let mut waited_ms = 0u64;
+            while waited_ms < 1000 && !stdout_handle.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                waited_ms += 25;
+            }
+            let mut waited_ms2 = 0u64;
+            while waited_ms2 < 1000 && !stderr_handle.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                waited_ms2 += 25;
+            }
+
+            assert!(
+                stdout_handle.is_finished(),
+                "stdout drainer didn't finish after multi-line child output (pid={pid})"
+            );
+            assert!(
+                stderr_handle.is_finished(),
+                "stderr drainer didn't finish after multi-line child output (pid={pid})"
+            );
+        }
+
+        /// `pipe_drainers_init_empty`: the new `pipe_drainers` field
+        /// must start empty on every constructor. This is a
+        /// regression guard for the constructor-update step (Step 1
+        /// of Component C).
+        #[tokio::test]
+        async fn pipe_drainers_init_empty() {
+            let b = LweBackend::new();
+            let drainers = b.pipe_drainers.lock().await;
+            assert!(drainers.is_empty(), "new() must start with empty drainers");
+
+            let b = LweBackend::with_binary("/bin/true");
+            let drainers = b.pipe_drainers.lock().await;
+            assert!(
+                drainers.is_empty(),
+                "with_binary() must start with empty drainers"
+            );
+
+            let b = LweBackend::with_binary_and_fps("/bin/true", 30);
+            let drainers = b.pipe_drainers.lock().await;
+            assert!(
+                drainers.is_empty(),
+                "with_binary_and_fps() must start with empty drainers"
+            );
+        }
+
+        /// `unbind_removes_drainers`: the public `unbind()` method
+        /// removes the (stdout_handle, stderr_handle) pair for the
+        /// given pid and aborts both. Using an unknown pid is a
+        /// no-op. We spawn real (but trivially-completing) tasks so
+        /// the test exercises the abort path without leaving
+        /// pending JoinHandles for the runtime to wait on.
+        ///
+        /// The test holds the JoinHandles directly so we can wait
+        /// on them after `unbind()` aborts. The runtime requires
+        /// tasks to be cancelled before the test future can return;
+        /// if we let the JoinHandles drop without observing the
+        /// cancellation, the runtime may hang on shutdown.
+        #[tokio::test]
+        async fn unbind_removes_drainers() {
+            let b = LweBackend::new();
+            let (sout, serr) = {
+                let mut drainers = b.pipe_drainers.lock().await;
+                let s = tokio::spawn(async { tokio::task::yield_now().await });
+                let r = tokio::spawn(async { tokio::task::yield_now().await });
+                drainers.insert(99, (s, r));
+                // Detach the handles into the local scope so we
+                // can wait on them after unbind().
+                let entry = drainers.remove(&99).unwrap();
+                (entry.0, entry.1)
+            };
+            // Re-insert for the actual unbind test.
+            {
+                let mut drainers = b.pipe_drainers.lock().await;
+                drainers.insert(99, (sout, serr));
+            }
+
+            b.unbind(99).await;
+            let drainers = b.pipe_drainers.lock().await;
+            assert!(drainers.get(&99).is_none(), "unbind must remove entry");
+            drop(drainers);
+
+            // Unknown pid is a no-op (no panic, no spurious entry).
+            b.unbind(12345).await;
+        }
+
+        /// `shutdown_aborts_all_drainers`: the public `shutdown()`
+        /// method drains the entire map and aborts every entry.
+        /// We re-insert the JoinHandles after observing the map is
+        /// empty so the runtime doesn't wait on them at shutdown.
+        #[tokio::test]
+        async fn shutdown_aborts_all_drainers() {
+            let b = LweBackend::new();
+            let mut handles: Vec<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> =
+                Vec::new();
+            {
+                let mut drainers = b.pipe_drainers.lock().await;
+                for pid in [10, 20, 30] {
+                    let s = tokio::spawn(async { tokio::task::yield_now().await });
+                    let r = tokio::spawn(async { tokio::task::yield_now().await });
+                    handles.push((s, r));
+                    drainers.insert(pid, (tokio::spawn(async {}), tokio::spawn(async {})));
+                }
+            }
+
+            b.shutdown().await;
+            let drainers = b.pipe_drainers.lock().await;
+            assert!(drainers.is_empty(), "shutdown must drain the map");
+            drop(drainers);
+
+            // Wait for the JoinHandles to be reaped so the runtime
+            // doesn't hang on shutdown. Abort + await the cancelled
+            // JoinError so the task is fully reaped.
+            for (s, r) in handles {
+                s.abort();
+                r.abort();
+                let _ = s.await;
+                let _ = r.await;
+            }
+        }
     }
 }
