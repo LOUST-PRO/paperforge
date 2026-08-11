@@ -639,21 +639,35 @@ impl LweBackend {
         // ~immediately so a hung child is OK. We `remove()` from the
         // map so the reaper task doesn't try to reap it again — and
         // so the next SIGCHLD doesn't see a stale pid.
-        let mut pids = self.per_output_pids.lock().await;
-        if let Some(old) = pids.remove(output) {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(old),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-            // Also clear the scene map so a re-spawn with a
-            // different scene doesn't get confused.
-            let mut scenes = self.per_output_scenes.lock().await;
-            scenes.remove(output);
-            // Drop the dead pid's pipe drainers so the FD pair
-            // closes cleanly. Without this, the drainer tasks would
-            // keep reading an EOF socket until their JoinHandle is
-            // explicitly aborted, leaking FDs into the daemon's
-            // table.
+        //
+        // The lock is scoped to the cleanup block and dropped before
+        // `cmd.spawn()` (which is sync, so this is purely about
+        // releasing the MutexGuard before we re-acquire later in
+        // this function to insert the new pid). `tokio::sync::Mutex`
+        // is non-reentrant — same task acquiring twice on the same
+        // lock would deadlock waiting for itself.
+        let old_pid_for_drainers: Option<i32> = {
+            let mut pids = self.per_output_pids.lock().await;
+            if let Some(old) = pids.remove(output) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(old),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+                // Also clear the scene map so a re-spawn with a
+                // different scene doesn't get confused.
+                let mut scenes = self.per_output_scenes.lock().await;
+                scenes.remove(output);
+                Some(old)
+            } else {
+                None
+            }
+        };
+        // Drop the dead pid's pipe drainers so the FD pair
+        // closes cleanly. Without this, the drainer tasks would
+        // keep reading an EOF socket until their JoinHandle is
+        // explicitly aborted, leaking FDs into the daemon's
+        // table.
+        if let Some(old) = old_pid_for_drainers {
             let mut drainers = self.pipe_drainers.lock().await;
             if let Some((sout, serr)) = drainers.remove(&old) {
                 sout.abort();
