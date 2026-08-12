@@ -675,70 +675,16 @@ impl LweBackend {
             }
         }
 
-        let mut cmd = tokio::process::Command::new(&binary);
-        // Detach the LWE from the CLI's process group so SIGTERM to
-        // the parent (e.g. `timeout 60 paperforge playlist apply …`)
-        // does NOT cascade to the wallpaper. Without this, the
-        // local-spawn fallback in `paperforge set` / `playlist apply`
-        // leaves the output grey the moment the operator's shell
-        // timeout fires. `setsid(2)` puts the child in its own
-        // session and process group, isolating it from terminal
-        // signals. Safe to do even when the daemon spawns the LWE:
-        // systemd-launched processes also benefit from being in
-        // their own session.
-        //
-        // Use nix's `unistd::setsid` instead of raw libc — same
-        // syscall, but typed and with a Result we can propagate.
-        //
-        // `pre_exec` requires an `unsafe` block; the crate-level
-        // `#![forbid(unsafe_code)]` doesn't reach fn bodies so we
-        // can use `#[allow(unused_unsafe)]` to silence the lint
-        // noise — the unsafe is scoped to the pre_exec closure,
-        // which only runs in the forked child before exec.
-        // Detach the LWE from the CLI's process group so SIGTERM to
-        // the parent (e.g. `timeout 60 paperforge playlist apply …`)
-        // does NOT cascade to the wallpaper. Without this, the
-        // local-spawn fallback in `paperforge set` / `playlist apply`
-        // leaves the output grey the moment the operator's shell
-        // timeout fires. The unsafe lives in `crate::detach` to
-        // stay clear of the crate-wide `#![forbid(unsafe_code)]`.
-        //
-        // `tokio::process::Command::as_std_mut()` exposes the inner
-        // `std::process::Command` so we can install the setsid
-        // pre_exec, which is only exposed on the std type.
-        crate::detach::pre_exec_setsid(cmd.as_std_mut());
-        cmd.arg("--screen-root")
-            .arg(output)
-            .arg("--bg")
-            .arg(&content_id)
-            .arg("--silent")
-            .arg("--volume")
-            .arg("0")
-            .arg("--no-audio-processing")
-            .arg("--noautomute")
-            .arg("--disable-particles")
-            .arg("--disable-mouse")
-            .arg("--disable-parallax")
-            .arg("--fullscreen-pause-only-active")
-            .arg("--fps")
-            .arg(fps.to_string());
-
-        // Component C: pipe stdout/stderr into the tracing pipeline
-        // so journald captures LWE diagnostics (SYSLOG_IDENTIFIER=
-        // paperforge, courtesy of `paperforge.service`'s
-        // StandardOutput/StandardError=journal). Pre-C behaviour was
-        // `Stdio::null()` for all three streams, which silently
-        // discarded LWE's stderr on crash. The user's 2026-08-10
-        // wallpaper collapse left no trace because of this.
-        //
-        // stdin stays `Stdio::null()` — LWE doesn't read from stdin.
-        // The pipe readers (`drain_pipe`) terminate on EOF (child
-        // exits) or read error, and are aborted on `unbind()` /
-        // `shutdown()` so the FDs don't leak.
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
+        let cfg = crate::lwe_spawn::SpawnConfig {
+            binary: &binary,
+            output,
+            content_id: &content_id,
+            fps,
+        };
+        let mut cmd = crate::lwe_spawn::build_command(&cfg).map_err(|e| Error::BackendFailure {
+            kind: self.kind().process_pattern().to_string(),
+            message: format!("per-output spawn LWE command build failed: {e}"),
+        })?;
         let mut child = cmd.spawn().map_err(|e| Error::BackendFailure {
             kind: self.kind().process_pattern().to_string(),
             message: format!("per-output spawn LWE failed: {e}"),
