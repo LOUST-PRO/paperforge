@@ -246,10 +246,17 @@ impl FpsController for LweFpsController {
         //       nix::unistd::Pid::from_raw(pid),
         //       nix::sys::signal::Signal::SIGWINCH,
         //   )?;
-        // Pending the LWE SIGWINCH handler merge — see module-level
-        // docs.
+        //
+        // Until LWE merges the cycle-FPS handler (tracked in the
+        // operator's local LWE fork), we surface the missing
+        // capability as a structured error instead of panicking
+        // — the daemon and CLI rely on `Result<()>` propagation
+        // to make the governor safe to run end-to-end.
         let _ = (self, output);
-        todo!("LweFpsController::cycle_down pending LWE SIGWINCH handler merge")
+        Err(crate::error::Error::Other(anyhow::anyhow!(
+            "LweFpsController::cycle_down: pending LWE SIGWINCH handler merge \
+             (see fork commit `737a230` and `lwe-sigwinch-local-fork-only` memory)"
+        )))
     }
 
     async fn cycle_up(&self, output: &str) -> Result<()> {
@@ -264,18 +271,23 @@ impl FpsController for LweFpsController {
     async fn pause_hard(&self, output: &str) -> Result<()> {
         // Intended: nix::sys::signal::kill(pid, Signal::SIGSTOP)
         // once `pool_pid` accessor is public. For now we can't
-        // resolve pids, so we surface a clear TODO instead of
+        // resolve pids, so we surface a clear error instead of
         // sending a stray SIGSTOP to PID 0 / -1 (which would
         // either no-op or kill the entire process group).
         let _ = (self, output);
-        todo!("LweFpsController::pause_hard pending backend pool_pid accessor")
+        Err(crate::error::Error::Other(anyhow::anyhow!(
+            "LweFpsController::pause_hard: pending backend pool_pid accessor \
+             (LweBackend::per_output_pids is private)"
+        )))
     }
 
     async fn resume_hard(&self, output: &str) -> Result<()> {
         // Intended: nix::sys::signal::kill(pid, Signal::SIGCONT)
         // once `pool_pid` accessor is public.
         let _ = (self, output);
-        todo!("LweFpsController::resume_hard pending backend pool_pid accessor")
+        Err(crate::error::Error::Other(anyhow::anyhow!(
+            "LweFpsController::resume_hard: pending backend pool_pid accessor"
+        )))
     }
 
     async fn pause_frame(&self, output: &str) -> Result<()> {
@@ -284,7 +296,9 @@ impl FpsController for LweFpsController {
         // in `LweBackendOps::pause_soft` today; the controller
         // shim would call it through the backend once accessible.
         let _ = (self, output);
-        todo!("LweFpsController::pause_frame pending backend pool_pid accessor")
+        Err(crate::error::Error::Other(anyhow::anyhow!(
+            "LweFpsController::pause_frame: pending backend pool_pid accessor"
+        )))
     }
 }
 
@@ -392,14 +406,12 @@ mod tests {
 
     /// `LweFpsController` is a stub today but must construct +
     /// route through `Arc<dyn FpsController>`. The trait surface
-    /// has 5 methods; only `cycle_up` returns `Ok(())` today.
-    /// The kernel-touching methods (`cycle_down`, `pause_hard`,
-    /// `resume_hard`, `pause_frame`) deliberately `todo!()`
-    /// until both (a) LWE merges the SIGWINCH handler and (b)
-    /// `LweBackend::pool_pid` is exposed. Calling them now would
-    /// panic; the test therefore only exercises the Ok path and
-    /// the construction surface — the panic markers are enforced
-    /// at `cargo build` time via `todo!()` itself.
+    /// has 5 methods; `cycle_up` returns `Ok(())` and the
+    /// kernel-touching methods return `Err` with a structured
+    /// reason instead of panicking. The test exercises the Ok
+    /// path and the construction surface — the structured-error
+    /// contract is enforced by `cargo build` (any caller that
+    /// ignores the `Result<()>` will trip `must_use`).
     #[tokio::test]
     async fn lwe_fps_controller_constructs_and_cycle_up_works() {
         let backend = Arc::new(LweBackend::with_binary("/bin/true"));
@@ -408,5 +420,22 @@ mod tests {
         // cycle_up has a graceful Ok(()) path (SIGWINCH minimal
         // approach does not support going up).
         dyn_ctrl.cycle_up("DP-1").await.unwrap();
+    }
+
+    /// The four kernel-touching methods on `LweFpsController`
+    /// must return a structured `Err` today (not panic). When
+    /// LWE merges SIGWINCH + exposes `pool_pid`, these methods
+    /// will start sending real signals — at which point these
+    /// tests should be updated to assert on the Ok(()) path or
+    /// removed entirely.
+    #[tokio::test]
+    async fn lwe_fps_controller_kernel_methods_return_err() {
+        let backend = Arc::new(LweBackend::with_binary("/bin/true"));
+        let dyn_ctrl: Arc<dyn FpsController> = Arc::new(LweFpsController::new(backend));
+
+        assert!(dyn_ctrl.cycle_down("DP-1").await.is_err());
+        assert!(dyn_ctrl.pause_hard("DP-1").await.is_err());
+        assert!(dyn_ctrl.resume_hard("DP-1").await.is_err());
+        assert!(dyn_ctrl.pause_frame("DP-1").await.is_err());
     }
 }

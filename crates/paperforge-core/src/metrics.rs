@@ -164,76 +164,55 @@ impl MetricsCollector {
     pub fn sample(&self) -> MetricsSnapshot {
         let daemon = sample_process(self.daemon_pid);
         let gpu = sample_gpu();
-        let read_errors = {
-            let mut h = self.history.lock().expect("metrics history lock poisoned");
-            let mut e = self
-                .read_errors
-                .lock()
-                .expect("metrics errors lock poisoned");
-            // We sample output PIDs lazily: any PID observed in
-            // recent history is sampled again; new ones are NOT
-            // auto-discovered (the daemon owns that knowledge —
-            // metrics is a read-only observer).
-            let mut outputs: Vec<OutputMetrics> = Vec::new();
-            let mut seen: std::collections::HashSet<(String, i32)> =
-                std::collections::HashSet::new();
-            for prev in h.iter().rev().take(32) {
-                for o in &prev.outputs {
-                    let key = (o.output.clone(), o.pid);
-                    if seen.insert(key.clone()) {
-                        let mut om = OutputMetrics {
-                            output: o.output.clone(),
-                            pid: o.pid,
-                            rss_kb: None,
-                            cpu_jiffies: None,
-                            thread_count: None,
-                            fps_measured: None,
-                        };
-                        match read_proc_stat(o.pid) {
-                            Ok((rss, cpu, threads)) => {
-                                om.rss_kb = Some(rss);
-                                om.cpu_jiffies = Some(cpu);
-                                om.thread_count = Some(threads);
-                            }
-                            Err(_) => {
-                                *e += 1;
-                            }
+        // We sample output PIDs lazily: any PID observed in recent
+        // history is sampled again; new ones are NOT auto-discovered
+        // (the daemon owns that knowledge — metrics is a read-only
+        // observer).
+        let mut h = self.history.lock().expect("metrics history lock poisoned");
+        let mut e = self
+            .read_errors
+            .lock()
+            .expect("metrics errors lock poisoned");
+        let mut outputs: Vec<OutputMetrics> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, i32)> = std::collections::HashSet::new();
+        for prev in h.iter().rev().take(32) {
+            for o in &prev.outputs {
+                let key = (o.output.clone(), o.pid);
+                if seen.insert(key.clone()) {
+                    let mut om = OutputMetrics {
+                        output: o.output.clone(),
+                        pid: o.pid,
+                        rss_kb: None,
+                        cpu_jiffies: None,
+                        thread_count: None,
+                        fps_measured: None,
+                    };
+                    match read_proc_stat(o.pid) {
+                        Ok((rss, cpu, threads)) => {
+                            om.rss_kb = Some(rss);
+                            om.cpu_jiffies = Some(cpu);
+                            om.thread_count = Some(threads);
                         }
-                        outputs.push(om);
+                        Err(_) => {
+                            *e += 1;
+                        }
                     }
+                    outputs.push(om);
                 }
             }
-            let snap = MetricsSnapshot {
-                timestamp_secs: unix_secs_now(),
-                outputs,
-                daemon,
-                gpu,
-                read_errors: *e,
-            };
-            if h.len() >= self.capacity {
-                h.pop_front();
-            }
-            h.push_back(snap.clone());
-            *e
-        };
-        MetricsSnapshot {
-            timestamp_secs: unix_secs_now(),
-            outputs: Vec::new(), // placeholder — see actual returned snap
-            daemon: DaemonMetrics {
-                pid: self.daemon_pid,
-                rss_kb: None,
-                thread_count: None,
-            },
-            gpu: GpuMetrics {
-                card_count: 0,
-                busy_percent_sum: 0,
-                vram_total_kb: None,
-            },
-            read_errors,
         }
-        // NOTE: the above placeholder is intentional — the real
-        // snapshot is already pushed into the ring buffer. Callers
-        // that want the snapshot should read via `latest()`.
+        let snap = MetricsSnapshot {
+            timestamp_secs: unix_secs_now(),
+            outputs,
+            daemon,
+            gpu,
+            read_errors: *e,
+        };
+        if h.len() >= self.capacity {
+            h.pop_front();
+        }
+        h.push_back(snap.clone());
+        snap
     }
 
     /// Most recent snapshot, or `None` if no sample has been taken.
@@ -357,22 +336,30 @@ fn read_proc_stat(pid: i32) -> Result<(u64, u64, u32)> {
 /// field is the command name in parentheses, which we skip past
 /// the closing paren — names with spaces or parens need careful
 /// handling per proc(5).
-fn parse_proc_stat(s: &str) -> Result<(u64, u64, u32)> {
+///
+/// Returns `(rss_kb, cpu_jiffies, num_threads)`. `rss_kb` is
+/// computed from the page count via libc::sysconf(_SC_PAGESIZE)
+/// so we correctly handle non-4 KiB pages (ppc64le, arm64 with
+/// 64 KiB pages, etc.) — hardcoding 4 KiB silently under-reports
+/// RSS by 16× on those kernels.
+pub(crate) fn parse_proc_stat(s: &str) -> Result<(u64, u64, u32)> {
     // proc(5): field 1 = comm (in parens), 2 = state, 3 = ppid,
     // 4 = pgrp, 5 = session, 6 = tty_nr, 7 = tpgid, 8 = flags,
     // 9 = minflt, 10 = cminflt, 11 = majflt, 12 = cmajflt,
-    // 13 = utime, 14 = stime, 15 = cutime, 16 = cstime, ...
-    // 22 = starttime, 23 = vsize, 24 = rss (in pages).
-    // 19 (1-indexed) = num_threads.
+    // 13 = utime, 14 = stime, 15 = cutime, 16 = cstime, 17 = priority,
+    // 18 = nice, 19 = num_threads, 20 = itrealvalue,
+    // 21 = starttime, 22 = vsize, 23 = rss (in pages).
+    //
+    // We need utime (13), stime (14), num_threads (19), and
+    // rss_pages (23). After dropping the comm field, those map
+    // to post-paren indices 11, 12, 17, 21.
     let after_paren = s
         .rfind(')')
         .ok_or_else(|| Error::Other(anyhow::anyhow!("proc stat: no closing paren")))?;
     let rest = &s[after_paren + 1..];
-    // Split fields (state at position 0 after paren).
     let fields: Vec<&str> = rest.split_whitespace().collect();
-    // Field 1 (state) ... 11 = utime (idx 11), 12 = stime (idx 12),
-    // 17 = num_threads (idx 17).
-    if fields.len() < 20 {
+    // Need at least 22 post-paren fields (covering rss at idx 21).
+    if fields.len() < 22 {
         return Err(Error::Other(anyhow::anyhow!(
             "proc stat: too few fields ({})",
             fields.len()
@@ -388,12 +375,40 @@ fn parse_proc_stat(s: &str) -> Result<(u64, u64, u32)> {
     let num_threads: u32 = fields[17]
         .parse()
         .map_err(|e| Error::Other(anyhow::anyhow!("threads: {e}")))?;
-    // rss is proc(5) field 24 (1-indexed) → post-paren index 21.
     let rss_pages: u64 = fields[21]
         .parse()
         .map_err(|e| Error::Other(anyhow::anyhow!("rss: {e}")))?;
-    let rss_kb = rss_pages.saturating_mul(4); // assume 4 KiB page
+    let page_kb = page_size_kb() as u64;
+    let rss_kb = rss_pages.saturating_mul(page_kb);
     Ok((rss_kb, cpu_jiffies, num_threads))
+}
+
+/// Query the kernel page size in KiB via `nix::unistd::sysconf`.
+/// Falls back to 4 KiB if `sysconf` reports an indeterminate value
+/// (extremely rare; can happen under aggressive seccomp filtering
+/// of `_SC_PAGESIZE`).
+#[inline]
+fn page_size_kb() -> u32 {
+    use nix::unistd::{sysconf, SysconfVar};
+    match sysconf(SysconfVar::PAGE_SIZE) {
+        Ok(Some(p)) if p > 0 => ((p / 1024).max(1)) as u32,
+        // Indeterminate or error — fall back to 4 KiB (vast
+        // majority of Linux hosts, including all the CI runners
+        // and the operator's niri box). On a 64K-page host this
+        // under-reports RSS by 16×; the warning is logged once
+        // via `tracing::warn!` on first call.
+        Ok(_) | Err(_) => {
+            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            WARNED.get_or_init(|| {
+                tracing::warn!(
+                    target: "paperforge",
+                    "sysconf(_SC_PAGESIZE) returned indeterminate; assuming 4 KiB \
+                     (RSS will be under-reported by 16x on 64K-page kernels)"
+                );
+            });
+            4
+        }
+    }
 }
 
 fn sample_process(pid: i32) -> DaemonMetrics {

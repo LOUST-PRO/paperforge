@@ -474,43 +474,13 @@ fn unix_secs_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Parse `/proc/<pid>/stat` (the same shape
-/// [`crate::metrics::parse_proc_stat`] handles) — duplicated here
-/// so the sysfs provider can stand alone without depending on the
-/// metrics module's internals.
+/// Parse `/proc/<pid>/stat`. Thin re-export of
+/// [`crate::metrics::parse_proc_stat`] so the sysfs provider can
+/// stay self-contained in this module without re-implementing the
+/// proc(5) field dance (and so the bugfix for `<22` field guard +
+/// 64 KiB page size lives in exactly one place).
 fn parse_proc_stat(s: &str) -> Result<(u64, u64, u32)> {
-    // proc(5) field numbering after the paren:
-    //   0  state, 1  ppid, 2  pgrp, 3  session, 4  tty_nr,
-    //   5  tpgid, 6  flags, 7  minflt, 8  cminflt, 9  majflt,
-    //   10 cmajflt, 11 utime, 12 stime, 13 cutime, 14 cstime,
-    //   15 priority, 16 nice, 17 num_threads, 18 itrealvalue,
-    //   19 starttime, 20 vsize, 21 rss (in pages).
-    let after_paren = s
-        .rfind(')')
-        .ok_or_else(|| Error::Other(anyhow::anyhow!("proc stat: no closing paren")))?;
-    let rest = &s[after_paren + 1..];
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    if fields.len() < 20 {
-        return Err(Error::Other(anyhow::anyhow!(
-            "proc stat: too few fields ({})",
-            fields.len()
-        )));
-    }
-    let utime: u64 = fields[11]
-        .parse()
-        .map_err(|e| Error::Other(anyhow::anyhow!("utime: {e}")))?;
-    let stime: u64 = fields[12]
-        .parse()
-        .map_err(|e| Error::Other(anyhow::anyhow!("stime: {e}")))?;
-    let cpu_jiffies = utime + stime;
-    let num_threads: u32 = fields[17]
-        .parse()
-        .map_err(|e| Error::Other(anyhow::anyhow!("threads: {e}")))?;
-    let rss_pages: u64 = fields[21]
-        .parse()
-        .map_err(|e| Error::Other(anyhow::anyhow!("rss: {e}")))?;
-    let rss_kb = rss_pages.saturating_mul(4);
-    Ok((rss_kb, cpu_jiffies, num_threads))
+    crate::metrics::parse_proc_stat(s)
 }
 
 #[cfg(test)]

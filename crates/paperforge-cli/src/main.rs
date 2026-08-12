@@ -26,7 +26,7 @@ use paperforge_core::{
     config::{Config, ConfigPaths},
     daemon::{BackendOps, PaperforgeDaemon},
     dbus::{serve_dbus, PaperforgeControl},
-    fps_control::{FakeFpsController, FpsController, LweFpsController},
+    fps_control::{FakeFpsController, FpsController},
     governor::{FpsTier, GovernorConfig, GovernorEvent, LoadAwareGovernor},
     governor_provider::{MetricsReader, SysfsMetricsProvider},
     hotplug::{CompositorHotplugSource, HotplugWatcher},
@@ -177,6 +177,62 @@ enum PoolCmd {
     Status,
 }
 
+/// Whether this command may end up spawning linux-wallpaperengine
+/// (and therefore needs the binary on disk to fail fast with the
+/// actionable error). Read-only commands that talk to the daemon
+/// over D-Bus are NOT listed — they don't need LWE present, even
+/// when no daemon is running (they just exit with NotSupported).
+///
+/// Critical: `SelfUpdate` is NOT in this list. It's the command
+/// an operator uses to install or upgrade paperforge, and gating
+/// it on LWE would be self-blocking (you can't update with the
+/// renderer installed if the renderer is what broke you).
+impl Cmd {
+    fn requires_lwe_binary(&self) -> bool {
+        matches!(
+            self,
+            Cmd::Set { .. } | Cmd::Pause { .. } | Cmd::Resume | Cmd::Daemon | Cmd::Governor { .. }
+        )
+    }
+}
+
+/// Resolve the LWE binary path with the actionable error printed
+/// to stderr. Called only for commands that may spawn LWE (see
+/// [`Cmd::requires_lwe_binary`]).
+fn require_lwe_binary() -> anyhow::Result<()> {
+    use paperforge_core::error::Error;
+    match paperforge_core::lwe_locator::resolve() {
+        Ok(p) => {
+            tracing::info!(
+                target: "paperforge",
+                "lwe binary resolved at {}",
+                p.display()
+            );
+            Ok(())
+        }
+        Err(Error::LweBinaryNotFound { paths_tried }) => {
+            eprintln!(
+                "linux-wallpaperengine binary not found.\n\
+                 Tried these locations:\n  {}\n\n\
+                 Install via one of:\n  \
+                 • `cargo install --path ~/linux-wallpaperengine` (puts it in ~/.local/bin)\n  \
+                 • Build the Almamu/louzt fork and symlink: `ln -sf $PWD/build/output/linux-wallpaperengine ~/.local/bin/`\n  \
+                 • Set `binary_path` in ~/.config/paperforge/config.toml",
+                paths_tried
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n  "),
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("lwe locator error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum AudioCmd {
     /// Toggle mute (SIGUSR1).
@@ -229,6 +285,21 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let paths = ConfigPaths::defaults().context("resolving config paths")?;
     let cfg = Config::load(&paths).context("loading config")?;
+
+    // Fail fast for commands that may spawn LWE. This covers the
+    // 2026-08-10 incident (systemd-launched daemon with no
+    // ~/.local/bin in $PATH -> silent "os error 2") without
+    // breaking `--version`, `--help`, `paths`, `scan`,
+    // `playlist list`, `metrics`, `reconcile`, or `self-update`
+    // on hosts that have no renderer installed yet.
+    //
+    // Critical: `self-update` is the command an operator would use
+    // to install a working build, so the failure must NOT be
+    // self-blocking. Read-only commands don't need LWE; the CLI
+    // talks to the daemon over D-Bus for those.
+    if cli.cmd.requires_lwe_binary() {
+        require_lwe_binary()?;
+    }
 
     // Use `build_backend_ops()` (which honours `pool_enabled`) for
     // destructive commands (`set`/`pause`/`resume`). Use the raw
@@ -1383,7 +1454,7 @@ enum GovernorMode {
 /// 2. **Sysfs fallback** — no daemon. The CLI scans
 ///    `pgrep linux-wallpaperengine` + `/proc/<pid>/{cmdline,stat}`
 ///    directly via [`SysfsMetricsProvider`].
-async fn run_governor(mode: GovernorMode, cfg: &Config) -> anyhow::Result<()> {
+async fn run_governor(mode: GovernorMode, _cfg: &Config) -> anyhow::Result<()> {
     // 1. Metrics reader: prefer daemon-backed, fall back to sysfs.
     let metrics: Arc<dyn MetricsReader> = {
         let sys = paperforge_core::governor_provider::SystemMetricsProvider::new();
@@ -1399,14 +1470,20 @@ async fn run_governor(mode: GovernorMode, cfg: &Config) -> anyhow::Result<()> {
         }
     };
 
-    // 2. FPS controller: real or fake depending on mode.
-    let fps: Arc<dyn FpsController> = match mode {
-        GovernorMode::DryRun => Arc::new(FakeFpsController::new()),
-        _ => {
-            let backend = Arc::new(cfg.backend());
-            Arc::new(LweFpsController::new(backend))
-        }
-    };
+    // 2. FPS controller: fake for all CLI modes today.
+    //
+    // `LweFpsController::cycle_down` / `pause_hard` / `resume_hard` /
+    // `pause_frame` return `Err` (not `Ok`) until LWE merges the
+    // SIGWINCH handler AND `LweBackend::pool_pid` becomes public —
+    // tracked in the operator's local fork (commit `737a230`) and
+    // memory `lwe-sigwinch-local-fork-only`. Until then, even
+    // `--status` and `--watch` would surface an error on the first
+    // tier transition, which is confusing for a read-only operator
+    // inspection. Using `FakeFpsController` makes the governor
+    // decision logic fully exercisable end-to-end without ever
+    // touching the kernel; replace with the real controller once
+    // the LWE upstream changes land.
+    let fps: Arc<dyn FpsController> = Arc::new(FakeFpsController::new());
 
     // 3. Governor with the loaded [governor] config (defaults if
     //    missing — serde-defaulted on `GovernorConfig`).
