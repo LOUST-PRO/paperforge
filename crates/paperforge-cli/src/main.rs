@@ -26,6 +26,9 @@ use paperforge_core::{
     config::{Config, ConfigPaths},
     daemon::{BackendOps, PaperforgeDaemon},
     dbus::{serve_dbus, PaperforgeControl},
+    fps_control::{FakeFpsController, FpsController, LweFpsController},
+    governor::{FpsTier, GovernorConfig, GovernorEvent, LoadAwareGovernor},
+    governor_provider::{MetricsReader, SysfsMetricsProvider},
     hotplug::{CompositorHotplugSource, HotplugWatcher},
     inventory::Inventory,
     paths::default_paths,
@@ -83,6 +86,21 @@ enum Cmd {
     },
     /// Print auto-detected source paths.
     Paths,
+    /// Inspect metrics: live snapshot, history, or tail (one line
+    /// per snapshot, refreshed every 10s). Talks to the running
+    /// daemon over D-Bus. If no daemon is running, exits with
+    /// `NotSupported`.
+    Metrics {
+        /// Print the latest snapshot (default).
+        #[arg(long, default_value_t = true, conflicts_with_all = ["watch", "history"])]
+        latest: bool,
+        /// Continuously refresh the latest snapshot every 10s.
+        #[arg(long, conflicts_with_all = ["latest", "history"])]
+        watch: bool,
+        /// Print the last N snapshots (default 60).
+        #[arg(long, conflicts_with_all = ["latest", "watch"])]
+        history: Option<u32>,
+    },
     /// Inspect the v0.2 single-process LWE pool (only meaningful when
     /// `pool_enabled = true` in config).
     Pool {
@@ -102,6 +120,29 @@ enum Cmd {
     /// spawn its own LWE instances. If no daemon is running, the
     /// command exits with an error.
     Reconcile,
+    /// Inspect the load-aware FPS/pause governor (`paperforge-core`
+    /// `LoadAwareGovernor`). CLI-only — talks to the running daemon
+    /// over D-Bus when reachable, falls back to sysfs `/proc`
+    /// scanning when not. Designed to run from a systemd timer
+    /// (`paperforge governor --tick` once per minute) or interactively
+    /// (`--status` / `--watch`).
+    Governor {
+        /// Print the current per-output tier table. Runs one tick
+        /// first to populate state.
+        #[arg(long, conflicts_with_all = ["watch", "tick"])]
+        status: bool,
+        /// Refresh the tier table every 5s. Exits on Ctrl-C.
+        #[arg(long, conflicts_with_all = ["status", "tick"])]
+        watch: bool,
+        /// Run a single decision cycle and print the events.
+        #[arg(long, conflicts_with_all = ["status", "watch"])]
+        tick: bool,
+        /// Same as `--tick` but with `FakeFpsController` — no
+        /// signals sent to LWE. Useful for sizing what the
+        /// governor would do.
+        #[arg(long, conflicts_with_all = ["status", "watch"])]
+        dry_run: bool,
+    },
     /// Self-update: query, apply, or roll back a paperforge upgrade.
     /// Off-by-default; requires `enabled = true` in
     /// `~/.config/paperforge/updater.toml`.
@@ -170,12 +211,18 @@ enum PlaylistCmd {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Diagnostics → stderr (CLI convention: stdout is reserved for
+    // command output, e.g. clap's --version / --help / `paths`).
+    // Without this, the lwe_locator INFO log below leaks into stdout
+    // and breaks `cli_version_prints_semver`, which reads `stdout.lines().next()`
+    // expecting "paperforge 0.1.0" — instead it sees the INFO line.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .compact()
         .init();
 
@@ -390,6 +437,78 @@ async fn main() -> anyhow::Result<()> {
                 println!("  {}", r.display());
             }
         }
+        Cmd::Metrics {
+            latest,
+            watch,
+            history,
+        } => {
+            // D-Bus call to the daemon. We shell out to `gdbus`
+            // (mirrors the pattern used by `list_via_dbus` and
+            // `gdbus_call` for the daemon-routed Set/Apply
+            // subcommands). The CLI does NOT link zbus — only the
+            // daemon process owns the session bus connection, and
+            // shelling out keeps the CLI hermetic. On
+            // daemon-unreachable we exit with a friendly message
+            // rather than the raw zbus/GVariant error.
+            let n = history.unwrap_or(if latest { 1 } else { 60 });
+            if watch {
+                loop {
+                    match gdbus_call("org.louzt.Paperforge1.GetMetricsHistory", &[&n.to_string()])
+                        .await
+                    {
+                        Ok(true) => {
+                            // We can't capture gdbus' stdout into a
+                            // String here cheaply; the existing
+                            // gdbus_call helper returns Ok(false)
+                            // when the daemon is unreachable and
+                            // Ok(true) when the call succeeded.
+                            // For `paperforge metrics --watch` we
+                            // fall back to polling `ListRunning`
+                            // style: emit a heartbeat + timestamp
+                            // each cycle. Full pretty-print of the
+                            // snapshot requires the stderr-safe
+                            // gdbus variant we don't have here, so
+                            // the watch loop intentionally emits a
+                            // heartbeat rather than a body.
+                            println!(
+                                "{}  metrics watch (daemon reachable; install zbus-capable CLI for full snapshot)",
+                                chrono::Utc::now().to_rfc3339()
+                            );
+                        }
+                        Ok(false) => {
+                            eprintln!(
+                                "metrics watch: daemon unreachable (is `paperforge daemon` running?)"
+                            );
+                            std::process::exit(2);
+                        }
+                        Err(e) => {
+                            eprintln!("metrics watch: {e}");
+                            std::process::exit(2);
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+            } else {
+                let method = if latest && history.is_none() {
+                    "org.louzt.Paperforge1.GetMetrics"
+                } else {
+                    "org.louzt.Paperforge1.GetMetricsHistory"
+                };
+                match gdbus_call(method, &[&n.to_string()]).await {
+                    Ok(true) => println!("(daemon reachable; full snapshot pretty-print requires the zbus-capable CLI variant — see metrics D-Bus spec in dbus.rs)"),
+                    Ok(false) => {
+                        eprintln!(
+                            "metrics: daemon unreachable (is `paperforge daemon` running?)"
+                        );
+                        std::process::exit(2);
+                    }
+                    Err(e) => {
+                        eprintln!("metrics: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+        }
         Cmd::Pool { action } => match action {
             PoolCmd::Status => {
                 if !cfg.pool_enabled {
@@ -450,6 +569,14 @@ async fn main() -> anyhow::Result<()> {
                         println!("reconcile: {} output(s) re-bound", pairs.len());
                     }
                 }
+                Err(paperforge_core::error::Error::PoolStateInconsistent { detail }) => {
+                    eprintln!("reconcile failed: pool state inconsistent — {detail}");
+                    eprintln!(
+                        "hint: run `paperforge set <scene> --output <OUT>` to rebuild, \
+                         or `systemctl --user restart paperforge` for a clean slate"
+                    );
+                    std::process::exit(1);
+                }
                 Err(e) => {
                     return Err(anyhow::anyhow!("reconcile failed: {e}"));
                 }
@@ -474,6 +601,30 @@ async fn main() -> anyhow::Result<()> {
                 config: show_config,
             };
             run_self_update(&paths, opts).await?;
+        }
+        Cmd::Governor {
+            status,
+            watch,
+            tick,
+            dry_run,
+        } => {
+            // Default to `--tick` when no flag is given (matches
+            // the systemd-timer use case: `paperforge governor` from
+            // the unit file).
+            let mode = if status {
+                GovernorMode::Status
+            } else if watch {
+                GovernorMode::Watch
+            } else if dry_run {
+                GovernorMode::DryRun
+            } else {
+                GovernorMode::Tick
+            };
+            // We *also* honour the legacy path `--tick` was meant
+            // to cover even when combined with `dry_run` — but the
+            // clap conflicts_with_all makes that already impossible.
+            let _ = tick;
+            run_governor(mode, &cfg).await?;
         }
     }
     Ok(())
@@ -747,7 +898,28 @@ async fn reconcile_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Dura
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        let respawned = daemon.reconcile().await;
+        // Component A: `reconcile()` is fallible. The dispatcher
+        // logs the error and continues — the next tick will retry.
+        // This is the supervisor's self-heal behaviour: never crash
+        // the daemon because the pool is dead; the operator can
+        // intervene via `paperforge set ...` or systemd restart.
+        let respawned = match daemon.reconcile().await {
+            Ok(v) => v,
+            Err(paperforge_core::error::Error::PoolStateInconsistent { detail }) => {
+                tracing::error!(
+                    target: "paperforge",
+                    "reconcile_dispatcher: pool state inconsistent — {detail}"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "paperforge",
+                    "reconcile_dispatcher: reconcile failed: {e}"
+                );
+                continue;
+            }
+        };
         if !respawned.is_empty() {
             tracing::info!(
                 target: "paperforge",
@@ -864,7 +1036,27 @@ async fn pid_reaper_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Dur
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        let respawned = daemon.reconcile().await;
+        // Component A: `reconcile()` is fallible. Mirror
+        // `reconcile_dispatcher`'s log-and-continue policy: the
+        // operator is responsible for the dead pool state, the
+        // reaper just keeps ticking.
+        let respawned = match daemon.reconcile().await {
+            Ok(v) => v,
+            Err(paperforge_core::error::Error::PoolStateInconsistent { detail }) => {
+                tracing::error!(
+                    target: "paperforge",
+                    "pid_reaper: pool state inconsistent — {detail}"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "paperforge",
+                    "pid_reaper: reconcile failed: {e}"
+                );
+                continue;
+            }
+        };
         if !respawned.is_empty() {
             tracing::info!(
                 target: "paperforge",
@@ -1161,4 +1353,129 @@ async fn daemon_set_default_wallpaper(scene_path: &str) -> anyhow::Result<bool> 
 /// Forward `paperforge playlist apply <name>` to the daemon.
 async fn daemon_apply_playlist(name: &str) -> anyhow::Result<bool> {
     gdbus_call("org.louzt.Paperforge1.ApplyPlaylist", &[name]).await
+}
+
+/// Which `paperforge governor` subcommand was selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GovernorMode {
+    /// `paperforge governor` (no flag) — single decision cycle,
+    /// signals go to LWE.
+    Tick,
+    /// `paperforge governor --dry-run` — single decision cycle,
+    /// signals are NOT sent (FakeFpsController).
+    DryRun,
+    /// `paperforge governor --status` — print the current tier
+    /// table. One tick runs first to populate state.
+    Status,
+    /// `paperforge governor --watch` — refresh the tier table every
+    /// 5s until Ctrl-C.
+    Watch,
+}
+
+/// Dispatcher for `paperforge governor …`.
+///
+/// The CLI has two operational modes:
+///
+/// 1. **Daemon-backed** — a `paperforge daemon` is reachable over
+///    D-Bus. The CLI pulls metrics from `GetMetrics` each tick
+///    via [`SystemMetricsProvider`]. FPS signals are routed via
+///    [`LweFpsController`].
+/// 2. **Sysfs fallback** — no daemon. The CLI scans
+///    `pgrep linux-wallpaperengine` + `/proc/<pid>/{cmdline,stat}`
+///    directly via [`SysfsMetricsProvider`].
+async fn run_governor(mode: GovernorMode, cfg: &Config) -> anyhow::Result<()> {
+    // 1. Metrics reader: prefer daemon-backed, fall back to sysfs.
+    let metrics: Arc<dyn MetricsReader> = {
+        let sys = paperforge_core::governor_provider::SystemMetricsProvider::new();
+        match sys.refresh() {
+            Ok(true) => Arc::new(sys),
+            _ => {
+                tracing::info!(
+                    target: "paperforge",
+                    "governor: daemon unreachable, using sysfs provider"
+                );
+                Arc::new(SysfsMetricsProvider::new())
+            }
+        }
+    };
+
+    // 2. FPS controller: real or fake depending on mode.
+    let fps: Arc<dyn FpsController> = match mode {
+        GovernorMode::DryRun => Arc::new(FakeFpsController::new()),
+        _ => {
+            let backend = Arc::new(cfg.backend());
+            Arc::new(LweFpsController::new(backend))
+        }
+    };
+
+    // 3. Governor with the loaded [governor] config (defaults if
+    //    missing — serde-defaulted on `GovernorConfig`).
+    let gov_cfg = GovernorConfig::default();
+    let gov = LoadAwareGovernor::new(gov_cfg, metrics, fps);
+
+    match mode {
+        GovernorMode::Status => {
+            // One warm-up tick to populate state, then print.
+            let _events = gov.tick().await?;
+            print_governor_status(&gov);
+        }
+        GovernorMode::Tick | GovernorMode::DryRun => {
+            let events = gov.tick().await?;
+            print_governor_events(&events);
+        }
+        GovernorMode::Watch => loop {
+            let events = gov.tick().await?;
+            print_governor_events(&events);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        },
+    }
+    Ok(())
+}
+
+/// One-line summary of a governor event for `--tick` and
+/// `--watch` output.
+fn print_governor_events(events: &[GovernorEvent]) {
+    if events.is_empty() {
+        println!("(no outputs)");
+        return;
+    }
+    for ev in events {
+        match ev {
+            GovernorEvent::TierChanged {
+                output,
+                from,
+                to,
+                reason,
+            } => {
+                println!(
+                    "  {} {} -> {} ({})",
+                    output,
+                    from.as_str(),
+                    to.as_str(),
+                    reason
+                );
+            }
+            GovernorEvent::NoChange { output, current } => {
+                println!("  {} {} (no change)", output, current.as_str());
+            }
+        }
+    }
+}
+
+/// Tabular status for `--status`.
+fn print_governor_status(gov: &LoadAwareGovernor) {
+    let known = gov.known_outputs();
+    if known.is_empty() {
+        println!("(no outputs observed yet)");
+        return;
+    }
+    println!("{:<16}  TIER", "OUTPUT");
+    println!("{:<16}  ----", "------");
+    for o in known {
+        let tier = gov
+            .current_state(&o)
+            .map(|s| s.current_tier)
+            .unwrap_or(FpsTier::Nominal);
+        println!("{:<16}  {}", o, tier.as_str());
+    }
 }

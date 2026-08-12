@@ -1,0 +1,33 @@
+# paperforge-lwe.slice — transient unit slice for LWE renderer processes.
+#
+# Each LWE process spawned by paperforge enters this slice via:
+#   systemd-run --user --scope --slice=paperforge-lwe.slice -- /path/to/lwe ...
+#
+# This isolates the untrusted LWE renderer from paperforge's small
+# orchestrator cgroup (MemoryHigh=32M MemoryMax=64M). LWE typically
+# uses 100-400 MiB during scene render, so a per-slice cap of 512 MiB
+# soft / 1 GiB hard gives rendering headroom while protecting the
+# host from runaway GPU/memory usage.
+#
+# Operator install: copy to ~/.config/systemd/user/paperforge-lwe.slice
+# then `systemctl --user daemon-reload`. The slice is referenced
+# by name only; systemd creates it on first systemd-run invocation
+# even without this file, but the memory caps only apply when the
+# unit file exists.
+#
+# See: https://github.com/LOUST-PRO/paperforge/blob/main/contrib/systemd/paperforge-lwe.slice
+[Unit]
+Description=paperforge LWE renderer slice
+Documentation=https://github.com/LOUST-PRO/paperforge
+
+[Slice]
+# Soft limit: kernel reclaims pages aggressively above this without
+# OOM-killing. Tuned for 3 outputs x 1 scene + GPU buffer headroom.
+MemoryHigh=512M
+# Hard limit: OOM-kill if exceeded. Set generously above MemoryHigh
+# to allow transient spikes (large scene swaps, batched texture
+# uploads) without immediate termination.
+MemoryMax=1G
+# Cap LWE CPU so it can't starve compositor + foreground apps.
+# niri + wayland + paperforge need ~20% headroom under load.
+CPUQuota=80%

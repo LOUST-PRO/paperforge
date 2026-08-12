@@ -1,5 +1,7 @@
 //! Crate-wide error type.
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 /// Result alias for `paperforge-core`.
@@ -71,4 +73,27 @@ pub enum Error {
     /// Generic anyhow passthrough.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+
+    /// Pool claims a running LWE process but `/proc/<pid>/status` says
+    /// it's dead. Reconciler hit this when LWE segfaulted or was
+    /// OOM-killed silently. Caller should self-heal (respawn pool with
+    /// last-known bindings).
+    #[error("pool state inconsistent: {detail}")]
+    PoolStateInconsistent {
+        /// Human-readable detail of which PID was dead / which binding
+        /// was missing. Included in the error string so operators don't
+        /// have to enable tracing to debug.
+        detail: String,
+    },
+
+    /// LWE binary not found in any of the standard locations. Surface
+    /// the paths we tried so the operator can either install the
+    /// binary or set `binary_path` in config.toml.
+    #[error("linux-wallpaperengine binary not found in any of: {paths_tried:?}")]
+    LweBinaryNotFound {
+        /// Absolute paths the resolver checked. Includes `$HOME/.local/bin/...`,
+        /// `$HOME/linux-wallpaperengine/build/output/linux-wallpaperengine`,
+        /// `/usr/bin/linux-wallpaperengine`, and each `$PATH` directory.
+        paths_tried: Vec<PathBuf>,
+    },
 }
