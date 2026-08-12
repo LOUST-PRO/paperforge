@@ -211,12 +211,18 @@ enum PlaylistCmd {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Diagnostics → stderr (CLI convention: stdout is reserved for
+    // command output, e.g. clap's --version / --help / `paths`).
+    // Without this, the lwe_locator INFO log below leaks into stdout
+    // and breaks `cli_version_prints_semver`, which reads `stdout.lines().next()`
+    // expecting "paperforge 0.1.0" — instead it sees the INFO line.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .compact()
         .init();
 
