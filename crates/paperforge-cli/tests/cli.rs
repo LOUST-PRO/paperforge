@@ -87,8 +87,12 @@ fn cli_set_with_nonexistent_path_errors() {
     assert!(
         combined.contains("scene path does not exist")
             || combined.contains("BackendUnreachable")
-            || combined.contains("not reachable"),
-        "expected scene-not-found error, got: {combined}"
+            || combined.contains("not reachable")
+            // Post-fix #1 (PR #15): when LWE is not installed the
+            // CLI fail-fast gate kicks in before the path check.
+            // Accept that actionable error too.
+            || combined.contains("linux-wallpaperengine binary not found"),
+        "expected scene-not-found or lwe-not-found error, got: {combined}"
     );
 }
 
