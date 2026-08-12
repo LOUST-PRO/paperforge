@@ -586,19 +586,15 @@ impl LweBackend {
             ),
         })?;
 
-        let binary =
-            self.binary_path
-                .clone()
-                .unwrap_or_else(|| match crate::lwe_locator::resolve() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(
-                            target: "paperforge",
-                            "lwe binary auto-detect failed: {e}"
-                        );
-                        PathBuf::from("linux-wallpaperengine")
-                    }
-                });
+        let binary = match self.binary_path.clone() {
+            Some(p) => p,
+            None => match crate::lwe_locator::resolve() {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(e);
+                }
+            },
+        };
 
         // Idempotent fast path: same output + same content_id + same
         // FPS cap AND existing pid still alive → return existing pid.
