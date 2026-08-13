@@ -25,6 +25,7 @@ use dioxus::prelude::*;
 
 use paperforge_core::backend::BackendState;
 use paperforge_core::hotplug::{CompositorHotplugSource, Output};
+use paperforge_core::inventory::WallpaperEntry;
 
 use crate::data::bindings::Binding;
 use crate::data::playlists::{refresh_playlists, PlaylistSummary};
@@ -34,6 +35,7 @@ use crate::ipc::client::{IpcClient, SignalEvent};
 use crate::ipc::reconnect::next_backoff;
 use crate::ipc::ConnectionStatus;
 use crate::ui::bindings::BindingsPanel;
+use crate::ui::picker::Picker;
 use crate::ui::playlists::PlaylistsPanel;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::status::StatusBanner;
@@ -66,7 +68,9 @@ pub fn Root() -> Element {
     let outputs: Signal<Vec<Output>> = use_signal(Vec::new);
     let running: Signal<HashMap<String, BackendState>> = use_signal(HashMap::new);
     let playlists: Signal<Vec<PlaylistSummary>> = use_signal(Vec::new);
-    let inventory: Signal<Vec<PathBuf>> = use_signal(Vec::new); // PR 6 consumes this
+    // PR 6: switch from Vec<PathBuf> to Vec<WallpaperEntry> so the
+    // picker can render title + kind without re-scanning the disk.
+    let inventory: Signal<Vec<WallpaperEntry>> = use_signal(Vec::new);
     let bindings: Signal<Vec<Binding>> = use_signal(Vec::new); // PR 4 fills this
     let connection: Signal<ConnectionStatus> = use_signal(ConnectionStatus::default);
     let mut error: Signal<Option<GuiError>> = use_signal(|| None);
@@ -75,6 +79,9 @@ pub fn Root() -> Element {
     // unreachable. The list_running poll task reads this each tick;
     // toolbar callbacks clone it before issuing a write.
     let client_signal: Signal<Option<IpcClient>> = use_signal(|| None);
+    // PR 6: which output's picker modal is open. `None` = no modal.
+    // When set, the Picker overlay renders on top of the panels.
+    let picker_open_for: Signal<Option<String>> = use_signal(|| None);
 
     // ---- Coroutines ----
 
@@ -145,10 +152,9 @@ pub fn Root() -> Element {
             loop {
                 ticker.tick().await;
                 let (v, err) = data_inventory::refresh_inventory(roots.clone()).await;
-                // PR 3 only stores the path list — full WallpaperEntry
-                // shape lands in PR 6 (picker grid).
-                let paths: Vec<PathBuf> = v.into_iter().map(|e| e.path).collect();
-                inventory_sig.set(paths);
+                // PR 6: keep the full WallpaperEntry (title + kind)
+                // so the picker can render labels without re-scanning.
+                inventory_sig.set(v);
                 if let Some(e) = err {
                     error_sig.set(Some(e));
                 }
@@ -364,10 +370,12 @@ pub fn Root() -> Element {
     let outputs_snapshot: Vec<Output> = outputs.cloned();
     let running_snapshot: HashMap<String, BackendState> = running.cloned();
     let playlists_snapshot: Vec<PlaylistSummary> = playlists.cloned();
+    let inventory_snapshot: Vec<WallpaperEntry> = inventory.cloned();
     let bindings_snapshot: Vec<Binding> = bindings.cloned();
     let connection_snapshot: ConnectionStatus = connection.cloned();
     let error_snapshot: Option<GuiError> = error.cloned();
-    let inventory_len = inventory.cloned().len();
+    let inventory_len = inventory_snapshot.len();
+    let picker_target: Option<String> = picker_open_for.cloned();
     let connected: bool = matches!(connection_snapshot, ConnectionStatus::Connected);
 
     let connection_color = match connection_snapshot {
@@ -468,6 +476,52 @@ pub fn Root() -> Element {
         });
     };
 
+    // ---- Picker callbacks (PR 6) ----
+    //
+    // The Sidebar Set button fires `on_open_picker(output)`. The
+    // Picker modal's X / backdrop / Escape fires `on_close_picker`.
+    // A row click fires `on_pick_wallpaper(path)`, which issues the
+    // SetWallpaper D-Bus call and closes the modal on success.
+    let mut picker_for_open = picker_open_for;
+    let on_open_picker = move |output: String| {
+        picker_for_open.set(Some(output));
+    };
+
+    let mut picker_for_close = picker_open_for;
+    let on_close_picker = move |_| {
+        picker_for_close.set(None);
+    };
+
+    // on_pick_wallpaper: fires `set_binding(output, scene_path)` on
+    // the daemon. On success, closes the modal (the WallpaperStarted
+    // signal will populate the new row via the IPC loop — no
+    // optimistic local insert). On failure, surfaces the error and
+    // keeps the modal open so the operator can retry.
+    let client_for_pick = client_signal;
+    let error_for_pick = error;
+    let picker_for_pick = picker_open_for;
+    let on_pick_wallpaper = move |scene_path: PathBuf| {
+        // Read the target output from the signal at click time, not
+        // from the captured snapshot, so a second click after a
+        // signal-driven re-render still binds to the right output.
+        let Some(output) = picker_for_pick.cloned() else {
+            return;
+        };
+        let Some(client) = client_for_pick.cloned() else {
+            return;
+        };
+        let mut err = error_for_pick;
+        let mut picker = picker_for_pick;
+        spawn(async move {
+            if let Err(e) = crate::data::bindings::set_binding(&client, &output, &scene_path).await
+            {
+                err.set(Some(e));
+            } else {
+                picker.set(None);
+            }
+        });
+    };
+
     rsx! {
         document::Title { "paperforge — Dioxus GUI" }
         div {
@@ -533,6 +587,8 @@ pub fn Root() -> Element {
                 Sidebar {
                     outputs: outputs_snapshot.clone(),
                     running: running_snapshot.clone(),
+                    connected,
+                    on_open_picker,
                 }
                 BindingsPanel {
                     bindings: bindings_snapshot.clone(),
@@ -543,6 +599,18 @@ pub fn Root() -> Element {
                     playlists: playlists_snapshot.clone(),
                     connected,
                     on_apply,
+                }
+            }
+            // Picker modal (PR 6). Renders only when the operator
+            // has clicked Set on some output. Sits at the bottom of
+            // the rsx tree so its `position: fixed` overlay paints
+            // above the panel row without z-index gymnastics.
+            if let Some(out) = picker_target.clone() {
+                Picker {
+                    output: out,
+                    entries: inventory_snapshot.clone(),
+                    on_pick: on_pick_wallpaper,
+                    on_close: on_close_picker,
                 }
             }
             div {

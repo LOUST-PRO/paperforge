@@ -1,15 +1,18 @@
-//! Sidebar — outputs list with state badges.
+//! Sidebar — outputs list with state badges + per-row Set button.
 //!
 //! PR 3 layout:
 //!
 //! ```text
 //! Outputs
 //! ┌────────────────────┐
-//! │ ● HDMI-A-1  Run    │
-//! │ ● DP-1      Run    │
-//! │ ● eDP-1     Pause  │
+//! │ ● HDMI-A-1  Run [Set]
+//! │ ● DP-1      Run [Set]
+//! │ ● eDP-1     Pause [Set]
 //! └────────────────────┘
 //! ```
+//!
+//! The **Set** button opens the Picker modal for that output (PR 6).
+//! Disabled when the IPC client is disconnected.
 //!
 //! State badge color is delegated to `theme::state_color` so the
 //! rest of the GUI stays consistent.
@@ -23,15 +26,21 @@ use crate::ui::theme::{state_color, PANEL_BORDER, PANEL_PADDING};
 
 /// Render the outputs sidebar.
 ///
-/// `outputs` is the live list from `data::outputs::refresh_outputs`.
-/// `running` is the per-output `(output_name, BackendState)` map
-/// built from `data::bindings::refresh_bindings` (always empty in
-/// PR 3 — PR 4 wires the IPC).
+/// Props:
+/// - `outputs` — live outputs from the compositor hotplug source
+/// - `running` — `output → BackendState` map from `list_running`
+/// - `connected` — whether the IPC client is healthy; controls
+///   whether the Set buttons are interactive (greyed out on
+///   reconnect)
+/// - `on_open_picker` — callback fired with the output name when
+///   the operator clicks Set on a row
 #[allow(non_snake_case)]
 #[component]
 pub fn Sidebar(
     outputs: Vec<Output>,
     running: std::collections::HashMap<String, BackendState>,
+    connected: bool,
+    on_open_picker: EventHandler<String>,
 ) -> Element {
     rsx! {
         div {
@@ -46,10 +55,11 @@ pub fn Sidebar(
                     "No outputs detected — start sway / Hyprland, or check $XDG_CURRENT_DESKTOP."
                 }
             } else {
-                for o in outputs.iter() {
+                for o in outputs.into_iter() {
                     {
                         let state = running.get(&o.name).copied().unwrap_or(BackendState::NotRunning);
                         let color = state_color(state);
+                        let name_for_pick = o.name.clone();
                         rsx! {
                             div {
                                 style: "display: flex; align-items: center; gap: 0.5rem; padding: 0.25rem 0;",
@@ -64,6 +74,14 @@ pub fn Sidebar(
                                 span {
                                     style: "color: #8b949e; font-size: 0.75rem;",
                                     "{state_label(state)}"
+                                }
+                                button {
+                                    style: "background: #1f6feb; color: #ffffff; border: 1px solid #388bfd; border-radius: 4px; padding: 0.15rem 0.5rem; font-size: 0.7rem; cursor: pointer;",
+                                    disabled: !connected,
+                                    onclick: move |_| {
+                                        on_open_picker.call(name_for_pick.clone());
+                                    },
+                                    "Set"
                                 }
                             }
                         }
