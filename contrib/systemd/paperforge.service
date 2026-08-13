@@ -28,6 +28,18 @@
 #   exits and auto-started when niri comes back. Drop the PartOf
 #   line if you run a different compositor (Hyprland, sway) or run
 #   niri outside systemd.
+#
+# - WantedBy=graphical-session.target (NOT default.target) so the
+#   daemon does NOT auto-start when the user manager reaches
+#   default.target via linger (Linger=yes). If it did, paperforge
+#   would pull niri.service via Wants=niri.service, niri would
+#   run headless at boot, lock /run/user/1001/wayland-1, and
+#   GDM would fail to register any new login session with
+#   "Session never registered" — observed 2026-08-13. With
+#   graphical-session.target the daemon only starts when the
+#   user actually logs in via a graphical session (GDM, ly, etc.)
+#   which is exactly when niri has a real TTY to attach to.
+#   See memory: gdm-niri-linger-conflict-2026-08-13.
 
 [Unit]
 Description=paperforge daemon — LWE pool + D-Bus + hotplug watcher
@@ -50,4 +62,4 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
