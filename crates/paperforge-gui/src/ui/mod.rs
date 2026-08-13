@@ -16,6 +16,7 @@
 //! across the sprint.
 
 pub mod bindings;
+pub mod picker;
 pub mod playlists;
 pub mod root;
 pub mod sidebar;

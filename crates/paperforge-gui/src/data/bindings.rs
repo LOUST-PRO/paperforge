@@ -58,6 +58,27 @@ pub async fn unset_binding(client: &IpcClient, output: &str) -> Result<(), GuiEr
     client.unset_wallpaper(output).await
 }
 
+/// Call `SetWallpaper(output, scene_path)` on the daemon (PR 6).
+///
+/// Same shape as [`unset_binding`]: thin wrapper around the PR 5/B
+/// `IpcClient::set_wallpaper`. The Picker component hands the
+/// selected `WallpaperEntry::path` as `scene_path` — for Workshop
+/// scenes that's the directory, for loose media it's the file.
+///
+/// On success the daemon emits `WallpaperStarted`, which the IPC
+/// coroutine consumes to insert the new row. No optimistic local
+/// insert — the signal is the source of truth.
+#[allow(dead_code)] // consumed by ui/picker.rs in PR 6
+pub async fn set_binding(
+    client: &IpcClient,
+    output: &str,
+    scene_path: &std::path::Path,
+) -> Result<(), GuiError> {
+    client
+        .set_wallpaper(output, &scene_path.to_string_lossy())
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
