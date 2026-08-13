@@ -3648,6 +3648,7 @@ dependencies = [
  "dioxus",
  "dioxus-desktop",
  "dirs 5.0.1",
+ "futures-util",
  "paperforge-core",
  "tempfile",
  "tokio",

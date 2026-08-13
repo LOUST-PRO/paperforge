@@ -99,6 +99,102 @@ impl IpcClient {
         &self.client
     }
 
+    // ---- Write actions (PR 5/B) ----
+    //
+    // Thin wrappers that translate `paperforge_core::error::Error` to
+    // `GuiError::Ipc { kind = <verb>, … }` so the banner can show
+    // `[ipc] unset` vs `[ipc] pause` and the operator can pinpoint
+    // which call failed. The `kind` tag also helps when the same
+    // closure fires multiple verbs (e.g. toolbar buttons).
+
+    /// Call `SetWallpaper(output, scene_path)` on the daemon.
+    ///
+    /// Used by the per-output picker (PR 6). Marked `dead_code` until
+    /// then; surfaces `kind = "set_wallpaper"` on failure.
+    #[allow(dead_code)]
+    pub async fn set_wallpaper(&self, output: &str, scene_path: &str) -> Result<(), GuiError> {
+        self.client
+            .set_wallpaper(output, scene_path)
+            .await
+            .map_err(map_err("set_wallpaper"))
+    }
+
+    /// Call `UnsetWallpaper(output)` on the daemon. Idempotent:
+    /// unset on a non-bound output is a no-op (per the daemon side).
+    #[allow(dead_code)] // consumed by ui/root.rs + data/bindings.rs in PR 5/D
+    pub async fn unset_wallpaper(&self, output: &str) -> Result<(), GuiError> {
+        self.client
+            .unset_wallpaper(output)
+            .await
+            .map_err(map_err("unset_wallpaper"))
+    }
+
+    /// Call `Pause()` on the daemon. Returns the count of PIDs the
+    /// daemon signaled (surfaced in the banner for confirmation).
+    #[allow(dead_code)] // consumed by ui/root.rs toolbar in PR 5/D
+    pub async fn pause(&self) -> Result<u32, GuiError> {
+        self.client.pause().await.map_err(map_err("pause"))
+    }
+
+    /// Call `Resume()` on the daemon.
+    #[allow(dead_code)] // consumed by ui/root.rs toolbar in PR 5/D
+    pub async fn resume(&self) -> Result<u32, GuiError> {
+        self.client.resume().await.map_err(map_err("resume"))
+    }
+
+    /// Call `AudioToggle()` on the daemon.
+    #[allow(dead_code)] // consumed by ui/root.rs toolbar in PR 5/D
+    pub async fn audio_toggle(&self) -> Result<u32, GuiError> {
+        self.client
+            .audio_toggle()
+            .await
+            .map_err(map_err("audio_toggle"))
+    }
+
+    /// Call `AudioMute()` on the daemon. Toolbar Mute toggle lands
+    /// in PR 8 alongside the audio inspector.
+    #[allow(dead_code)]
+    pub async fn audio_mute(&self) -> Result<u32, GuiError> {
+        self.client
+            .audio_mute()
+            .await
+            .map_err(map_err("audio_mute"))
+    }
+
+    /// Call `AudioUnmute()` on the daemon.
+    #[allow(dead_code)]
+    pub async fn audio_unmute(&self) -> Result<u32, GuiError> {
+        self.client
+            .audio_unmute()
+            .await
+            .map_err(map_err("audio_unmute"))
+    }
+
+    /// Call `ApplyPlaylist(name)` on the daemon. The daemon iterates
+    /// the stored playlist and binds each entry to its outputs.
+    #[allow(dead_code)] // consumed by data/playlists.rs in PR 5/C
+    pub async fn apply_playlist(&self, name: &str) -> Result<(), GuiError> {
+        self.client
+            .apply_playlist(name)
+            .await
+            .map_err(map_err("apply_playlist"))
+    }
+
+    /// Call `ListRunning()` on the daemon. Returns the per-PID
+    /// `(pid, BackendState)` pairs. The GUI owns the pid→output table
+    /// (populated from `WallpaperStarted` signals) and uses it to
+    /// filter this list down to the `output → state` map the
+    /// sidebar badges render.
+    #[allow(dead_code)] // consumed by ui/root.rs poll in PR 5/D
+    pub async fn list_running(
+        &self,
+    ) -> Result<Vec<(i32, paperforge_core::backend::BackendState)>, GuiError> {
+        self.client
+            .list_running()
+            .await
+            .map_err(map_err("list_running"))
+    }
+
     /// Subscribe to the 3 signals emitted on `org.louzt.Paperforge1`.
     ///
     /// The returned [`SignalStream`] yields parsed [`SignalEvent`]s.
@@ -198,6 +294,18 @@ impl SignalStream {
             }
             _ => None,
         }
+    }
+}
+
+/// Translate `paperforge_core::error::Error` into `GuiError::Ipc`
+/// with a stable `kind` tag. Used by every write-action wrapper
+/// above so the banner can attribute failures to a specific verb
+/// (`[ipc] unset` vs `[ipc] pause`). `kind` is `&'static str` per
+/// `GuiError::Ipc`, so the caller's string literal passes through.
+fn map_err(kind: &'static str) -> impl FnOnce(paperforge_core::error::Error) -> GuiError {
+    move |e| GuiError::Ipc {
+        kind,
+        message: format!("{e}"),
     }
 }
 
