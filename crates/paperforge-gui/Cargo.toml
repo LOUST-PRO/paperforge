@@ -34,6 +34,9 @@ tracing-subscriber = { workspace = true }
 # D-Bus IPC client (used in PR 4 for `PaperforgeClient` reconnection)
 zbus = { workspace = true }
 
+# Stream combinators for `MessageStream` iteration in `ipc/client.rs`
+futures-util = { workspace = true }
+
 # Error helpers in PR 3 data modules (spawn_blocking JoinError wrapping)
 anyhow = { workspace = true }
 

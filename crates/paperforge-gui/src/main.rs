@@ -27,6 +27,7 @@ use paperforge_core as core;
 mod app;
 mod data;
 mod error;
+mod ipc;
 mod ui;
 
 fn main() {

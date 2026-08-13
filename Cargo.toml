@@ -65,6 +65,9 @@ filetime = "0.2"
 # D-Bus IPC service (Fase 6D — zbus-based daemon control)
 zbus = { version = "4", default-features = false, features = ["tokio"] }
 
+# Stream combinators (used by ipc/client.rs MessageStream iteration)
+futures-util = "0.3"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
