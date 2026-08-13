@@ -26,7 +26,7 @@ use dioxus::prelude::*;
 use paperforge_core::backend::BackendState;
 use paperforge_core::hotplug::{CompositorHotplugSource, Output};
 
-use crate::data::bindings::{refresh_bindings, Binding};
+use crate::data::bindings::Binding;
 use crate::data::playlists::{refresh_playlists, PlaylistSummary};
 use crate::data::{inventory as data_inventory, outputs as data_outputs};
 use crate::error::GuiError;
@@ -42,6 +42,10 @@ use crate::ui::theme::{self, FONT_STACK, PANEL_BORDER};
 const OUTPUTS_TICK: Duration = Duration::from_secs(2);
 const PLAYLISTS_TICK: Duration = Duration::from_secs(10);
 const INVENTORY_TICK: Duration = Duration::from_secs(30);
+/// `list_running` poll cadence. Cheap (one D-Bus method call) and the
+/// result feeds the sidebar state badges. 5s matches the human reaction
+/// time for "did my click land?" without thrashing the bus.
+const RUNNING_TICK: Duration = Duration::from_secs(5);
 
 /// Root component. Mounts the global state into context and starts
 /// 5 background coroutines (outputs / playlists / inventory /
@@ -66,6 +70,11 @@ pub fn Root() -> Element {
     let bindings: Signal<Vec<Binding>> = use_signal(Vec::new); // PR 4 fills this
     let connection: Signal<ConnectionStatus> = use_signal(ConnectionStatus::default);
     let mut error: Signal<Option<GuiError>> = use_signal(|| None);
+    // The active IpcClient clone, set by the IPC loop on connect,
+    // cleared on disconnect/reconnect. `None` while the daemon is
+    // unreachable. The list_running poll task reads this each tick;
+    // toolbar callbacks clone it before issuing a write.
+    let client_signal: Signal<Option<IpcClient>> = use_signal(|| None);
 
     // ---- Coroutines ----
 
@@ -172,6 +181,7 @@ pub fn Root() -> Element {
     let _ipc_loop = use_coroutine(move |_rx: UnboundedReceiver<()>| {
         let mut bindings_sig = bindings;
         let mut connection_sig = connection;
+        let mut client_sig = client_signal;
         let mut error_sig = error;
         async move {
             let mut attempt: u32 = 0;
@@ -197,6 +207,10 @@ pub fn Root() -> Element {
                     Ok(client) => {
                         attempt = 0;
                         connection_sig.set(ConnectionStatus::Connected);
+                        // Expose the live client to the poll task and
+                        // toolbar callbacks. Cloned (Arc under the hood)
+                        // so the IPC loop retains its own copy too.
+                        client_sig.set(Some(client.clone()));
                         tracing::info!(
                             target: "paperforge-gui",
                             "IpcClient connected to daemon"
@@ -210,6 +224,7 @@ pub fn Root() -> Element {
                                 );
                                 error_sig.set(Some(e));
                                 connection_sig.set(ConnectionStatus::Reconnecting { attempt: 1 });
+                                client_sig.set(None);
                                 tokio::time::sleep(next_backoff(0)).await;
                                 continue;
                             }
@@ -223,20 +238,25 @@ pub fn Root() -> Element {
                                             );
                                             connection_sig
                                                 .set(ConnectionStatus::Reconnecting { attempt: 1 });
+                                            client_sig.set(None);
                                             tokio::time::sleep(next_backoff(0)).await;
                                             break;
                                         }
                                         Some(SignalEvent::Bound {
                                             output,
                                             scene_path,
-                                            pid: _,
+                                            pid,
                                         }) => {
+                                            // PR 5/D: persist the pid so
+                                            // the list_running poll task
+                                            // can map pid→output when
+                                            // reconciling sidebar badges.
                                             running_map.insert(
                                                 output.clone(),
                                                 Binding {
                                                     output: output.clone(),
                                                     scene_path,
-                                                    pid: None,
+                                                    pid: Some(pid),
                                                 },
                                             );
                                             let mut sorted: Vec<Binding> =
@@ -245,19 +265,29 @@ pub fn Root() -> Element {
                                             bindings_sig.set(sorted);
                                         }
                                         Some(SignalEvent::Unbound { pid }) => {
-                                            // SignalStream removed the pid from its
-                                            // own internal map already; we don't have
-                                            // pid → output here, so do a coarse
-                                            // refresh via the daemon's list_running
-                                            // when it lands. For PR 4 we keep the
-                                            // existing entries; PR 5+ adds
-                                            // `list_running` reconciliation.
+                                            // SignalStream already removed the
+                                            // pid from its internal map; here
+                                            // we sweep our running_map for the
+                                            // entry that owns this pid.
+                                            let to_remove: Vec<String> = running_map
+                                                .iter()
+                                                .filter_map(|(out, b)| {
+                                                    b.pid.filter(|p| *p == pid)
+                                                        .map(|_| out.clone())
+                                                })
+                                                .collect();
+                                            for out in to_remove {
+                                                running_map.remove(&out);
+                                            }
+                                            let mut sorted: Vec<Binding> =
+                                                running_map.values().cloned().collect();
+                                            sorted.sort_by(|a, b| a.output.cmp(&b.output));
+                                            bindings_sig.set(sorted);
                                             tracing::debug!(
                                                 target: "paperforge-gui",
                                                 pid,
-                                                "WallpaperStopped received"
+                                                "WallpaperStopped received; bindings pruned"
                                             );
-                                            let _ = refresh_bindings; // silence unused while PR 4 ships read-only
                                         }
                                         Some(SignalEvent::MonitorsChanged { outputs }) => {
                                             tracing::debug!(
@@ -277,6 +307,59 @@ pub fn Root() -> Element {
         }
     });
 
+    // ---- list_running poll (PR 5/D) ----
+    //
+    // Every 5s, ask the daemon for the per-PID `(pid, BackendState)`
+    // list, then project to `output → BackendState` using the pid map
+    // we already maintain in `bindings`. The result populates the
+    // `running` signal that the sidebar consumes for state badges.
+    //
+    // Skips the tick cleanly when `client_signal` is `None` (daemon
+    // down / reconnecting). No error surfacing for transient failures
+    // here — a stale sidebar badge is preferable to a banner flood.
+    let _running_poll = use_coroutine(move |_rx: UnboundedReceiver<()>| {
+        let client_sig = client_signal;
+        let mut running_sig = running;
+        let bindings_sig = bindings;
+        async move {
+            let mut ticker = tokio::time::interval(RUNNING_TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(client) = client_sig.cloned() else {
+                    continue;
+                };
+                // Build pid→output from the bindings snapshot. If a
+                // binding has no pid yet (initial state, signal race),
+                // it just won't get a state badge this round.
+                let pid_map: HashMap<i32, String> = bindings_sig
+                    .cloned()
+                    .iter()
+                    .filter_map(|b| b.pid.map(|p| (p, b.output.clone())))
+                    .collect();
+                match client.list_running().await {
+                    Ok(pairs) => {
+                        let mut m: HashMap<String, BackendState> = HashMap::new();
+                        for (pid, state) in pairs {
+                            if let Some(out) = pid_map.get(&pid) {
+                                m.insert(out.clone(), state);
+                            }
+                        }
+                        running_sig.set(m);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "paperforge-gui",
+                            error = %e,
+                            "list_running poll failed; keeping previous state"
+                        );
+                    }
+                }
+            }
+        }
+    });
+
     // Snapshot current signal values for the rsx below. Signals are
     // Copy + Clone, so the `.cloned()` calls are cheap.
     let outputs_snapshot: Vec<Output> = outputs.cloned();
@@ -286,12 +369,104 @@ pub fn Root() -> Element {
     let connection_snapshot: ConnectionStatus = connection.cloned();
     let error_snapshot: Option<GuiError> = error.cloned();
     let inventory_len = inventory.cloned().len();
+    let connected: bool = matches!(connection_snapshot, ConnectionStatus::Connected);
 
     let connection_color = match connection_snapshot {
         ConnectionStatus::Connected => theme::connection_color(true),
         ConnectionStatus::Disconnected | ConnectionStatus::Reconnecting { .. } => {
             theme::connection_color(false)
         }
+    };
+
+    // ---- Write-action closures (PR 5/D) ----
+    //
+    // These are passed as `EventHandler` props to the panels. Each
+    // captures `client_signal` (Copy) and `error` (needs `mut`), and
+    // spawns a one-shot task that issues the D-Bus call. On failure,
+    // the error signal is set so the banner surfaces it.
+    //
+    // `spawn` is `dioxus::prelude::spawn`, which dispatches onto the
+    // Dioxus runtime. The async block captures clones of `client_signal`
+    // and `error` so the closures themselves can be `move` and short.
+    //
+    // Toolbar verbs (pause / resume / audio_toggle) follow the same
+    // pattern; they live in the rsx below rather than as `on_*`
+    // callbacks because there's exactly one of each.
+
+    // on_unset: called by BindingsPanel rows. Clones the client
+    // out of the signal at call time so a stale closure (bound
+    // before the daemon was reachable) still sees the current state.
+    let error_for_unset = error;
+    let client_for_unset = client_signal;
+    let on_unset = move |output: String| {
+        let Some(client) = client_for_unset.cloned() else {
+            return;
+        };
+        let mut err = error_for_unset;
+        spawn(async move {
+            if let Err(e) = crate::data::bindings::unset_binding(&client, &output).await {
+                err.set(Some(e));
+            }
+        });
+    };
+
+    // on_apply: same shape, calls data::playlists::apply_playlist.
+    let error_for_apply = error;
+    let client_for_apply = client_signal;
+    let on_apply = move |name: String| {
+        let Some(client) = client_for_apply.cloned() else {
+            return;
+        };
+        let mut err = error_for_apply;
+        spawn(async move {
+            if let Err(e) = crate::data::playlists::apply_playlist(&client, &name).await {
+                err.set(Some(e));
+            }
+        });
+    };
+
+    // Toolbar closures (PR 5/D). Each takes the client at call time
+    // and surfaces failures via `error`.
+    let error_for_toolbar = error;
+    let client_for_pause = client_signal;
+    let on_pause = move |_| {
+        let Some(client) = client_for_pause.cloned() else {
+            return;
+        };
+        let mut err = error_for_toolbar;
+        spawn(async move {
+            if let Err(e) = client.pause().await {
+                err.set(Some(e));
+            }
+        });
+    };
+
+    let error_for_resume = error;
+    let client_for_resume = client_signal;
+    let on_resume = move |_| {
+        let Some(client) = client_for_resume.cloned() else {
+            return;
+        };
+        let mut err = error_for_resume;
+        spawn(async move {
+            if let Err(e) = client.resume().await {
+                err.set(Some(e));
+            }
+        });
+    };
+
+    let error_for_audio = error;
+    let client_for_audio = client_signal;
+    let on_audio_toggle = move |_| {
+        let Some(client) = client_for_audio.cloned() else {
+            return;
+        };
+        let mut err = error_for_audio;
+        spawn(async move {
+            if let Err(e) = client.audio_toggle().await {
+                err.set(Some(e));
+            }
+        });
     };
 
     rsx! {
@@ -317,6 +492,31 @@ pub fn Root() -> Element {
                     "{connection_snapshot}"
                 }
             }
+            // Toolbar (PR 5/D). Pauses all running backends, resumes
+            // them, or toggles the audio mute state. Disabled while
+            // disconnected so the operator can't enqueue writes that
+            // will fail. Sits between the header and the panel row.
+            div {
+                style: "display: inline-flex; gap: 0.5rem; margin-bottom: 0.75rem;",
+                button {
+                    style: "background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 4px; padding: 0.35rem 0.9rem; font-size: 0.8125rem; cursor: pointer;",
+                    disabled: !connected,
+                    onclick: on_pause,
+                    "Pause all"
+                }
+                button {
+                    style: "background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 4px; padding: 0.35rem 0.9rem; font-size: 0.8125rem; cursor: pointer;",
+                    disabled: !connected,
+                    onclick: on_resume,
+                    "Resume all"
+                }
+                button {
+                    style: "background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 4px; padding: 0.35rem 0.9rem; font-size: 0.8125rem; cursor: pointer;",
+                    disabled: !connected,
+                    onclick: on_audio_toggle,
+                    "Audio toggle"
+                }
+            }
             StatusBanner {
                 error: error_snapshot,
                 on_dismiss: move |_| {
@@ -337,9 +537,13 @@ pub fn Root() -> Element {
                 }
                 BindingsPanel {
                     bindings: bindings_snapshot.clone(),
+                    connected,
+                    on_unset,
                 }
                 PlaylistsPanel {
                     playlists: playlists_snapshot.clone(),
+                    connected,
+                    on_apply,
                 }
             }
             div {
