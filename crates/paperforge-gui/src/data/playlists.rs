@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use paperforge_core::error::Error as CoreError;
 use paperforge_core::playlist::{Playlist, PlaylistStore};
 
+use crate::error::GuiError;
+use crate::ipc::client::IpcClient;
+
 /// Lightweight summary used by the GUI's playlists sidebar. The full
 /// `Playlist` is loaded on demand by the editor (PR 7).
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +74,23 @@ pub async fn refresh_playlists(store_root: PathBuf) -> (Vec<PlaylistSummary>, Op
         Ok(v) => (v, None),
         Err(e) => (Vec::new(), Some(e)),
     }
+}
+
+/// Call `ApplyPlaylist(name)` on the daemon (PR 5/C).
+///
+/// Thin wrapper around [`IpcClient::apply_playlist`]. Mirrors
+/// `unset_binding`: the data layer owns the IPC verb, the UI just
+/// hands an `&IpcClient` and a playlist name.
+///
+/// The daemon iterates the stored playlist and binds each entry to
+/// its declared outputs, then emits one `WallpaperStarted` per
+/// bind. The IPC coroutine consumes those signals and rebuilds the
+/// `bindings` signal — no optimistic local update needed.
+///
+/// Errors propagate verbatim; banner shows `kind = "apply_playlist"`.
+#[allow(dead_code)] // consumed by ui/playlists.rs in PR 5/D
+pub async fn apply_playlist(client: &IpcClient, name: &str) -> Result<(), GuiError> {
+    client.apply_playlist(name).await
 }
 
 #[cfg(test)]

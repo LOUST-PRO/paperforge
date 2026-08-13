@@ -10,6 +10,9 @@
 
 use std::path::PathBuf;
 
+use crate::error::GuiError;
+use crate::ipc::client::IpcClient;
+
 /// One row in the bindings grid: a Wayland output mapped to the
 /// scene path that's currently being rendered on it.
 ///
@@ -33,6 +36,26 @@ pub struct Binding {
 #[allow(dead_code)] // consumed by ui/bindings.rs in PR 3+
 pub async fn refresh_bindings() -> Vec<Binding> {
     Vec::new()
+}
+
+/// Call `UnsetWallpaper(output)` on the daemon (PR 5/C).
+///
+/// Thin wrapper around [`IpcClient::unset_wallpaper`]. Lives here
+/// (not directly in `ui/bindings.rs`) so the data layer owns the
+/// IPC verb, mirroring how `refresh_playlists` / `refresh_inventory`
+/// own their read paths. The UI just hands an `&IpcClient` and an
+/// output name.
+///
+/// On success the daemon emits `WallpaperStopped`, which the IPC
+/// coroutine in `ui::root` consumes to drop the row from the
+/// `bindings` signal. No optimistic local delete — the signal is
+/// the source of truth.
+///
+/// Errors propagate verbatim to the caller, which surfaces them in
+/// the banner with `kind = "unset_wallpaper"`.
+#[allow(dead_code)] // consumed by ui/bindings.rs in PR 5/D
+pub async fn unset_binding(client: &IpcClient, output: &str) -> Result<(), GuiError> {
+    client.unset_wallpaper(output).await
 }
 
 #[cfg(test)]
