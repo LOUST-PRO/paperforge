@@ -272,8 +272,7 @@ pub fn Root() -> Element {
                                             let to_remove: Vec<String> = running_map
                                                 .iter()
                                                 .filter_map(|(out, b)| {
-                                                    b.pid.filter(|p| *p == pid)
-                                                        .map(|_| out.clone())
+                                                    b.pid.filter(|p| *p == pid).map(|_| out.clone())
                                                 })
                                                 .collect();
                                             for out in to_remove {
