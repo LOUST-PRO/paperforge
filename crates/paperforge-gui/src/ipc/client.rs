@@ -28,6 +28,7 @@
 //! so the banner can show `[ipc] …`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use futures_util::StreamExt;
 use paperforge_core::dbus::{PaperforgeClient, BUS_NAME};
@@ -60,11 +61,17 @@ pub enum SignalEvent {
 
 /// D-Bus client + signal subscription for the GUI.
 ///
-/// Cheap-to-move handle. Owned by `ui::root`'s IPC coroutine, which
-/// is the only place that calls `subscribe_signals()` (the stream
-/// itself isn't `Clone` — it's owned by the single consumer).
+/// Cheap-to-move, cheaply-cloneable handle. PR 5 wraps the underlying
+/// `PaperforgeClient` in an `Arc` so the IPC coroutine in `ui::root`
+/// can hand out a clone to write-action closures (Unset / Apply /
+/// Pause / Resume / Audio toggle) without re-creating the D-Bus
+/// connection.
+///
+/// `subscribe_signals()` is still owned by the single consumer (the
+/// IPC coroutine) — the returned `SignalStream` isn't `Clone`.
+#[derive(Clone)]
 pub struct IpcClient {
-    client: PaperforgeClient,
+    client: Arc<PaperforgeClient>,
 }
 
 impl IpcClient {
@@ -80,7 +87,9 @@ impl IpcClient {
                 kind: "connect",
                 message: format!("{e}"),
             })?;
-        Ok(Self { client })
+        Ok(Self {
+            client: Arc::new(client),
+        })
     }
 
     /// Underlying typed client. Used by PR 5+ write actions
