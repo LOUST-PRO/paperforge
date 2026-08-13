@@ -35,7 +35,7 @@ use paperforge_core::error::Error as CoreError;
 /// One variant per subsystem. New variants are added (not
 /// refactored) to keep the `match` arms in `ui/status.rs` cheap.
 #[allow(dead_code)] // consumed by ui/status.rs in PR 3+
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GuiError {
     /// D-Bus IPC failure (connection, call_method, signature).
     Ipc { kind: &'static str, message: String },

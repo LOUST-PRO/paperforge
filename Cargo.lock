@@ -3644,12 +3644,16 @@ dependencies = [
 name = "paperforge-gui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "dioxus",
  "dioxus-desktop",
+ "dirs 5.0.1",
  "paperforge-core",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zbus",
 ]
 
 [[package]]

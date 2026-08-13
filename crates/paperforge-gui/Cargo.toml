@@ -34,6 +34,17 @@ tracing-subscriber = { workspace = true }
 # D-Bus IPC client (used in PR 4 for `PaperforgeClient` reconnection)
 zbus = { workspace = true }
 
+# Error helpers in PR 3 data modules (spawn_blocking JoinError wrapping)
+anyhow = { workspace = true }
+
+# XDG path resolution for the playlist store root (matches TUI behavior)
+dirs = { workspace = true }
+
 [features]
 default = []
 devtools = ["dioxus-desktop/devtools"]
+
+[dev-dependencies]
+# Tempdir helpers in data module tests
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

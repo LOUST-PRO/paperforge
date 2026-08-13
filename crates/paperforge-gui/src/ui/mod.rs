@@ -12,8 +12,12 @@
 //! - `preview` — PR 8 (static `preview.jpg` pane)
 //!
 //! Until each PR lands the module may be empty or absent. We
-//! declare them eagerly here (with `#[allow(dead_code)]`/`pub mod`)
-//! so the navigation graph is stable across the sprint.
+//! declare them eagerly here so the navigation graph is stable
+//! across the sprint.
 
+pub mod bindings;
+pub mod playlists;
 pub mod root;
+pub mod sidebar;
+pub mod status;
 pub mod theme;
