@@ -24,6 +24,8 @@
 //!
 //! - `SetWallpaper(s: output, s: scene_path) → ()` — apply a scene to a
 //!   specific Wayland output. Equivalent to `paperforge set`.
+//! - `UnsetWallpaper(s: output) → ()` — kill the LWE instance bound to
+//!   `output`. Idempotent; returns Ok even when no wallpaper was bound.
 //! - `Pause() → u32` — SIGSTOP all running LWE. Returns count.
 //! - `Resume() → u32` — SIGCONT all paused LWE. Returns count.
 //! - `AudioToggle() → u32` — SIGUSR1 all LWE. Returns count.
@@ -86,6 +88,13 @@ pub struct DaemonState {
 pub trait PaperforgeControl: Send + Sync {
     /// Apply `scene_path` to the given Wayland `output`.
     async fn set_wallpaper(&self, output: &str, scene_path: &str) -> Result<()>;
+
+    /// Remove the wallpaper bound to `output` (kill its LWE
+    /// instance). After this returns, `list_running` no longer
+    /// contains the output's PID and the daemon emits a
+    /// `WallpaperStopped` signal. Returns `Ok(())` even when no
+    /// wallpaper was bound to `output` (idempotent unset).
+    async fn unset_wallpaper(&self, output: &str) -> Result<()>;
 
     /// Pause all running instances. Returns the count of PIDs signaled.
     async fn pause(&self) -> Result<u32>;
@@ -157,6 +166,15 @@ impl PaperforgeInterface {
     async fn set_wallpaper(&self, output: String, scene_path: String) -> zbus::fdo::Result<()> {
         self.ctrl
             .set_wallpaper(&output, &scene_path)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
+    }
+
+    /// Remove the wallpaper bound to `output`. Idempotent — returns
+    /// `Ok(())` even when no wallpaper was bound.
+    async fn unset_wallpaper(&self, output: String) -> zbus::fdo::Result<()> {
+        self.ctrl
+            .unset_wallpaper(&output)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
     }
@@ -332,6 +350,115 @@ impl PaperforgeClient {
         })
     }
 
+    /// Underlying zbus connection. Exposed for signal subscription
+    /// (`MessageStream::for_match_rule` requires a connection
+    /// reference). Prefer the typed helpers below when possible —
+    /// this is the escape hatch for surfaces we have not wrapped yet.
+    pub fn connection(&self) -> &zbus::connection::Connection {
+        &self.conn
+    }
+
+    /// Call `SetWallpaper(output, scene_path)` on the daemon.
+    pub async fn set_wallpaper(&self, output: &str, scene_path: &str) -> crate::error::Result<()> {
+        self.call_no_return("SetWallpaper", &(output, scene_path))
+            .await
+    }
+
+    /// Call `UnsetWallpaper(output)` on the daemon. Idempotent.
+    pub async fn unset_wallpaper(&self, output: &str) -> crate::error::Result<()> {
+        self.call_no_return("UnsetWallpaper", &(output,)).await
+    }
+
+    /// Call `Pause()` on the daemon. Returns the count of PIDs signaled.
+    pub async fn pause(&self) -> crate::error::Result<u32> {
+        self.call_u32("Pause", &()).await
+    }
+
+    /// Call `Resume()` on the daemon. Returns the count of PIDs signaled.
+    pub async fn resume(&self) -> crate::error::Result<u32> {
+        self.call_u32("Resume", &()).await
+    }
+
+    /// Call `AudioToggle()` on the daemon. Returns the count of PIDs signaled.
+    pub async fn audio_toggle(&self) -> crate::error::Result<u32> {
+        self.call_u32("AudioToggle", &()).await
+    }
+
+    /// Call `AudioMute()` on the daemon. Returns the count of PIDs signaled.
+    pub async fn audio_mute(&self) -> crate::error::Result<u32> {
+        self.call_u32("AudioMute", &()).await
+    }
+
+    /// Call `AudioUnmute()` on the daemon. Returns the count of PIDs signaled.
+    pub async fn audio_unmute(&self) -> crate::error::Result<u32> {
+        self.call_u32("AudioUnmute", &()).await
+    }
+
+    /// Call `ApplyPlaylist(name)` on the daemon.
+    pub async fn apply_playlist(&self, name: &str) -> crate::error::Result<()> {
+        self.call_no_return("ApplyPlaylist", &(name,)).await
+    }
+
+    /// Call `ListRunning()` on the daemon. Returns `(pid, state)`
+    /// tuples where `state` is the last-known `BackendState` for
+    /// that PID. The daemon returns `(i32, String)`; we map the
+    /// string back to `BackendState` here so callers don't deal
+    /// with the transport encoding.
+    pub async fn list_running(&self) -> crate::error::Result<Vec<(i32, BackendState)>> {
+        let reply = self
+            .conn
+            .call_method(
+                Some(BUS_NAME),
+                self.obj_path.clone(),
+                Some(self.if_name.clone()),
+                "ListRunning",
+                &(),
+            )
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("D-Bus ListRunning call: {e}")))?;
+        let body = reply.body();
+        let raw: Vec<(i32, String)> = body
+            .deserialize()
+            .map_err(|e| Error::Other(anyhow::anyhow!("D-Bus ListRunning parse: {e}")))?;
+        raw.into_iter()
+            .map(|(pid, state)| {
+                let parsed = match state.as_str() {
+                    "running" => BackendState::Running,
+                    "paused" => BackendState::Paused,
+                    "not-running" => BackendState::NotRunning,
+                    other => {
+                        return Err(Error::Other(anyhow::anyhow!(
+                            "D-Bus ListRunning returned unknown state {other:?} for pid {pid}"
+                        )));
+                    }
+                };
+                Ok((pid, parsed))
+            })
+            .collect::<crate::error::Result<Vec<_>>>()
+    }
+
+    /// Call `GetState()` on the daemon. Returns the parsed
+    /// [`DaemonState`] snapshot.
+    pub async fn get_state(&self) -> crate::error::Result<DaemonState> {
+        let reply = self
+            .conn
+            .call_method(
+                Some(BUS_NAME),
+                self.obj_path.clone(),
+                Some(self.if_name.clone()),
+                "GetState",
+                &(),
+            )
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("D-Bus GetState call: {e}")))?;
+        let body = reply.body();
+        let raw: String = body
+            .deserialize()
+            .map_err(|e| Error::Other(anyhow::anyhow!("D-Bus GetState body: {e}")))?;
+        serde_json::from_str(&raw)
+            .map_err(|e| Error::Other(anyhow::anyhow!("DaemonState JSON parse: {e}")))
+    }
+
     /// Call `Reconcile` on the daemon. Returns the `(output,
     /// new_pid)` pairs that were re-spawned (empty when nothing
     /// needed re-binding).
@@ -368,6 +495,51 @@ impl PaperforgeClient {
                 Ok((output, pid))
             })
             .collect()
+    }
+
+    /// Internal helper: invoke a no-arg or `(String)`/`(String, String)`
+    /// method that returns `()`. Avoids the boilerplate of
+    /// `call_method` + body deserialize + `Error::Other` wrapping
+    /// for each method.
+    async fn call_no_return<B>(&self, method: &'static str, body: &B) -> crate::error::Result<()>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+    {
+        let _reply = self
+            .conn
+            .call_method(
+                Some(BUS_NAME),
+                self.obj_path.clone(),
+                Some(self.if_name.clone()),
+                method,
+                body,
+            )
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("D-Bus {method} call: {e}")))?;
+        Ok(())
+    }
+
+    /// Internal helper: invoke a no-arg method that returns `u32`.
+    async fn call_u32<B>(&self, method: &'static str, body: &B) -> crate::error::Result<u32>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+    {
+        let reply = self
+            .conn
+            .call_method(
+                Some(BUS_NAME),
+                self.obj_path.clone(),
+                Some(self.if_name.clone()),
+                method,
+                body,
+            )
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("D-Bus {method} call: {e}")))?;
+        let parsed: u32 = reply
+            .body()
+            .deserialize()
+            .map_err(|e| Error::Other(anyhow::anyhow!("D-Bus {method} response parse: {e}")))?;
+        Ok(parsed)
     }
 }
 
@@ -483,6 +655,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("set_wallpaper:{output}:{scene_path}"));
+            Ok(())
+        }
+
+        async fn unset_wallpaper(&self, output: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("unset_wallpaper:{output}"));
             Ok(())
         }
 

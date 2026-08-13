@@ -18,7 +18,9 @@
 //! All panels are rendered as [`Table`](ratatui::widgets::Table)s for
 //! uniform styling. Each panel highlights its title when focused.
 
-use chrono::{DateTime, Utc};
+use paperforge_core::format::{
+    entry_size_on_disk, format_entry_path, format_mtime_ago, format_size,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -29,7 +31,7 @@ use ratatui::{
 
 use crate::{
     app::{App, Focus},
-    data::{entry_size_on_disk, format_entry_path, format_size, RunningInstance, Snapshot},
+    data::{RunningInstance, Snapshot},
 };
 
 fn panel_style(focused: bool) -> Style {
@@ -164,12 +166,6 @@ fn format_inventory_summary(s: &Snapshot) -> String {
         s.inventory.len(),
         s.lwe_compatible_count()
     )
-}
-
-#[allow(dead_code)]
-fn format_mtime_ago(mtime: std::time::SystemTime) -> String {
-    let dt: DateTime<Utc> = mtime.into();
-    dt.format("%Y-%m-%d").to_string()
 }
 
 #[allow(dead_code)]

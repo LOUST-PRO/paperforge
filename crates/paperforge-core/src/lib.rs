@@ -45,6 +45,7 @@ pub mod daemon;
 pub mod dbus;
 pub mod detach;
 pub mod error;
+pub mod format;
 pub mod fps_control;
 pub mod fullscreen;
 pub mod governor;
@@ -72,9 +73,13 @@ pub use compositor_watch::{
 pub use config::{Config, ConfigPaths};
 pub use daemon::{BackendOps, DaemonEvent, LweBackendOps, PaperforgeDaemon};
 pub use dbus::{
-    serve_dbus, DaemonState, PaperforgeControl, PaperforgeInterface, BUS_NAME, OBJECT_PATH,
+    serve_dbus, DaemonState, PaperforgeClient, PaperforgeControl, PaperforgeInterface, BUS_NAME,
+    OBJECT_PATH,
 };
 pub use error::{Error, Result};
+pub use format::{
+    backend_path, entry_size_on_disk, format_entry_path, format_mtime_ago, format_size,
+};
 pub use fps_control::{FakeFpsController, FpsCall, FpsController, LweFpsController};
 pub use governor::{FpsTier, GovernorConfig, GovernorEvent, GovernorState, LoadAwareGovernor};
 pub use governor_provider::{

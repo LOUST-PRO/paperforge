@@ -811,6 +811,17 @@ impl PaperforgeControl for PaperforgeDaemon {
         Ok(())
     }
 
+    async fn unset_wallpaper(&self, output: &str) -> Result<()> {
+        // Idempotent: kill_per_output is a no-op when the output
+        // has no recorded pid. The reaper emits `WallpaperStopped`
+        // automatically once the SIGTERM takes effect; the GUI's
+        // signal handler drops the corresponding entry from its
+        // `bindings` map. We don't synthesize the event here — the
+        // 50-200 ms reaper latency is fine for the bindings view
+        // and avoids races between two WallpaperStopped emissions.
+        self.kill_per_output(output).await
+    }
+
     async fn pause(&self) -> Result<u32> {
         // Route through the configured pause mode (Frame default,
         // operator can set [pause].mode = "hard"|"frame"|"throttle"

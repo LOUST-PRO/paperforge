@@ -53,7 +53,7 @@ impl WallpaperKind {
 }
 
 /// One wallpaper entry discovered by [`Inventory::scan`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct WallpaperEntry {
     /// Absolute path to the wallpaper (directory for Workshop scenes,
     /// file for loose media).

@@ -9,16 +9,13 @@
 //! All disk-touching work runs inside `tokio::task::spawn_blocking`
 //! so the event loop is never blocked on slow filesystems.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use paperforge_core::{
     backend::{BackendState, LweBackend, WallpaperBackend},
     error::{Error, Result},
     hotplug::{CompositorHotplugSource, HotplugSource, Output},
-    inventory::{Inventory, WallpaperEntry, WallpaperKind},
+    inventory::{Inventory, WallpaperEntry},
     playlist::{Playlist, PlaylistStore},
 };
 
@@ -176,65 +173,11 @@ pub async fn refresh_inventory(roots: Vec<PathBuf>) -> (Vec<WallpaperEntry>, Opt
     }
 }
 
-/// Display a single inventory entry as a compact summary string.
-pub fn format_entry_path(path: &Path, max_len: usize) -> String {
-    let s = path.to_string_lossy();
-    if s.chars().count() <= max_len {
-        s.into_owned()
-    } else {
-        // Keep the tail (filename is what matters when paths are
-        // long). Reserve 1 char for the ellipsis.
-        let keep = max_len.saturating_sub(1);
-        let tail: String = s
-            .chars()
-            .rev()
-            .take(keep)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        format!("…{tail}")
-    }
-}
-
-/// Format human-readable size (binary).
-pub fn format_size(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-/// Compute file size (for loose media) or sum of dir (for Workshop scenes).
-pub fn entry_size_on_disk(path: &Path, kind: WallpaperKind) -> u64 {
-    match kind {
-        WallpaperKind::LooseImage | WallpaperKind::LooseVideo => {
-            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-        }
-        WallpaperKind::WorkshopScene => walkdir::WalkDir::new(path)
-            .into_iter()
-            .filter_map(|r: std::result::Result<walkdir::DirEntry, walkdir::Error>| r.ok())
-            // Sum file bytes only — directories add their inode size
-            // (typically 80+ bytes on ext4), which would inflate the
-            // displayed total and confuse the user.
-            .filter(|e| e.file_type().is_file())
-            .filter_map(|e| e.metadata().ok())
-            .map(|m| m.len())
-            .sum(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paperforge_core::format::{entry_size_on_disk, format_entry_path, format_size};
+    use paperforge_core::inventory::WallpaperKind;
 
     #[test]
     fn format_size_binary_units() {
