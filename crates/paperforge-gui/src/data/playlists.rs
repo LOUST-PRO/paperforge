@@ -93,6 +93,30 @@ pub async fn apply_playlist(client: &IpcClient, name: &str) -> Result<(), GuiErr
     client.apply_playlist(name).await
 }
 
+/// Persist a `Playlist` to the on-disk store (PR 7/A).
+///
+/// Wraps [`PlaylistStore::save`] in `spawn_blocking` so the file
+/// write doesn't stall the Dioxus runtime. The operator edits the
+/// playlist in the editor modal, hits Save, and the resulting
+/// `Playlist` lands here as-is. No D-Bus involved — `save_playlist`
+/// is purely a local-filesystem write; the next `apply_playlist`
+/// call is what reaches the daemon.
+///
+/// Errors propagate verbatim; banner shows `kind = "save_playlist"`.
+/// On success the next poll tick (10s) re-reads the store and
+/// picks up the new entry count / description.
+#[allow(dead_code)] // consumed by ui/playlist_editor.rs in PR 7/A
+pub async fn save_playlist(store_root: PathBuf, playlist: Playlist) -> Result<(), GuiError> {
+    tokio::task::spawn_blocking(move || -> std::result::Result<(), CoreError> {
+        let store = PlaylistStore::new(&store_root)?;
+        store.save(&playlist)?;
+        Ok(())
+    })
+    .await
+    .map_err(|join_err| GuiError::Core(format!("spawn_blocking (save_playlist): {join_err}")))?
+    .map_err(GuiError::from_core)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,4 +151,10 @@ mod tests {
         assert_eq!(v[0].outputs, 2);
         assert_eq!(v[0].description.as_deref(), Some("test playlist"));
     }
+
+    // See `tests/integration_playlists.rs` for the
+    // `save_playlist_overwrites_and_round_trips` integration test
+    // — it needs a `tempfile` fixture and exercises the full
+    // store round-trip, which fits the integration slot better
+    // than a unit test next to the helper.
 }
