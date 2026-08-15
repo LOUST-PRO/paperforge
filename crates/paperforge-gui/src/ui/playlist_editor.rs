@@ -1,4 +1,4 @@
-//! Playlist editor modal — click-to-add editor (PR 7/A).
+//! Playlist editor modal — click-to-add + drag-drop editor (PR 7).
 //!
 //! ## Layout
 //!
@@ -17,11 +17,10 @@
 //! The Dioxus 0.8-alpha drag-drop story on Linux is shaky (Dioxus
 //! issue #3961 — events don't fire on WebKitGTK for some
 //! drag-target combinations). Per the Fase 6C plan, click-to-add
-//! is the **contract**; drag-drop is the **enhancement**. PR 7/A
-//! ships the click-to-add UX with full save support. PR 7/B will
-//! layer `ondragstart` / `ondragover` / `ondrop` on top of the
-//! same `editor_draft` state, reusing the `DragPayload` enum from
-//! `app.rs`.
+//! is the **contract**; drag-drop is the **enhancement**. PR 7/A-2
+//! ships the click-to-add UX with full save support. PR 7/B layers
+//! `ondragstart` / `ondragover` / `ondrop` on top of the same
+//! `editor_draft` state, with `DragPayload` as the typed payload.
 //!
 //! ## State model (Signal-driven)
 //!
@@ -34,6 +33,9 @@
 //! - Mutate with `draft.set(Some(new_state))` from the row buttons
 //!   (`↑` / `↓` / `Remove`). Signals propagate back to the parent
 //!   re-render so the editor stays consistent across renders.
+//! - Drag-drop uses a sibling `drag: Signal<Option<DragPayload>>`
+//!   set in `ondragstart` and consumed in `ondrop`. The editor
+//!   reads `drag()` to render a drop-zone highlight.
 //! - `Add` fires `on_add_requested(output_target)` — the parent
 //!   reuses the existing `Picker` modal (PR 6) instead of nesting
 //!   a second picker inside the editor. When the picker resolves,
@@ -68,19 +70,43 @@ pub struct OpenEditor {
     pub draft: Playlist,
 }
 
+/// What the operator is currently dragging from another part of
+/// the editor modal (PR 7/B).
+///
+/// The editor is self-contained: drag sources and drop targets all
+/// live inside the same modal. `Wallpaper` is dragged from the
+/// inventory sub-picker (`EditorPicker`) into the playlist body to
+/// append. `PlaylistEntry` is dragged from one row in the body to
+/// another to reorder.
+///
+/// The shape mirrors the broader plan's `DragPayload` enum
+/// (`full-innovation` mode, see `app.rs` design). It is intentionally
+/// local to the editor — the inventory cards in the parent root
+/// use a separate copy/click path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DragPayload {
+    /// Picker entry (a wallpaper from the inventory sub-picker).
+    Wallpaper(PathBuf),
+    /// Body row being reordered. `index` is the source position.
+    PlaylistEntry { playlist: String, index: usize },
+}
+
 /// Render the playlist editor modal.
 ///
 /// Props:
 /// - `draft` — current open-editor state (read snapshot + Signal
 ///   for mutation). The render reads `draft.cloned().unwrap()`;
 ///   the row buttons call `draft.set(Some(new))` to mutate.
-/// - `picker_target` — when set, the editor shows an "Add
-///   wallpaper" mini-picker (a stripped-down inventory grid); when
-///   cleared, the picker doesn't render. This is wired to the
-///   parent's `picker_open_for` signal so the user can use the
-///   same Picker UX as PR 6, but the editor owns no picker
-///   component — it just consumes an `open_or_close` flag.
+/// - `show_picker` — when set, the editor shows an "Add wallpaper"
+///   mini-picker (a stripped-down inventory grid); when cleared,
+///   the picker doesn't render. This is wired to the parent's
+///   `editor_show_picker` signal so the user can use the same
+///   Picker UX as PR 6, but the editor owns no picker component —
+///   it just consumes an `open_or_close` flag.
 /// - `inventory` — wallpapers available to add
+/// - `drag` — currently in-flight drag payload (PR 7/B). Set in
+///   `ondragstart`, consumed in `ondrop`. The editor reads this
+///   signal to render drop-zone highlights.
 /// - `on_save` — fires with the draft `Playlist` when the operator
 ///   hits Save. The parent calls `data::playlists::save_playlist`
 ///   and closes the editor on success.
@@ -91,12 +117,14 @@ pub struct OpenEditor {
 pub fn PlaylistEditor(
     draft: Signal<Option<OpenEditor>>,
     show_picker: Signal<bool>,
+    drag: Signal<Option<DragPayload>>,
     inventory: Vec<WallpaperEntry>,
     on_save: EventHandler<Playlist>,
     on_cancel: EventHandler<()>,
 ) -> Element {
     let snapshot = draft.cloned().unwrap();
     let wallpapers_len = snapshot.draft.wallpapers.len();
+    let is_dragging = drag.cloned().is_some();
 
     rsx! {
         div {
@@ -129,13 +157,44 @@ pub fn PlaylistEditor(
                         "{desc}"
                     }
                 }
-                // Body: ordered wallpapers list
+                // Body: ordered wallpapers list. The container is a
+                // drop target — ondragover must preventDefault so the
+                // browser actually fires ondrop. ondrop appends a
+                // wallpaper if the drag is a `Wallpaper` payload, or
+                // noops if it's a `PlaylistEntry` (those only reorder
+                // onto specific rows).
                 div {
-                    style: "overflow-y: auto; padding: 0.5rem 0.75rem; flex: 1;",
+                    style: if is_dragging {
+                        "overflow-y: auto; padding: 0.5rem 0.75rem; flex: 1; background: #0a1f3a; border-radius: 4px; transition: background 80ms;"
+                    } else {
+                        "overflow-y: auto; padding: 0.5rem 0.75rem; flex: 1;"
+                    },
+                    ondragover: move |ev| ev.prevent_default(),
+                    ondrop: {
+                        let mut drag = drag;
+                        let mut draft = draft;
+                        move |ev| {
+                            ev.prevent_default();
+                            // Honor the payload: only `Wallpaper`
+                            // payloads drop into the body container.
+                            // A `PlaylistEntry` payload here means
+                            // the operator dropped on whitespace;
+                            // ignore (no row reorder, no append).
+                            if let Some(DragPayload::Wallpaper(path)) = drag.cloned() {
+                                if let Some(mut cur) = draft.cloned() {
+                                    if !cur.draft.wallpapers.contains(&path) {
+                                        cur.draft.wallpapers.push(path);
+                                        draft.set(Some(cur));
+                                    }
+                                }
+                            }
+                            drag.set(None);
+                        }
+                    },
                     if snapshot.draft.wallpapers.is_empty() {
                         p {
                             style: "color: #8b949e; font-size: 0.875rem; padding: 1rem; text-align: center;",
-                            "No wallpapers. Use the Add button below to pick from the inventory."
+                            "No wallpapers. Drag in from the picker or use the Add button."
                         }
                     } else {
                         div {
@@ -153,9 +212,63 @@ pub fn PlaylistEditor(
                                     let mut draft_for_up = draft;
                                     let mut draft_for_down = draft;
                                     let mut draft_for_remove = draft;
+                                    let mut drag_for_start = drag;
+                                    let mut drag_for_drop = drag;
+                                    let mut draft_for_drop = draft;
+                                    let playlist_name = snapshot.name.clone();
                                     rsx! {
                                         div {
-                                            style: "{PANEL_BORDER} background: #161b22; padding: 0.5rem 0.75rem; display: flex; align-items: center; gap: 0.5rem;",
+                                            style: "{PANEL_BORDER} background: #161b22; padding: 0.5rem 0.75rem; display: flex; align-items: center; gap: 0.5rem; cursor: grab;",
+                                            draggable: "true",
+                                            ondragstart: move |ev| {
+                                                // Set both the typed
+                                                // payload (consumed by
+                                                // our own drops) and the
+                                                // HTML5 DataTransfer
+                                                // format (gives the
+                                                // browser a visible
+                                                // drag image and works
+                                                // across iframes).
+                                                let _ = ev.data_transfer().set_data(
+                                                    "text/x-paperforge-playlist-entry",
+                                                    &i.to_string(),
+                                                );
+                                                drag_for_start.set(Some(DragPayload::PlaylistEntry {
+                                                    playlist: playlist_name.clone(),
+                                                    index: i,
+                                                }));
+                                            },
+                                            ondragover: move |ev| ev.prevent_default(),
+                                            ondrop: move |ev| {
+                                                ev.prevent_default();
+                                                let payload = drag_for_drop.cloned();
+                                                if let Some(mut cur) = draft_for_drop.cloned() {
+                                                    match payload {
+                                                        Some(DragPayload::PlaylistEntry { playlist: _, index: src }) => {
+                                                            // Reorder: move src → i.
+                                                            // If src < i, drop index in
+                                                            // the original position
+                                                            // matches the user's intent
+                                                            // (splice out, splice in).
+                                                            if src != i && src < cur.draft.wallpapers.len() {
+                                                                let moved = cur.draft.wallpapers.remove(src);
+                                                                let insert_at = if src < i { i - 1 } else { i };
+                                                                let insert_at = insert_at.min(cur.draft.wallpapers.len());
+                                                                cur.draft.wallpapers.insert(insert_at, moved);
+                                                                draft_for_drop.set(Some(cur));
+                                                            }
+                                                        }
+                                                        Some(DragPayload::Wallpaper(path))
+                                                            if !cur.draft.wallpapers.contains(&path) =>
+                                                        {
+                                                            cur.draft.wallpapers.insert(i, path);
+                                                            draft_for_drop.set(Some(cur));
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                                drag_for_drop.set(None);
+                                            },
                                             span {
                                                 style: "color: #8b949e; font-family: monospace; font-size: 0.75rem; width: 1.5rem; text-align: right;",
                                                 "{i + 1}"
@@ -233,6 +346,7 @@ pub fn PlaylistEditor(
                                 show_picker.set(false);
                             },
                             on_cancel: move |_| show_picker.set(false),
+                            drag: drag,
                         }
                     }
                 }
@@ -266,12 +380,17 @@ pub fn PlaylistEditor(
 /// embedded in the editor card. Lighter than the per-output
 /// `Picker` (no overlay, no Escape handling) because it lives
 /// inside the editor modal.
+///
+/// PR 7/B: each row is `draggable="true"` and sets a `DragPayload::Wallpaper`
+/// payload via `ondragstart`. The operator can either click to
+/// append (PR 7/A path) or drag into the body rows.
 #[allow(non_snake_case)]
 #[component]
 fn EditorPicker(
     entries: Vec<WallpaperEntry>,
     on_pick: EventHandler<PathBuf>,
     on_cancel: EventHandler<()>,
+    drag: Signal<Option<DragPayload>>,
 ) -> Element {
     rsx! {
         div {
@@ -291,14 +410,24 @@ fn EditorPicker(
             for entry in entries.iter() {
                 {
                     let path_for_pick = entry.path.clone();
+                    let path_for_drag = entry.path.clone();
+                    let mut drag_for_start = drag;
                     let display = entry
                         .title
                         .clone()
                         .unwrap_or_else(|| entry.path.display().to_string());
                     rsx! {
                         div {
-                            style: "padding: 0.3rem 0.5rem; cursor: pointer; border-radius: 3px; display: flex; align-items: center; gap: 0.5rem;",
+                            style: "padding: 0.3rem 0.5rem; cursor: grab; border-radius: 3px; display: flex; align-items: center; gap: 0.5rem;",
+                            draggable: "true",
                             onclick: move |_| on_pick.call(path_for_pick.clone()),
+                            ondragstart: move |ev| {
+                                let _ = ev.data_transfer().set_data(
+                                    "text/x-paperforge-wallpaper",
+                                    &path_for_drag.to_string_lossy(),
+                                );
+                                drag_for_start.set(Some(DragPayload::Wallpaper(path_for_drag.clone())));
+                            },
                             span {
                                 style: "background: #21262d; color: #8b949e; font-family: monospace; font-size: 0.65rem; padding: 0.1rem 0.3rem; border-radius: 3px;",
                                 "{kind_short(entry.kind)}"
@@ -340,5 +469,38 @@ mod tests {
         assert_eq!(kind_short(WallpaperKind::WorkshopScene), "scene");
         assert_eq!(kind_short(WallpaperKind::LooseImage), "image");
         assert_eq!(kind_short(WallpaperKind::LooseVideo), "video");
+    }
+
+    #[test]
+    fn drag_payload_distinguishes_sources() {
+        // DragPayload variants must be distinguishable so the
+        // drop handler can pick the right action. Equality on the
+        // path / index discriminates correctly (reordering the
+        // same row to itself is a no-op).
+        let wallpaper = DragPayload::Wallpaper(PathBuf::from("/tmp/wallpaper_a"));
+        let entry = DragPayload::PlaylistEntry {
+            playlist: "demo".into(),
+            index: 2,
+        };
+        assert!(wallpaper != entry);
+        assert_eq!(
+            DragPayload::PlaylistEntry {
+                playlist: "demo".into(),
+                index: 2,
+            },
+            entry,
+        );
+    }
+
+    #[test]
+    fn drag_payload_wallpaper_round_trips_losslessly() {
+        // DragPayload is Clone + PartialEq, so the signal can carry
+        // it across event boundaries without losing the path.
+        let p = PathBuf::from("/tmp/wallpaper_with_unicode_ñoño");
+        let payload = DragPayload::Wallpaper(p.clone());
+        match payload {
+            DragPayload::Wallpaper(inner) => assert_eq!(inner, p),
+            _ => panic!("wrong variant"),
+        }
     }
 }

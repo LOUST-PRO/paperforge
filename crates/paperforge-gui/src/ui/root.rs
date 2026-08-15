@@ -37,7 +37,7 @@ use crate::ipc::reconnect::next_backoff;
 use crate::ipc::ConnectionStatus;
 use crate::ui::bindings::BindingsPanel;
 use crate::ui::picker::Picker;
-use crate::ui::playlist_editor::{OpenEditor, PlaylistEditor};
+use crate::ui::playlist_editor::{DragPayload, OpenEditor, PlaylistEditor};
 use crate::ui::playlists::PlaylistsPanel;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::status::StatusBanner;
@@ -92,6 +92,10 @@ pub fn Root() -> Element {
     // editor's "Add wallpaper" button. Lives here so the editor
     // remains a controlled component (no nested `use_signal`).
     let editor_show_picker: Signal<bool> = use_signal(|| false);
+    // PR 7/B: in-flight drag payload inside the editor. Set in
+    // `ondragstart` (picker entry or body row), consumed in `ondrop`.
+    // The editor reads this signal to render drop-zone highlights.
+    let editor_drag: Signal<Option<DragPayload>> = use_signal(|| None);
 
     // ---- Coroutines ----
 
@@ -704,6 +708,7 @@ pub fn Root() -> Element {
                 PlaylistEditor {
                     draft: editor_draft,
                     show_picker: editor_show_picker,
+                    drag: editor_drag,
                     inventory: inventory_snapshot.clone(),
                     on_save: on_save_editor,
                     on_cancel: on_cancel_editor,
