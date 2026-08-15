@@ -1,5 +1,5 @@
-//! Thumbnail subsystem — preview.jpg (and Phase 1 fallback) decoding
-//! + PNG cache (PR 8.1).
+//! Thumbnail subsystem — preview.jpg / image / ffmpeg-first-frame
+//! decoding + PNG cache (PR 8.1 + Fase 6C.2).
 //!
 //! ## What this module does
 //!
@@ -15,9 +15,12 @@
 //!   fall back to the title-only badge).
 //! - `LooseImage` → decode the image itself (jpg / png / webp / gif
 //!   via the `image` 0.25 codec set).
-//! - `LooseVideo` → `None` in Phase 1. Phase 2 (Fase 6C.2) will
-//!   shell out to `ffmpeg` for first-frame extraction. Until then,
-//!   the editor and picker show the title only.
+//! - `LooseVideo` → shell out to `ffmpeg` for a single PNG frame
+//!   (Fase 6C.2, see [`crate::data::ffmpeg`]), then run that PNG
+//!   through the same resize/encode pipeline as the static-image
+//!   path. If ffmpeg isn't on PATH or the extraction fails, we
+//!   surface `Failed` (not `None`) so the UI can show a warning
+//!   rather than the silent title-only fallback.
 //!
 //! ## Cache
 //!
@@ -39,15 +42,16 @@
 //! inside `tokio::task::spawn_blocking`. The `image` crate is
 //! blocking-by-design (no internal async) and the PNG encoder is
 //! synchronous, so it would otherwise stall the Dioxus runtime on
-//! large inventories.
+//! large inventories. The ffmpeg subprocess (Fase 6C.2) is spawned
+//! via `tokio::process::Command` and timed out via
+//! `tokio::time::timeout`.
 //!
 //! ## Wiring timeline
 //!
 //! PR 8.1 ships the surface (helpers + cache + tests). PR 8.2
 //! consumes it from `ui/picker.rs` (per-tile thumbnail) and
-//! `ui/preview.rs` (single large preview pane). Until PR 8.2
-//! lands, the bin target has no caller — the module-level
-//! `#[allow(dead_code)]` keeps clippy green on the unused API.
+//! `ui/preview.rs` (single large preview pane). Fase 6C.2 adds
+//! the ffmpeg path for `LooseVideo`.
 
 #![allow(dead_code)] // PR 8.2 will consume every item below.
 
@@ -58,6 +62,7 @@ use tokio::task;
 
 use paperforge_core::inventory::{WallpaperEntry, WallpaperKind};
 
+use crate::data::ffmpeg;
 use crate::error::GuiError;
 
 /// Render target dimensions. 16:9 at 256×144 keeps the picker
@@ -117,21 +122,52 @@ pub fn cache_path_for(cache_dir: &Path, entry: &WallpaperEntry) -> PathBuf {
     cache_dir.join(shard).join(format!("{key}.png"))
 }
 
-/// Locate the source image for an entry. Returns `None` when the
-/// kind is unsupported in Phase 1 or the conventional source is
-/// absent.
-fn source_for(entry: &WallpaperEntry) -> Option<PathBuf> {
+/// Discriminated union of the three decode paths the thumbnail
+/// pipeline supports. Returning an enum (rather than `Option<PathBuf>`)
+/// lets [`load_thumbnail`] dispatch to the right decoder without
+/// re-inspecting `entry.kind` — each variant already carries the
+/// inputs that decoder needs.
+#[derive(Debug, Clone, PartialEq)]
+enum ThumbSource {
+    /// `WorkshopScene` with a usable `preview.jpg` next to it.
+    /// The bytes are read straight from `path`.
+    WorkshopPreview(PathBuf),
+    /// `LooseImage`: decode `path` directly with the `image` crate.
+    LooseImage(PathBuf),
+    /// `LooseVideo`: shell out to ffmpeg first, decode the resulting
+    /// PNG bytes from stdout.
+    LooseVideo(PathBuf),
+    /// The conventional source is absent (e.g. `preview.jpg`
+    /// missing on a `WorkshopScene`, or a `LooseVideo` while ffmpeg
+    /// isn't installed). Caller renders the title-only fallback.
+    Unavailable,
+}
+
+/// Locate the source image for an entry. Returns `ThumbSource::Unavailable`
+/// when the kind is unsupported or the conventional source is absent.
+///
+/// `LooseVideo` returns `Unavailable` when ffmpeg isn't installed —
+/// the caller's UX is the title-only fallback (Phase 1 behavior)
+/// rather than a noisy banner. A missing ffmpeg is a host-level
+/// configuration gap, not a per-entry fault.
+fn source_for(entry: &WallpaperEntry) -> ThumbSource {
     match entry.kind {
         WallpaperKind::WorkshopScene => {
             let candidate = entry.path.join("preview.jpg");
             if candidate.is_file() {
-                Some(candidate)
+                ThumbSource::WorkshopPreview(candidate)
             } else {
-                None
+                ThumbSource::Unavailable
             }
         }
-        WallpaperKind::LooseImage => Some(entry.path.clone()),
-        WallpaperKind::LooseVideo => None,
+        WallpaperKind::LooseImage => ThumbSource::LooseImage(entry.path.clone()),
+        WallpaperKind::LooseVideo => {
+            if ffmpeg::ffmpeg_available() {
+                ThumbSource::LooseVideo(entry.path.clone())
+            } else {
+                ThumbSource::Unavailable
+            }
+        }
     }
 }
 
@@ -147,14 +183,56 @@ fn source_for(entry: &WallpaperEntry) -> Option<PathBuf> {
 /// on every successful decode — the LRU eviction is a Phase 2
 /// concern (it requires an inventory-level policy that crosses
 /// the cache + the live `Inventory` signal).
+///
+/// ## Dispatch
+///
+/// 1. [`ThumbSource::WorkshopPreview`] and [`ThumbSource::LooseImage`]
+///    decode the file at `path` directly via the `image` crate
+///    inside `spawn_blocking`.
+/// 2. [`ThumbSource::LooseVideo`] awaits
+///    [`ffmpeg::extract_first_frame`] (async subprocess with 8s
+///    timeout) and pipes the PNG bytes through the same decoder
+///    + resize + encode pipeline as the static-image path.
+/// 3. [`ThumbSource::Unavailable`] short-circuits to
+///    `Ok(ThumbnailState::None)`.
 pub async fn load_thumbnail(
     entry: WallpaperEntry,
     cache_dir: PathBuf,
 ) -> Result<ThumbnailState, GuiError> {
-    let Some(src) = source_for(&entry) else {
-        return Ok(ThumbnailState::None);
-    };
-    let dst = cache_path_for(&cache_dir, &entry);
+    match source_for(&entry) {
+        ThumbSource::Unavailable => Ok(ThumbnailState::None),
+        ThumbSource::WorkshopPreview(p) | ThumbSource::LooseImage(p) => {
+            load_static_image_thumbnail(p, cache_dir, &entry).await
+        }
+        ThumbSource::LooseVideo(_) => load_loose_video_thumbnail(&entry, cache_dir).await,
+    }
+}
+
+/// LooseVideo → ffmpeg → PNG bytes → resize + encode + cache.
+async fn load_loose_video_thumbnail(
+    entry: &WallpaperEntry,
+    cache_dir: PathBuf,
+) -> Result<ThumbnailState, GuiError> {
+    let src = entry.path.clone();
+    let png_bytes = ffmpeg::extract_first_frame(&src)
+        .await
+        .map_err(|e| GuiError::Ffmpeg(format!("{} (source: {})", e, src.display())))?;
+    let dst = cache_path_for(&cache_dir, entry);
+    task::spawn_blocking(move || -> Result<ThumbnailState, GuiError> {
+        decode_resize_encode_png(&png_bytes, &dst)
+    })
+    .await
+    .map_err(|join_err| GuiError::Core(format!("spawn_blocking (video thumb): {join_err}")))?
+}
+
+/// Static-image path (WorkshopScene preview.jpg + LooseImage):
+/// read bytes, decode with `image`, resize, re-encode, persist.
+async fn load_static_image_thumbnail(
+    src: PathBuf,
+    cache_dir: PathBuf,
+    entry: &WallpaperEntry,
+) -> Result<ThumbnailState, GuiError> {
+    let dst = cache_path_for(&cache_dir, entry);
     task::spawn_blocking(move || -> Result<ThumbnailState, GuiError> {
         // Ensure cache dir exists. Cache key includes a 2-char shard
         // so mkdir fires once per ~256 entries, not per entry.
@@ -201,6 +279,38 @@ pub async fn load_thumbnail(
     })
     .await
     .map_err(|join_err| GuiError::Core(format!("spawn_blocking (load_thumbnail): {join_err}")))?
+}
+
+/// Decode a PNG byte slice, resize to the canonical thumbnail box,
+/// re-encode, and persist. Used by both the static-image path and
+/// the ffmpeg-video path (which receives PNG bytes from stdout).
+fn decode_resize_encode_png(png_bytes: &[u8], dst: &Path) -> Result<ThumbnailState, GuiError> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| GuiError::Image(format!("create_dir_all({}): {e}", parent.display())))?;
+    }
+    let img = image::ImageReader::new(std::io::Cursor::new(png_bytes))
+        .with_guessed_format()
+        .map_err(|e| GuiError::Image(format!("with_guessed_format: {e}")))?
+        .decode()
+        .map_err(|e| GuiError::Image(format!("decode png from ffmpeg: {e}")))?;
+    let resized = img.resize_exact(
+        THUMB_WIDTH,
+        THUMB_HEIGHT,
+        image::imageops::FilterType::CatmullRom,
+    );
+    let rgba = resized.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let raw: Vec<u8> = rgba.into_raw();
+    let mut png_buf: Vec<u8> = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png_buf);
+    use image::ImageEncoder;
+    encoder
+        .write_image(&raw, w, h, image::ExtendedColorType::Rgba8)
+        .map_err(|e| GuiError::Image(format!("png encode (video thumb): {e}")))?;
+    std::fs::write(dst, &png_buf)
+        .map_err(|e| GuiError::Image(format!("write({}): {e}", dst.display())))?;
+    Ok(ThumbnailState::Ready(png_buf))
 }
 
 /// Try to load the cached PNG without decoding. Used by the
@@ -305,11 +415,11 @@ mod tests {
             title: Some("scene".into()),
             workshop_id: None,
         };
-        assert_eq!(source_for(&entry), Some(preview));
+        assert_eq!(source_for(&entry), ThumbSource::WorkshopPreview(preview));
     }
 
     #[test]
-    fn source_for_workshop_scene_returns_none_without_preview_jpg() {
+    fn source_for_workshop_scene_returns_unavailable_without_preview_jpg() {
         let tmp = tempfile::tempdir().unwrap();
         let scene = tmp.path().join("scene");
         std::fs::create_dir(&scene).unwrap();
@@ -320,7 +430,7 @@ mod tests {
             title: Some("scene".into()),
             workshop_id: None,
         };
-        assert_eq!(source_for(&entry), None);
+        assert_eq!(source_for(&entry), ThumbSource::Unavailable);
     }
 
     #[test]
@@ -334,12 +444,16 @@ mod tests {
         };
         assert_eq!(
             source_for(&entry),
-            Some(PathBuf::from("/tmp/wallpaper.jpg"))
+            ThumbSource::LooseImage(PathBuf::from("/tmp/wallpaper.jpg"))
         );
     }
 
     #[test]
-    fn source_for_loose_video_returns_none() {
+    fn source_for_loose_video_resolves_to_video_or_unavailable() {
+        // Without ffmpeg on PATH the helper falls back to
+        // Unavailable (the Phase 1 behavior). With ffmpeg on PATH
+        // it returns LooseVideo(path). We can't assert the host's
+        // ffmpeg availability, so we just verify the dispatch.
         let entry = WallpaperEntry {
             path: PathBuf::from("/tmp/wallpaper.mp4"),
             mtime: std::time::SystemTime::UNIX_EPOCH,
@@ -347,7 +461,15 @@ mod tests {
             title: None,
             workshop_id: None,
         };
-        assert_eq!(source_for(&entry), None);
+        let result = source_for(&entry);
+        if ffmpeg::ffmpeg_available() {
+            assert_eq!(
+                result,
+                ThumbSource::LooseVideo(PathBuf::from("/tmp/wallpaper.mp4"))
+            );
+        } else {
+            assert_eq!(result, ThumbSource::Unavailable);
+        }
     }
 
     #[test]
@@ -404,19 +526,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_thumbnail_returns_none_for_loose_video() {
+    async fn load_thumbnail_loose_video_path_dispatches_by_ffmpeg_availability() {
+        // Fase 6C.2 split: a LooseVideo entry no longer unconditionally
+        // returns None. The behavior depends on whether `ffmpeg` is
+        // installed on the host:
+        //   - ffmpeg on PATH  → call extract_first_frame(path)
+        //     (path here is a non-existent file, so it must error
+        //     with GuiError::Ffmpeg)
+        //   - ffmpeg missing  → fallback to ThumbnailState::None
+        //     (the Phase 1 behavior)
+        // We assert whichever branch applies so the test passes on
+        // both kinds of hosts.
         let tmp = tempfile::tempdir().unwrap();
         let entry = WallpaperEntry {
-            path: PathBuf::from("/tmp/movie.mp4"),
+            path: PathBuf::from("/tmp/nonexistent-movie.mp4"),
             mtime: std::time::SystemTime::UNIX_EPOCH,
             kind: WallpaperKind::LooseVideo,
             title: None,
             workshop_id: None,
         };
-        let res = load_thumbnail(entry, tmp.path().to_path_buf())
-            .await
-            .unwrap();
-        assert_eq!(res, ThumbnailState::None);
+        let res = load_thumbnail(entry, tmp.path().to_path_buf()).await;
+        if ffmpeg::ffmpeg_available() {
+            // ffmpeg ran (or tried to). The file doesn't exist, so
+            // we expect a GuiError::Ffmpeg error.
+            match res {
+                Err(GuiError::Ffmpeg(msg)) => {
+                    assert!(
+                        msg.contains("/tmp/nonexistent-movie.mp4"),
+                        "ffmpeg error must reference source path, got: {msg}"
+                    );
+                }
+                other => panic!("expected GuiError::Ffmpeg, got {other:?}"),
+            }
+        } else {
+            // ffmpeg missing → Unavailable → ThumbnailState::None.
+            assert_eq!(res.unwrap(), ThumbnailState::None);
+        }
     }
 
     #[tokio::test]

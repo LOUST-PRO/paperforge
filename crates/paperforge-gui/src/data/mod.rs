@@ -17,6 +17,7 @@
 //! here so the UI module can compile against the read-only shape.
 
 pub mod bindings;
+pub mod ffmpeg;
 pub mod inventory;
 pub mod outputs;
 pub mod playlists;

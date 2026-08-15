@@ -45,6 +45,8 @@ pub enum GuiError {
     Core(String),
     /// Thumbnail decode/encode error (image crate).
     Image(String),
+    /// ffmpeg subprocess error (thumbnail extraction for LooseVideo).
+    Ffmpeg(String),
     /// Raw `std::io::Error` wrapped.
     Io(String),
     /// Config file parse / validation error.
@@ -62,6 +64,7 @@ impl GuiError {
             GuiError::DaemonResponse(_) => "daemon",
             GuiError::Core(_) => "core",
             GuiError::Image(_) => "image",
+            GuiError::Ffmpeg(_) => "ffmpeg",
             GuiError::Io(_) => "io",
             GuiError::Config(_) => "config",
             GuiError::Notice(_) => "notice",
@@ -75,9 +78,11 @@ impl GuiError {
         match self {
             GuiError::Notice(_) => Severity::Notice,
             GuiError::Ipc { .. } | GuiError::DaemonResponse(_) => Severity::Error,
-            GuiError::Core(_) | GuiError::Image(_) | GuiError::Io(_) | GuiError::Config(_) => {
-                Severity::Error
-            }
+            GuiError::Core(_)
+            | GuiError::Image(_)
+            | GuiError::Ffmpeg(_)
+            | GuiError::Io(_)
+            | GuiError::Config(_) => Severity::Error,
         }
     }
 
@@ -107,6 +112,7 @@ impl fmt::Display for GuiError {
             GuiError::DaemonResponse(m) => write!(f, "daemon error: {m}"),
             GuiError::Core(m) => write!(f, "core error: {m}"),
             GuiError::Image(m) => write!(f, "image error: {m}"),
+            GuiError::Ffmpeg(m) => write!(f, "ffmpeg error: {m}"),
             GuiError::Io(m) => write!(f, "io error: {m}"),
             GuiError::Config(m) => write!(f, "config error: {m}"),
             GuiError::Notice(m) => write!(f, "{m}"),
@@ -143,6 +149,7 @@ mod tests {
             GuiError::DaemonResponse("x".into()),
             GuiError::Core("x".into()),
             GuiError::Image("x".into()),
+            GuiError::Ffmpeg("x".into()),
             GuiError::Io("x".into()),
             GuiError::Config("x".into()),
             GuiError::Notice("x".into()),
@@ -164,6 +171,7 @@ mod tests {
             GuiError::DaemonResponse("x".into()),
             GuiError::Core("x".into()),
             GuiError::Image("x".into()),
+            GuiError::Ffmpeg("x".into()),
             GuiError::Io("x".into()),
             GuiError::Config("x".into()),
         ];
