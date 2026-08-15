@@ -40,6 +40,7 @@ use crate::ui::inventory_panel::InventoryPanel;
 use crate::ui::picker::Picker;
 use crate::ui::playlist_editor::{DragPayload, OpenEditor, PlaylistEditor};
 use crate::ui::playlists::PlaylistsPanel;
+use crate::ui::settings_panel::SettingsPanel;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::status::StatusBanner;
 use crate::ui::theme::{self, FONT_STACK, PANEL_BORDER};
@@ -97,6 +98,21 @@ pub fn Root() -> Element {
     // `ondragstart` (picker entry or body row), consumed in `ondrop`.
     // The editor reads this signal to render drop-zone highlights.
     let editor_drag: Signal<Option<DragPayload>> = use_signal(|| None);
+    // PR 9.4: extra_sources — paths the operator has added on top of
+    // the auto-detected ones. Initialized from `Config::load` on the
+    // UI thread (the TOML file is tiny — <1 KiB — so no need to
+    // dispatch to `spawn_blocking`).
+    let cache_paths = use_context::<crate::app::AppState>().cache_paths.clone();
+    let cache_paths_for_inventory = cache_paths.clone();
+    let extra_sources: Signal<Vec<PathBuf>> = use_signal(|| {
+        match paperforge_core::config::Config::load(&cache_paths) {
+            Ok(cfg) => cfg.extra_sources,
+            Err(e) => {
+                tracing::warn!(error = %e, "Config::load failed at startup; extra_sources defaults to []");
+                Vec::new()
+            }
+        }
+    });
 
     // ---- Coroutines ----
 
@@ -163,18 +179,30 @@ pub fn Root() -> Element {
     });
 
     // Inventory loop: every 30s, scan detected roots at depth 4.
-    let inventory_roots = use_context::<crate::app::AppState>().inventory_roots();
+    // PR 9.4: also includes `extra_sources` from the Settings panel.
+    let detected_paths = use_context::<crate::app::AppState>().paths.clone();
     let _inventory_loop = use_coroutine(move |_rx: UnboundedReceiver<()>| {
-        let roots = inventory_roots.clone();
+        let detected = detected_paths.clone();
         let mut inventory_sig = inventory;
         let mut error_sig = error;
+        let cache_paths = cache_paths_for_inventory.clone();
         async move {
             let mut ticker = tokio::time::interval(INVENTORY_TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                let (v, err) = data_inventory::refresh_inventory(roots.clone()).await;
+                // Re-read extra_sources from disk each tick so a manual
+                // edit to config.toml is picked up without a restart.
+                let extra = match paperforge_core::config::Config::load(&cache_paths) {
+                    Ok(cfg) => cfg.extra_sources,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Config::load failed inside inventory loop; skipping extra_sources");
+                        Vec::new()
+                    }
+                };
+                let roots = crate::data::settings::merge_inventory_roots(&detected, &extra);
+                let (v, err) = data_inventory::refresh_inventory(roots).await;
                 // PR 6: keep the full WallpaperEntry (title + kind)
                 // so the picker can render labels without re-scanning.
                 inventory_sig.set(v);
@@ -400,6 +428,7 @@ pub fn Root() -> Element {
     let inventory_len = inventory_snapshot.len();
     let picker_target: Option<String> = picker_open_for.cloned();
     let connected: bool = matches!(connection_snapshot, ConnectionStatus::Connected);
+    let extra_sources_snapshot: Vec<PathBuf> = extra_sources.cloned();
 
     let connection_color = match connection_snapshot {
         ConnectionStatus::Connected => theme::connection_color(true),
@@ -565,6 +594,95 @@ pub fn Root() -> Element {
         ))));
     };
 
+    // PR 9.4 — Settings panel callbacks.
+    //
+    // on_add: dedup the new path against the current `extra_sources`,
+    // persist via `data::settings::save_config`, and update the
+    // signal so the inventory scan picks it up on the next tick.
+    // We also kick the signal by replacing it (forces a re-render
+    // even before the next 30s tick lands).
+    let error_for_add = error;
+    let cache_paths_for_add = cache_paths.clone();
+    let extra_sources_for_add = extra_sources;
+    let on_add = move |path: PathBuf| {
+        let mut err = error_for_add;
+        let mut sources = extra_sources_for_add;
+        let cache_paths = cache_paths_for_add.clone();
+        spawn(async move {
+            let cp = cache_paths.clone();
+            let path_clone = path.clone();
+            let save_result = tokio::task::spawn_blocking(move || -> Result<
+                (Vec<PathBuf>, bool),
+                GuiError,
+            > {
+                let mut cfg = paperforge_core::config::Config::load(&cp)
+                    .map_err(|e| GuiError::Config(format!("load: {e}")))?;
+                let added = crate::data::settings::push_extra_source(&mut cfg, path_clone);
+                crate::data::settings::save_config(&cp, &cfg)?;
+                Ok((cfg.extra_sources, added))
+            })
+            .await;
+            match save_result {
+                Ok(Ok((new_sources, true))) => {
+                    sources.set(new_sources);
+                }
+                Ok(Ok((new_sources, false))) => {
+                    // Already present — replace the signal anyway so
+                    // the panel re-renders, but no error.
+                    sources.set(new_sources);
+                    err.set(Some(GuiError::Notice(format!(
+                        "Path already present: {}",
+                        path.display()
+                    ))));
+                }
+                Ok(Err(e)) => err.set(Some(e)),
+                Err(join_err) => err.set(Some(GuiError::Core(format!(
+                    "spawn_blocking (add): {join_err}"
+                )))),
+            }
+        });
+    };
+
+    // on_remove: remove the path from `extra_sources`, persist. The
+    // signal is updated synchronously since the operation is in-memory.
+    let error_for_remove = error;
+    let cache_paths_for_remove = cache_paths.clone();
+    let extra_sources_for_remove = extra_sources;
+    let on_remove = move |path: PathBuf| {
+        let mut err = error_for_remove;
+        let mut sources = extra_sources_for_remove;
+        let cache_paths = cache_paths_for_remove.clone();
+        spawn(async move {
+            let cp = cache_paths.clone();
+            let path_clone = path.clone();
+            let save_result = tokio::task::spawn_blocking(move || -> Result<
+                Vec<PathBuf>,
+                GuiError,
+            > {
+                let mut cfg = paperforge_core::config::Config::load(&cp)
+                    .map_err(|e| GuiError::Config(format!("load: {e}")))?;
+                if !crate::data::settings::remove_extra_source(&mut cfg, &path_clone) {
+                    return Err(GuiError::Core(format!(
+                        "path not present in extra_sources: {}",
+                        path_clone.display()
+                    )));
+                }
+                crate::data::settings::save_config(&cp, &cfg)?;
+                Ok(cfg.extra_sources)
+            })
+            .await;
+            match save_result {
+                Ok(Ok(new_sources)) => {
+                    sources.set(new_sources);
+                }
+                Ok(Err(e)) => err.set(Some(e)),
+                Err(join_err) => err.set(Some(GuiError::Core(format!(
+                    "spawn_blocking (remove): {join_err}"
+                )))),
+            }
+        });
+    };
+
     // ---- Playlist editor callbacks (PR 7) ----
     //
     // on_open_editor: kicks off an async load of the on-disk playlist
@@ -728,6 +846,16 @@ pub fn Root() -> Element {
                 entries: inventory_snapshot.clone(),
                 cache_dir: use_context::<crate::app::AppState>().cache_paths.thumbnails_dir.clone(),
                 on_browse,
+            }
+            // PR 9.4: SettingsPanel — extra_sources editor. Sits
+            // below InventoryPanel because changes here directly
+            // affect what the InventoryPanel will show on the next
+            // 30s tick (or the immediate re-render driven by the
+            // signal update).
+            SettingsPanel {
+                extra_sources: extra_sources_snapshot.clone(),
+                on_add,
+                on_remove,
             }
             // Picker modal (PR 6). Renders only when the operator
             // has clicked Set on some output. Sits at the bottom of

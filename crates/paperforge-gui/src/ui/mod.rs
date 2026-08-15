@@ -12,6 +12,7 @@
 //! - `playlist_editor` — PR 7 (full playlist editor modal)
 //! - `preview` — PR 8 (static `preview.jpg` pane)
 //! - `inventory_panel` — PR 9.3 (always-visible wallpapers browser)
+//! - `settings_panel` — PR 9.4 (edit `Config::extra_sources`)
 //!
 //! Until each PR lands the module may be empty or absent. We
 //! declare them eagerly here so the navigation graph is stable
@@ -26,4 +27,5 @@ pub mod preview;
 pub mod root;
 pub mod sidebar;
 pub mod status;
+pub mod settings_panel;
 pub mod theme;

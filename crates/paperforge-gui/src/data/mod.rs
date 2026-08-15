@@ -21,4 +21,5 @@ pub mod ffmpeg;
 pub mod inventory;
 pub mod outputs;
 pub mod playlists;
+pub mod settings;
 pub mod thumbnails;
