@@ -116,7 +116,11 @@ impl Inventory {
     /// Walks up to `max_depth` levels (default `8` — Workshop folders
     /// rarely nest that deep). Workshop scenes are detected by the
     /// presence of `project.json`; loose media is detected by file
-    /// extension.
+    /// extension. **When a directory is recognized as a Workshop
+    /// scene, the walker skips its subtree** — the scene's internal
+    /// media (`bg.png`, `preview.jpg`, scene sub-folders) belong to
+    /// the scene entry, not as separate `LooseImage` rows. Without
+    /// that skip, one scene produces 5–10 inventory rows.
     pub fn scan(&mut self, root: &Path, max_depth: usize) -> Result<usize> {
         if !root.exists() {
             tracing::debug!("skip non-existent root: {}", root.display());
@@ -125,12 +129,23 @@ impl Inventory {
 
         let mut added = 0usize;
 
-        for entry in WalkDir::new(root)
+        // PR 9.5: we have to drive `WalkDir` manually instead of
+        // `for entry in iter.filter_map(...)` because `skip_current_dir`
+        // is a method on the **iterator** (`WalkDir::IntoIter`), not
+        // on `DirEntry`. The for-loop holds the iterator borrowed
+        // immutably, so we can't call the mutable skip on it. The
+        // docs explicitly call out this ergonomic gap:
+        // https://docs.rs/walkdir/2.5.0/walkdir/struct.IntoIter.html#method.skip_current_dir
+        let mut walker = WalkDir::new(root)
             .max_depth(max_depth)
             .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+            .into_iter();
+        while let Some(entry) = walker.next() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
             let path = entry.path();
             let file_name = match entry.file_name().to_str() {
                 Some(n) => n,
@@ -146,6 +161,18 @@ impl Inventory {
                             added += 1;
                         }
                     }
+                    // PR 9.5 fix: a Workshop scene directory contains
+                    // `project.json` AND the scene's actual media
+                    // (bg.png, scene_*.png, preview.jpg, video files).
+                    // Without `skip_current_dir`, WalkDir descends
+                    // into the scene and the scanner registers each
+                    // internal media file as a separate `LooseImage`
+                    // entry — turning one scene into 5–10 inventory
+                    // rows (the operator's "1 solo scene lo detecta
+                    // como varios" report). Skipping the subtree
+                    // after detecting `project.json` keeps each
+                    // scene as exactly one entry.
+                    walker.skip_current_dir();
                 }
                 continue;
             }
@@ -295,6 +322,78 @@ mod tests {
         assert_eq!(entries[0].kind, WallpaperKind::WorkshopScene);
     }
 
+    /// Regression: a Workshop scene ships internal media (preview.jpg,
+    /// bg.png, scene_*.png, materials/*.jpg). Before task #63 the
+    /// scanner descended into the scene directory and registered each
+    /// of those as a separate `LooseImage` entry, so one scene produced
+    /// 5–10 rows in the inventory. After the fix we call
+    /// `walker.skip_current_dir()` after detecting `project.json`, so
+    /// each scene contributes exactly one row regardless of how many
+    /// internal media files it has.
+    #[test]
+    fn scan_does_not_descend_into_workshop_scene() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scene = tmp.path().join("123456");
+        std::fs::create_dir_all(scene.join("materials")).unwrap();
+        std::fs::write(
+            scene.join("project.json"),
+            r#"{"title":"With Internal Media","type":"scene","id":"123456"}"#,
+        )
+        .unwrap();
+        // Plant a bunch of internal media that would each register as a
+        // LooseImage if the scanner descended into the directory.
+        std::fs::write(scene.join("preview.jpg"), b"fake-jpg").unwrap();
+        std::fs::write(scene.join("bg.png"), b"fake-png").unwrap();
+        std::fs::write(scene.join("scene_0.png"), b"fake-png").unwrap();
+        std::fs::write(scene.join("scene_1.png"), b"fake-png").unwrap();
+        std::fs::write(scene.join("materials/brick.jpg"), b"fake-jpg").unwrap();
+        std::fs::write(scene.join("materials/normal.png"), b"fake-png").unwrap();
+
+        let mut inv = Inventory::new();
+        let n = inv.scan(tmp.path(), 4).unwrap();
+        assert_eq!(n, 1, "scene internal media must not be registered");
+        let entries: Vec<_> = inv.entries().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title.as_deref(), Some("With Internal Media"));
+        assert_eq!(entries[0].kind, WallpaperKind::WorkshopScene);
+        // Sanity: no LooseImage/LooseVideo snuck in.
+        assert!(
+            entries
+                .iter()
+                .all(|e| matches!(e.kind, WallpaperKind::WorkshopScene)),
+            "only WorkshopScene entries should exist"
+        );
+    }
+
+    /// Two scenes in the same root — each must register as exactly one
+    /// entry. This catches the bug where `skip_current_dir` only worked
+    /// for the first hit and let the second scene leak its internals.
+    #[test]
+    fn scan_does_not_descend_into_multiple_workshop_scenes() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (id, title) in [("aaaa", "Alpha"), ("bbbb", "Bravo")] {
+            let scene = tmp.path().join(id);
+            std::fs::create_dir_all(scene.join("materials")).unwrap();
+            std::fs::write(
+                scene.join("project.json"),
+                format!(r#"{{"title":"{title}","type":"scene","id":"{id}"}}"#),
+            )
+            .unwrap();
+            std::fs::write(scene.join("preview.jpg"), b"j").unwrap();
+            std::fs::write(scene.join("bg.png"), b"p").unwrap();
+            std::fs::write(scene.join("materials/x.png"), b"p").unwrap();
+        }
+
+        let mut inv = Inventory::new();
+        let n = inv.scan(tmp.path(), 4).unwrap();
+        assert_eq!(n, 2, "each scene must register once, not 4× each");
+        let entries: Vec<_> = inv.entries().collect();
+        assert_eq!(entries.len(), 2);
+        let titles: Vec<_> = entries.iter().filter_map(|e| e.title.clone()).collect();
+        assert!(titles.contains(&"Alpha".to_string()));
+        assert!(titles.contains(&"Bravo".to_string()));
+    }
+
     #[test]
     fn scan_finds_loose_video() {
         let tmp = tempfile::tempdir().unwrap();
@@ -380,5 +479,64 @@ mod tests {
         let inv = Inventory::new();
         assert!(inv.is_empty());
         assert_eq!(inv.len(), 0);
+    }
+
+    /// Operator smoke test — runs against Lou's real Workshop paths
+    /// when `PAPERFORGE_SCAN_HOME=1` is set. Off by default so CI
+    /// doesn't depend on a particular operator's filesystem. Use:
+    ///
+    /// ```bash
+    /// PAPERFORGE_SCAN_HOME=1 cargo test -p paperforge-core \
+    ///     --lib inventory::tests::scan_operator_home -- --ignored --nocapture
+    /// ```
+    ///
+    /// Before task #63 this reported ~1102 entries (every Workshop
+    /// scene's internal media registered as a separate LooseImage).
+    /// After the fix it should report ~50–100: one row per scene
+    /// plus the loose media under `~/Wallpapers`.
+    #[test]
+    #[ignore]
+    fn scan_operator_home() {
+        if std::env::var("PAPERFORGE_SCAN_HOME").is_err() {
+            eprintln!("PAPERFORGE_SCAN_HOME not set — skipping");
+            return;
+        }
+        use crate::paths::default_paths;
+
+        let paths = default_paths();
+        eprintln!(
+            "Detected workshop roots: {:?}",
+            paths.workshop_roots
+        );
+        eprintln!("Detected local roots:   {:?}", paths.local_roots);
+        let roots: Vec<_> = paths.all().cloned().collect();
+        assert!(!roots.is_empty(), "no source dirs found in $HOME");
+
+        let mut inv = Inventory::new();
+        for root in &roots {
+            let n = inv.scan(root, 4).unwrap_or_else(|e| {
+                panic!("scan failed for {}: {e}", root.display());
+            });
+            eprintln!("  {} → +{} entries", root.display(), n);
+        }
+        eprintln!("Total entries: {}", inv.len());
+        let by_kind = inv.entries().fold([0usize; 3], |mut acc, e| {
+            match e.kind {
+                WallpaperKind::WorkshopScene => acc[0] += 1,
+                WallpaperKind::LooseImage => acc[1] += 1,
+                WallpaperKind::LooseVideo => acc[2] += 1,
+            }
+            acc
+        });
+        eprintln!(
+            "By kind: scene={} loose_image={} loose_video={}",
+            by_kind[0], by_kind[1], by_kind[2]
+        );
+        assert!(
+            inv.len() < 500,
+            "inventory grew beyond expected band (got {}). \
+             Did the skip_current_dir fix regress?",
+            inv.len()
+        );
     }
 }
