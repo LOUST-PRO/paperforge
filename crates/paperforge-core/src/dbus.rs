@@ -34,7 +34,7 @@
 //! - `ListRunning() → a(i)` — return array of `(pid, state)` tuples.
 //! - `ApplyPlaylist(s: name) → ()` — load and apply a named playlist.
 //! - `GetState() → s` — JSON snapshot of the daemon state (backend,
-//!   active playlist, known outputs, etc).
+//!   active playlist, known outputs, pool snapshot).
 //!
 //! # Signals
 //!
@@ -52,6 +52,7 @@
 //! stub. The trait is the public API — zbus is an implementation
 //! detail.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -66,6 +67,13 @@ use crate::{
 /// Snapshot of the daemon's runtime state. Returned by
 /// `GetState` as a JSON string for forward-compatibility (new fields
 /// can be added without breaking existing clients).
+///
+/// The `pool_*` fields are populated when the daemon's backend is
+/// Linux Wallpaper Engine with the v0.2 pool architecture enabled.
+/// For non-LWE backends (swww, hyprpaper, mpvpaper) the pool fields
+/// stay at their defaults (`pool_pid = None`, `pool_bindings = {}`,
+/// `pool_argv = None`) and clients should treat them as "not
+/// applicable" rather than "empty / pool not running".
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonState {
     /// Which backend the daemon is orchestrating.
@@ -78,6 +86,27 @@ pub struct DaemonState {
     pub known_outputs: Vec<String>,
     /// paperforge version.
     pub version: String,
+    /// PID of the v0.2 single-process pool, or `None` when the
+    /// pool isn't running (or the backend isn't LWE). Populated by
+    /// the daemon's `get_state` from `LweSinglePool::current_pid`.
+    /// Added in Task #31 — fixes `paperforge pool status` reporting
+    /// `(none)` when the daemon owns the pool (previously the CLI
+    /// instantiated a fresh in-process pool and reported empty).
+    #[serde(default)]
+    pub pool_pid: Option<i32>,
+    /// `output → content_id` bindings of the v0.2 single-process
+    /// pool. Empty when no pool is running or the backend isn't
+    /// LWE. Populated by the daemon's `get_state` from
+    /// `LweSinglePool::bindings`.
+    #[serde(default)]
+    pub pool_bindings: BTreeMap<String, String>,
+    /// Full argv the pool would respawn with (one entry per flag,
+    /// including the binary path at `[0]`). `None` when the pool
+    /// isn't running. Useful for debugging what `--screen-root` /
+    /// `--bg` pairs are actually passed to LWE without scraping
+    /// `/proc/<pid>/cmdline`.
+    #[serde(default)]
+    pub pool_argv: Option<Vec<String>>,
 }
 
 /// Backend-agnostic control surface that the D-Bus interface adapts.
@@ -729,11 +758,15 @@ mod tests {
             running: vec![(100, BackendState::Running)],
             known_outputs: vec!["DP-1".to_string(), "HDMI-A-1".to_string()],
             version: "0.1.0".to_string(),
+            pool_pid: Some(4242),
+            pool_bindings: BTreeMap::new(),
+            pool_argv: None,
         };
         let j = serde_json::to_string(&s).unwrap();
         assert!(j.contains("\"backend\":\"linux-wallpaper-engine\""));
         assert!(j.contains("\"active_playlist\":\"focus\""));
         assert!(j.contains("\"version\":\"0.1.0\""));
+        assert!(j.contains("\"pool_pid\":4242"));
     }
 
     #[test]
@@ -744,10 +777,34 @@ mod tests {
             running: vec![],
             known_outputs: vec!["eDP-1".to_string()],
             version: "0.1.0".to_string(),
+            pool_pid: None,
+            pool_bindings: BTreeMap::new(),
+            pool_argv: None,
         };
         let j = serde_json::to_string(&s).unwrap();
         let back: DaemonState = serde_json::from_str(&j).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn daemon_state_roundtrip_with_populated_pool() {
+        // The Task #31 fix ships new `pool_*` fields; existing
+        // serializations (without those keys) must still
+        // deserialize thanks to `#[serde(default)]`. This is the
+        // backwards-compat guard for any on-disk snapshot /
+        // cross-version client that doesn't know about the new
+        // fields yet.
+        let legacy = r#"{
+            "backend": "linux-wallpaper-engine",
+            "active_playlist": null,
+            "running": [],
+            "known_outputs": ["DP-1"],
+            "version": "0.1.0"
+        }"#;
+        let parsed: DaemonState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.pool_pid, None);
+        assert!(parsed.pool_bindings.is_empty());
+        assert_eq!(parsed.pool_argv, None);
     }
 
     #[tokio::test]
@@ -792,12 +849,20 @@ mod tests {
                 running: vec![],
                 known_outputs: vec!["DP-1".to_string()],
                 version: "0.1.0".to_string(),
+                pool_pid: None,
+                pool_bindings: BTreeMap::new(),
+                pool_argv: None,
             };
         }
         let ctrl: Arc<dyn PaperforgeControl> = stub.clone();
         let s = ctrl.get_state().await.unwrap();
         assert_eq!(s.active_playlist.as_deref(), Some("default"));
         assert_eq!(s.known_outputs, vec!["DP-1".to_string()]);
+        // Task #31 — stub doesn't know about pool state; defaults
+        // must be populated rather than missing.
+        assert_eq!(s.pool_pid, None);
+        assert!(s.pool_bindings.is_empty());
+        assert_eq!(s.pool_argv, None);
     }
 
     /// Verify the zbus interface compiles + the type is constructible.

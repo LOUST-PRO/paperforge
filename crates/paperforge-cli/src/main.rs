@@ -588,11 +588,32 @@ async fn main() -> anyhow::Result<()> {
                     );
                     return Ok(());
                 }
+                // Task #31 — prefer the daemon's view over an
+                // in-process pool. Before this fix, the CLI
+                // instantiated a fresh `LweSinglePool` from the
+                // config, which always reported empty bindings
+                // even when the daemon owned a 3-output pool
+                // (because the daemon's pool lives in a different
+                // process). Now we D-Bus-first, falling back to
+                // the local pool only when no daemon is reachable
+                // — that fallback preserves the historical
+                // behaviour for operators who run `paperforge pool
+                // status` without a daemon to dry-check the argv
+                // they'd actually launch.
+                if let Some(state) = pool_status_via_dbus().await {
+                    print_pool_status_from_state(&state);
+                    return Ok(());
+                }
+                tracing::debug!(
+                    target: "paperforge",
+                    "pool status: daemon unreachable, falling back to in-process pool"
+                );
                 let pool = backend.pool();
                 let pid = pool.current_pid().await;
                 let bindings = pool.bindings().await;
                 let argv = pool.current_argv().await;
                 println!("pool_enabled: true");
+                println!("(local in-process pool — daemon unreachable; bindings/argv reflect what this CLI process would spawn, not what the daemon owns)");
                 match pid {
                     Some(p) => println!("current pid: {p}"),
                     None => println!("current pid: (none — pool not running)"),
@@ -1424,6 +1445,331 @@ async fn daemon_set_default_wallpaper(scene_path: &str) -> anyhow::Result<bool> 
 /// Forward `paperforge playlist apply <name>` to the daemon.
 async fn daemon_apply_playlist(name: &str) -> anyhow::Result<bool> {
     gdbus_call("org.louzt.Paperforge1.ApplyPlaylist", &[name]).await
+}
+
+/// Task #31 — fetch the daemon's [`DaemonState`] snapshot via D-Bus
+/// and return only the pool-related fields. Returns `None` when no
+/// daemon is on the session bus (caller should fall back to the
+/// local in-process pool).
+///
+/// We invoke `gdbus` rather than the zbus Rust client because the
+/// CLI is hermetic — only the daemon process links zbus. This is
+/// the same rationale as [`list_via_dbus`]: keeps the CLI from
+/// dragging zbus into its build graph and avoids duplicate
+/// connection setup just for one read.
+///
+/// Output format from `gdbus call` for a method that returns a
+/// single string `s`:
+/// ```text
+/// (  "<escaped JSON>",)
+/// ```
+/// Where `<escaped JSON>` has its inner `"` backslash-escaped by
+/// gdbus's printer. We unescape that layer, then let serde_json
+/// parse the real JSON.
+async fn pool_status_via_dbus() -> Option<paperforge_core::dbus::DaemonState> {
+    let raw = gdbus_call_capture("org.louzt.Paperforge1.GetState", &[])
+        .await
+        .ok()
+        .flatten()?;
+    let json = unescape_gvariant_string(&raw);
+    match serde_json::from_str::<paperforge_core::dbus::DaemonState>(&json) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(
+                target: "paperforge",
+                "pool status via D-Bus: DaemonState parse failed: {e}; \
+                 raw gdbus output: {raw:?}"
+            );
+            None
+        }
+    }
+}
+
+/// Print the pool portion of a daemon-owned [`DaemonState`] snapshot.
+/// Shared by the D-Bus path (Task #31) and any future caller that
+/// already has a `DaemonState` in hand (e.g. the GUI's bindings
+/// panel). Non-pool fields are intentionally not printed here —
+/// `paperforge pool status` is scoped to pool introspection.
+fn print_pool_status_from_state(state: &paperforge_core::dbus::DaemonState) {
+    println!("pool_enabled: true");
+    println!("(via daemon — bindings/argv reflect what `paperforge daemon` owns)");
+    match state.pool_pid {
+        Some(p) => println!("current pid: {p}"),
+        None => println!("current pid: (none — pool not running)"),
+    }
+    if state.pool_bindings.is_empty() {
+        println!("bindings: (none)");
+    } else {
+        println!("bindings ({}):", state.pool_bindings.len());
+        // BTreeMap iter is sorted by key — deterministic output,
+        // matches the local-pool path's `backend.pool().bindings()`
+        // ordering.
+        for (out, content_id) in &state.pool_bindings {
+            println!("  {out}\t{content_id}");
+        }
+    }
+    match &state.pool_argv {
+        Some(args) => {
+            println!("argv ({} tokens):", args.len());
+            for (i, tok) in args.iter().enumerate() {
+                println!("  [{i}] {tok}");
+            }
+        }
+        None => println!("argv: (none — pool not running)"),
+    }
+}
+
+/// Strip the gdbus GVariant outer wrapper and unescape the inner
+/// string so it can be passed to serde_json.
+///
+/// `gdbus call` for a method returning a single string `s` prints
+/// (verified live 2026-08-15 against `gdbus call --session
+/// --dest org.louzt.Paperforge1 --object-path /org/louzt/Paperforge1
+/// --method org.louzt.Paperforge1.GetState`):
+///
+/// ```text
+/// (  '<escaped JSON>',)
+/// ```
+///
+/// Note the SINGLE-quote outer delimiter — gdbus uses `'` (not
+/// `"`) to delimit strings in its text format. Inside the JSON,
+/// every `"` is backslash-escaped to `\"`, and every `\` is
+/// escaped to `\\`. We walk the string respecting the `\` escape
+/// so the trailing `',)` (GVariant tuple close) doesn't get eaten
+/// by an over-eager outer-quote strip.
+///
+/// If the input doesn't have a `('...',)` shape we return it
+/// verbatim — serde_json will then fail with a precise error and
+/// the operator sees the raw gdbus output in the warn log, which
+/// is strictly more debuggable than silently mangling the wire
+/// format.
+fn unescape_gvariant_string(raw: &str) -> String {
+    // Find the opening `'` of the string literal (skip past the
+    // GVariant tuple `(` and any whitespace).
+    let bytes = raw.as_bytes();
+    let Some(open_idx) = bytes.iter().position(|&b| b == b'\'') else {
+        return raw.to_string();
+    };
+    // Walk forward from `open_idx + 1`, tracking the `\` escape,
+    // until we find the matching closing `'`.
+    let after_open = &raw[open_idx + 1..];
+    let mut close_rel = None;
+    let mut in_escape = false;
+    for (i, c) in after_open.char_indices() {
+        if in_escape {
+            in_escape = false;
+            continue;
+        }
+        match c {
+            '\\' => in_escape = true,
+            '\'' => {
+                close_rel = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(close_idx) = close_rel else {
+        // Unterminated string — return verbatim, let serde_json
+        // produce a useful parse error.
+        return raw.to_string();
+    };
+    let escaped = &after_open[..close_idx];
+    let mut out = String::with_capacity(escaped.len());
+    let mut chars = escaped.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    // Unknown escape — keep both chars verbatim
+                    // so the original payload survives.
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => {
+                    // Trailing lone backslash — keep verbatim.
+                    out.push('\\');
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Same as [`gdbus_call`] but returns the raw stdout from `gdbus`
+/// so callers can parse the GVariant body themselves. Used by
+/// [`pool_status_via_dbus`] to fetch the daemon's `DaemonState`
+/// JSON snapshot — [`gdbus_call`] discards stdout by design (it
+/// only needs the Ok/Err signal for fire-and-forget writes).
+///
+/// Same return contract as [`gdbus_call`]: `Ok(Some(stdout))` on
+/// success, `Ok(None)` when the daemon is unreachable, `Err` on
+/// hard failure.
+async fn gdbus_call_capture(method: &str, args: &[&str]) -> anyhow::Result<Option<String>> {
+    let mut cmd_args: Vec<String> = vec![
+        "call".into(),
+        "--session".into(),
+        "--dest".into(),
+        "org.louzt.Paperforge".into(),
+        "--object-path".into(),
+        "/org/louzt/Paperforge".into(),
+        "--method".into(),
+        method.into(),
+    ];
+    for a in args {
+        cmd_args.push(a.to_string());
+    }
+    // 5s timeout mirrors `gdbus_call` so a hung daemon doesn't
+    // hold the CLI runtime open. We capture stdout (stderr
+    // stays /dev/null — it's only diagnostics).
+    let call_fut = tokio::process::Command::new("gdbus")
+        .args(&cmd_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let out = match tokio::time::timeout(Duration::from_secs(5), call_fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => {
+            tracing::debug!(
+                target: "paperforge",
+                "gdbus_call_capture({method}) timed out after 5s; treating as unreachable"
+            );
+            return Ok(None);
+        }
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lowered = stderr.to_lowercase();
+        if lowered.contains("can't find")
+            || lowered.contains("cannot find")
+            || lowered.contains("not found")
+            || lowered.contains("no such")
+            || lowered.contains("no connection")
+            || lowered.contains("service unknown")
+        {
+            return Ok(None);
+        }
+        anyhow::bail!("gdbus_call_capture {method} failed: {}", stderr.trim());
+    }
+    Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+#[cfg(test)]
+mod pool_status_tests {
+    use super::*;
+    use paperforge_core::backend::BackendKind;
+    use paperforge_core::dbus::DaemonState;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn unescape_strips_gvariant_outer_wrapper() {
+        // Real gdbus wire format: single quotes delimit the outer
+        // string, the inner JSON's `"` are escaped to `\"`, and
+        // the tuple closes with `',)`.
+        let raw = r#"(  '{\"backend\":\"linux-wallpaper-engine\"}',)"#;
+        let unescaped = unescape_gvariant_string(raw);
+        // After unescaping, the inner JSON should be parseable.
+        let parsed: serde_json::Value = serde_json::from_str(&unescaped).unwrap();
+        assert_eq!(
+            parsed.get("backend").and_then(|v| v.as_str()),
+            Some("linux-wallpaper-engine")
+        );
+    }
+
+    #[test]
+    fn unescape_handles_no_string_at_all() {
+        // If the input has no `'` characters at all, the parser
+        // returns it verbatim (no string to unescape).
+        let raw = "(not a gdbus body)";
+        assert_eq!(unescape_gvariant_string(raw), raw);
+    }
+
+    #[test]
+    fn unescape_handles_trailing_backslash_in_payload() {
+        // Real wire format: outer single quotes. The payload
+        // contains `abc\\` (literal `abc` + two backslashes)
+        // which after find-first-quote + walk-respect-escapes
+        // becomes the single `\` via the `\\` → `\` rule.
+        let raw = r#"(  'abc\\',)"#;
+        let unescaped = unescape_gvariant_string(raw);
+        assert_eq!(unescaped, r"abc\");
+    }
+
+    #[test]
+    fn unescape_handles_unterminated_string_gracefully() {
+        // If gdbus somehow emits a string that doesn't close,
+        // we want the raw payload through (serde_json will
+        // produce a useful parse error) rather than panicking.
+        let raw = "(  'oops";
+        assert_eq!(unescape_gvariant_string(raw), raw);
+    }
+
+    #[test]
+    fn unescape_handles_real_gdbus_daemon_state_payload() {
+        // Captured live from the running daemon 2026-08-15:
+        // the wire format includes a fully nested JSON string
+        // with array values, escaped quotes throughout, and a
+        // running PID tuple. This is the regression test that
+        // catches "wrong delimiter" bugs (the previous version
+        // used `"` and stripped the JSON apart at its first
+        // inner quote).
+        let raw = r#"(  '{"backend":"linux-wallpaper-engine","active_playlist":null,"running":[[961660,"running"]],"known_outputs":[],"version":"0.1.0"}',)"#;
+        let unescaped = unescape_gvariant_string(raw);
+        let parsed: serde_json::Value = serde_json::from_str(&unescaped).unwrap();
+        assert_eq!(
+            parsed.get("backend").and_then(|v| v.as_str()),
+            Some("linux-wallpaper-engine")
+        );
+        assert_eq!(
+            parsed.get("version").and_then(|v| v.as_str()),
+            Some("0.1.0")
+        );
+        let running = parsed.get("running").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(running.len(), 1);
+    }
+
+    #[test]
+    fn print_pool_status_from_state_deterministic_ordering() {
+        // `pool_bindings` is a BTreeMap so iteration order is
+        // stable; the printer relies on that to give
+        // reproducible output across calls. We verify the order
+        // here rather than asserting exact stdout formatting
+        // (which would be brittle).
+        let mut b = BTreeMap::new();
+        b.insert("DP-1".to_string(), "111".to_string());
+        b.insert("HDMI-A-1".to_string(), "222".to_string());
+        b.insert("eDP-1".to_string(), "333".to_string());
+        let state = DaemonState {
+            backend: BackendKind::LinuxWallpaperEngine,
+            active_playlist: None,
+            running: vec![],
+            known_outputs: vec![],
+            version: "0.1.0".into(),
+            pool_pid: Some(1234),
+            pool_bindings: b,
+            pool_argv: Some(vec![
+                "linux-wallpaperengine".into(),
+                "--screen-root".into(),
+                "DP-1".into(),
+                "--bg".into(),
+                "111".into(),
+            ]),
+        };
+        let ordered: Vec<(&String, &String)> = state.pool_bindings.iter().collect();
+        assert_eq!(ordered[0].0, "DP-1");
+        assert_eq!(ordered[1].0, "HDMI-A-1");
+        assert_eq!(ordered[2].0, "eDP-1");
+        // Smoke: print doesn't panic (we don't capture stdout).
+        print_pool_status_from_state(&state);
+    }
 }
 
 /// Which `paperforge governor` subcommand was selected.

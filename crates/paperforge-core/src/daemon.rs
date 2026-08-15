@@ -27,6 +27,7 @@
 //! Tests inject a stub [`BackendOps`]; production code wires the
 //! real [`LweBackendOps`].
 
+use std::collections::BTreeMap;
 use std::{path::PathBuf, sync::Arc};
 
 use chrono::Utc;
@@ -896,12 +897,35 @@ impl PaperforgeControl for PaperforgeDaemon {
 
     async fn get_state(&self) -> Result<DaemonState> {
         let running = self.backend.list().await?;
+        // Snapshot the v0.2 single-process pool when the backend is
+        // LWE (Task #31). `pool_pid`/`pool_bindings`/`pool_argv`
+        // land on the wire in the JSON snapshot so CLI / GUI can
+        // report the *daemon-owned* pool state instead of
+        // instantiating their own in-process pool (which is always
+        // empty — the cause of the `paperforge pool status` stale
+        // read bug fixed by this change). Non-LWE backends leave
+        // the pool fields at defaults — clients treat that as
+        // "not applicable" rather than "pool not running".
+        let (pool_pid, pool_bindings, pool_argv) = match self.backend_as_lwe() {
+            Some(lwe_ops) if lwe_ops.use_pool() => {
+                let pool = lwe_ops.backend().pool();
+                (
+                    pool.current_pid().await,
+                    pool.bindings().await,
+                    pool.current_argv().await,
+                )
+            }
+            _ => (None, BTreeMap::new(), None),
+        };
         Ok(DaemonState {
             backend: self.backend.kind(),
             active_playlist: self.active_playlist.read().await.clone(),
             running,
             known_outputs: self.known_outputs.read().await.clone(),
             version: self.version.clone(),
+            pool_pid,
+            pool_bindings,
+            pool_argv,
         })
     }
 
@@ -1089,6 +1113,45 @@ mod tests {
         assert_eq!(s.backend, BackendKind::SwwwDaemon);
         assert!(s.active_playlist.is_none());
         assert!(s.running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_get_state_pool_defaults_for_non_lwe_backend() {
+        // Task #31 — non-LWE backends leave the pool_* fields at
+        // their defaults so the CLI / GUI treat them as "not
+        // applicable" rather than "empty / pool not running".
+        let backend = Arc::new(FakeBackend::new(BackendKind::SwwwDaemon));
+        let (_tmp, daemon, _rx) = fresh_daemon(&backend);
+        let s = daemon.get_state().await.unwrap();
+        assert_eq!(s.pool_pid, None);
+        assert!(s.pool_bindings.is_empty());
+        assert_eq!(s.pool_argv, None);
+    }
+
+    #[tokio::test]
+    async fn daemon_get_state_pool_empty_for_lwe_pool_not_yet_started() {
+        // When the daemon IS LWE-backed but the pool hasn't
+        // spawned an LWE yet (e.g. operator hasn't run `set`),
+        // the pool snapshot is still empty. This is the same
+        // observable state as "no LWE backend" — the difference
+        // is that pool fields WILL populate once a wallpaper
+        // is set (covered by the integration smoke test, not
+        // here — constructing a real `LweBackendOps` requires
+        // the LWE binary on PATH).
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PlaylistStore::new(tmp.path()).unwrap();
+        let lwe_ops = Arc::new(LweBackendOps::with_pool(true));
+        let backend_dyn: Arc<dyn BackendOps> = lwe_ops.clone();
+        let (daemon, _rx) = PaperforgeDaemon::with_lwe_backend_ops_and_store(
+            backend_dyn,
+            lwe_ops,
+            Arc::new(RwLock::new(store)),
+        );
+        let s = daemon.get_state().await.unwrap();
+        assert_eq!(s.backend, BackendKind::LinuxWallpaperEngine);
+        assert_eq!(s.pool_pid, None, "pool has no LWE child yet");
+        assert!(s.pool_bindings.is_empty());
+        assert_eq!(s.pool_argv, None);
     }
 
     #[tokio::test]
