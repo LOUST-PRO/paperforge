@@ -35,8 +35,11 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::{
     audio::{AudioCommand, LweAudioController},
-    backend::{BackendKind, BackendState, LweBackend, PoolHealth, SwwwBackend, WallpaperBackend},
-    dbus::{DaemonState, PaperforgeControl},
+    backend::{
+        pid_state_quick, BackendKind, BackendState, LweBackend, PoolHealth, SwwwBackend,
+        WallpaperBackend,
+    },
+    dbus::{AggregateHealth, DaemonState, HealthSnapshot, PaperforgeControl, PerOutputHealth},
     error::{Error, Result},
     hotplug::HotplugEvent,
     playlist::PlaylistStore,
@@ -63,6 +66,16 @@ pub trait BackendOps: Send + Sync {
         );
         self.set(output, scene).await?;
         Ok(0)
+    }
+    /// Like [`Self::set_with_pid`] but lets the caller tag the
+    /// resulting pool-level transition timing log with an `op`
+    /// label (e.g. `"playlist_apply"`). Default impl ignores `op`
+    /// and delegates to [`Self::set_with_pid`] — non-pool backends
+    /// have no log field to populate. LWE's [`LweBackendOps`]
+    /// overrides this to thread `op` through to `pool.bind_with_op`.
+    async fn set_with_pid_op(&self, output: &str, scene: &str, op: &'static str) -> Result<i32> {
+        let _ = op;
+        self.set_with_pid(output, scene).await
     }
     /// Pause all running instances. Returns count of PIDs signaled.
     async fn pause(&self) -> Result<usize>;
@@ -179,6 +192,19 @@ impl LweBackendOps {
     pub fn set_active_fps(&self, fps: u32) {
         if self.use_pool {
             self.backend.pool().set_active_fps(fps);
+        }
+    }
+
+    /// Override the transition grace window (ms) used by
+    /// `bind()` between spawning the new LWE and killing the old.
+    /// No-op for the per-output path (the v0.1 legacy spawn does
+    /// not have a spawn-first-kill-after flow). Defaults to the
+    /// pool's 2000 ms; production callers should thread
+    /// `Config.transition_grace_ms` through here so operator
+    /// overrides take effect.
+    pub fn set_transition_grace_ms(&self, ms: u64) {
+        if self.use_pool {
+            self.backend.pool().set_transition_grace_ms(ms);
         }
     }
 
@@ -353,6 +379,30 @@ impl BackendOps for LweBackendOps {
         }
     }
 
+    async fn set_with_pid_op(&self, output: &str, scene: &str, op: &'static str) -> Result<i32> {
+        // Pool path: thread `op` through to the pool's
+        // `bind_scene_with_op` so the structured transition timing
+        // log line carries the caller's tag (e.g. `"playlist_apply"`
+        // from `apply_playlist`). Per-output path bypasses the pool
+        // so `op` is logged as informational only — there's no
+        // shared log field to populate there.
+        let path = std::path::Path::new(scene);
+        if self.use_pool {
+            self.backend
+                .pool()
+                .bind_scene_with_op(output, path, op)
+                .await
+        } else {
+            tracing::debug!(
+                backend = ?self.kind(),
+                op = op,
+                output = output,
+                "per-output set ignores op (no pool log line to tag)"
+            );
+            self.backend.set_per_output(path, output).await
+        }
+    }
+
     async fn pause(&self) -> Result<usize> {
         self.backend.pause().await
     }
@@ -446,6 +496,30 @@ pub struct PaperforgeDaemon {
     /// mutate it from a different tokio task.
     metrics: Arc<RwLock<crate::metrics::MetricsCollector>>,
     version: String,
+    /// Instant at which this daemon was constructed. Used by
+    /// [`get_health`](Self::get_health) to compute `uptime_secs`.
+    /// `Instant` (monotonic) rather than wallclock so a system
+    /// clock jump doesn't make the reported uptime negative or
+    /// regress.
+    daemon_started_at: std::time::Instant,
+    /// Per-output wallclock timestamp (ISO 8601 / RFC 3339) of the
+    /// last successful `set_wallpaper`. Populated by
+    /// `set_wallpaper` after the bind completes successfully. Read
+    /// by `get_health`.
+    per_output_last_set_at: Arc<RwLock<BTreeMap<String, chrono::DateTime<Utc>>>>,
+    /// Per-output last-transition duration in milliseconds.
+    /// Recorded by `set_wallpaper` from the elapsed time between
+    /// the start of the operation and a successful bind.
+    per_output_last_transition_ms: Arc<RwLock<BTreeMap<String, u64>>>,
+    /// Wallclock of the last successful `set_wallpaper` on any
+    /// output. Used by `get_health` to populate
+    /// [`AggregateHealth::last_set_total_ms`].
+    last_set_total_at: Arc<RwLock<Option<chrono::DateTime<Utc>>>>,
+    /// Duration of the last successful `set_wallpaper` in
+    /// milliseconds. Used by `get_health` to populate
+    /// [`AggregateHealth::last_set_total_ms`] (the
+    /// UNIX-epoch-millis timestamp of the same instant).
+    last_transition_ms_total: Arc<RwLock<Option<u64>>>,
 }
 
 impl PaperforgeDaemon {
@@ -494,6 +568,11 @@ impl PaperforgeDaemon {
             event_tx,
             metrics: Arc::new(RwLock::new(crate::metrics::MetricsCollector::new())),
             version: crate::VERSION.to_string(),
+            daemon_started_at: std::time::Instant::now(),
+            per_output_last_set_at: Arc::new(RwLock::new(BTreeMap::new())),
+            per_output_last_transition_ms: Arc::new(RwLock::new(BTreeMap::new())),
+            last_set_total_at: Arc::new(RwLock::new(None)),
+            last_transition_ms_total: Arc::new(RwLock::new(None)),
         });
         (daemon, event_rx)
     }
@@ -549,6 +628,11 @@ impl PaperforgeDaemon {
             event_tx,
             metrics: Arc::new(RwLock::new(crate::metrics::MetricsCollector::new())),
             version: crate::VERSION.to_string(),
+            daemon_started_at: std::time::Instant::now(),
+            per_output_last_set_at: Arc::new(RwLock::new(BTreeMap::new())),
+            per_output_last_transition_ms: Arc::new(RwLock::new(BTreeMap::new())),
+            last_set_total_at: Arc::new(RwLock::new(None)),
+            last_transition_ms_total: Arc::new(RwLock::new(None)),
         });
         (daemon, event_rx)
     }
@@ -802,12 +886,28 @@ impl PaperforgeControl for PaperforgeDaemon {
         // of `set_with_pid` for the pool architecture, but we route
         // through `set_with_pid` so the pid is propagated through the
         // same code path regardless of pool_enabled.
+        //
+        // Time the operation so `get_health` can report
+        // per-output + aggregate last-transition timings.
+        let start = std::time::Instant::now();
         let pid = self.backend.set_with_pid(output, scene_path).await?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let at = Utc::now();
+        self.per_output_last_set_at
+            .write()
+            .await
+            .insert(output.to_string(), at);
+        self.per_output_last_transition_ms
+            .write()
+            .await
+            .insert(output.to_string(), elapsed_ms);
+        *self.last_set_total_at.write().await = Some(at);
+        *self.last_transition_ms_total.write().await = Some(elapsed_ms);
         let _ = self.emit(DaemonEvent::WallpaperStarted {
             output: output.to_string(),
             scene_path: scene_path.to_string(),
             pid,
-            at: Utc::now(),
+            at,
         });
         Ok(())
     }
@@ -889,7 +989,12 @@ impl PaperforgeControl for PaperforgeDaemon {
         let n = pl.wallpapers.len().max(1);
         for (i, output) in outputs.iter().enumerate() {
             let scene = pl.wallpapers[i % n].to_string_lossy().to_string();
-            backend.set(output, &scene).await?;
+            // Tag each set with `op = "playlist_apply"` so the
+            // pool's structured transition timing log can be grepped
+            // separately from user-facing sets (default `op = "set"`).
+            backend
+                .set_with_pid_op(output, &scene, "playlist_apply")
+                .await?;
         }
         *self.active_playlist.write().await = Some(name.to_string());
         Ok(())
@@ -967,6 +1072,83 @@ impl PaperforgeControl for PaperforgeDaemon {
         let snaps = collector.history(n as usize);
         serde_json::to_string(&snaps)
             .map_err(|e| Error::Other(anyhow::anyhow!("metrics history: serialize: {e}")))
+    }
+
+    /// Build a [`HealthSnapshot`] from the live backend state.
+    ///
+    /// Per-output section: walks [`LweBackend::per_output_pids`]
+    /// (the per-output pid map, populated by `set_per_output` for
+    /// the v0.1 legacy path AND by the pool's `bind_with_op`
+    /// path's `sync_pid_map_from_pool` so both architectures end
+    /// up in the same map). For each entry, runs
+    /// [`pid_state_quick`] against `/proc/<pid>/status` and
+    /// looks up the last-set timing in the daemon's in-memory
+    /// history. Empty for fresh daemons or non-LWE backends
+    /// (swww/hyprpaper/mpvpaper don't surface per-output pids).
+    ///
+    /// Aggregate section: pool's `current_pid` + `bindings()`
+    /// (mirrors the snapshot in `get_state`), daemon uptime from
+    /// the `daemon_started_at` `Instant`, and the
+    /// `last_set_total_ms` UNIX-epoch timestamp.
+    async fn get_health(&self) -> Result<HealthSnapshot> {
+        // Snapshot the relevant state. We collect per-output inside
+        // the LWE-only branch so the rest of the function can
+        // delegate without further trait dispatch.
+        let mut per_output: BTreeMap<String, PerOutputHealth> = BTreeMap::new();
+        if let Some(lwe_ops) = self.backend_as_lwe() {
+            let backend = lwe_ops.backend();
+            // Clone the per-output pid state into a local so we
+            // drop the lock before issuing the per-pid /proc reads
+            // (which can take a few ms each on a busy system).
+            let pids_snapshot = backend.per_output_pids_snapshot().await;
+            let last_set_map = self.per_output_last_set_at.read().await;
+            let last_trans_map = self.per_output_last_transition_ms.read().await;
+            for (output, pid) in pids_snapshot {
+                let pid_state = match pid_state_quick(pid) {
+                    Ok(BackendState::Running) => "Running",
+                    Ok(BackendState::Paused) => "Paused",
+                    Ok(BackendState::NotRunning) => "Dead",
+                    Err(_) => "Unknown",
+                }
+                .to_string();
+                per_output.insert(
+                    output.clone(),
+                    PerOutputHealth {
+                        lwe_pid: Some(pid),
+                        pid_state,
+                        last_set_at: last_set_map.get(&output).map(|t| t.to_rfc3339()),
+                        last_transition_ms: last_trans_map.get(&output).copied(),
+                    },
+                );
+            }
+        }
+
+        // Aggregate pool state. Non-LWE backends fall through to
+        // the default `(None, empty map)` so the GUI sees a
+        // well-formed snapshot.
+        let (current_pid, pool_bindings) = match self.backend_as_lwe() {
+            Some(lwe_ops) if lwe_ops.use_pool() => {
+                let pool = lwe_ops.backend().pool();
+                (pool.current_pid().await, pool.bindings().await)
+            }
+            _ => (None, BTreeMap::new()),
+        };
+        let uptime_secs = self.daemon_started_at.elapsed().as_secs();
+        let last_set_total_ms = self
+            .last_set_total_at
+            .read()
+            .await
+            .as_ref()
+            .map(|t| t.timestamp_millis().max(0) as u64);
+        Ok(HealthSnapshot {
+            per_output,
+            aggregate: AggregateHealth {
+                current_pid,
+                pool_bindings,
+                uptime_secs,
+                last_set_total_ms,
+            },
+        })
     }
 }
 
@@ -1152,6 +1334,132 @@ mod tests {
         assert_eq!(s.pool_pid, None, "pool has no LWE child yet");
         assert!(s.pool_bindings.is_empty());
         assert_eq!(s.pool_argv, None);
+    }
+
+    /// `get_health` for a fresh non-LWE daemon returns an empty
+    /// snapshot with `current_pid = None`, no last-set timing, and
+    /// an uptime below 5 seconds.
+    #[tokio::test]
+    async fn daemon_get_health_empty_for_fresh_non_lwe_daemon() {
+        let backend = Arc::new(FakeBackend::new(BackendKind::SwwwDaemon));
+        let (_tmp, daemon, _rx) = fresh_daemon(&backend);
+        let h = daemon.get_health().await.unwrap();
+        assert!(
+            h.per_output.is_empty(),
+            "non-LWE backend has no per-output section"
+        );
+        assert_eq!(h.aggregate.current_pid, None);
+        assert!(h.aggregate.pool_bindings.is_empty());
+        assert!(
+            h.aggregate.uptime_secs < 5,
+            "fresh daemon's uptime must be < 5s, got {}",
+            h.aggregate.uptime_secs
+        );
+        assert_eq!(h.aggregate.last_set_total_ms, None);
+    }
+
+    /// `get_health` for a fresh LWE-backed daemon that hasn't bound
+    /// anything yet: per-output is empty, pool empty, uptime small.
+    /// This mirrors `daemon_get_state_pool_empty_for_lwe_pool_not_yet_started`
+    /// but for the new health surface.
+    #[tokio::test]
+    async fn daemon_get_health_empty_for_fresh_lwe_daemon() {
+        let lwe_ops = Arc::new(LweBackendOps::with_pool(true));
+        let backend_dyn: Arc<dyn BackendOps> = lwe_ops.clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PlaylistStore::new(tmp.path()).unwrap();
+        let (daemon, _rx) = PaperforgeDaemon::with_lwe_backend_ops_and_store(
+            backend_dyn,
+            lwe_ops,
+            Arc::new(RwLock::new(store)),
+        );
+        let h = daemon.get_health().await.unwrap();
+        assert!(h.per_output.is_empty());
+        assert_eq!(h.aggregate.current_pid, None);
+        assert!(h.aggregate.pool_bindings.is_empty());
+        assert!(h.aggregate.uptime_secs < 5);
+        assert_eq!(h.aggregate.last_set_total_ms, None);
+    }
+
+    /// After `set_wallpaper` succeeds, `get_health` reports the
+    /// spawned pid in `per_output` and records the timestamp +
+    /// transition duration in both per-output and aggregate.
+    /// Uses the `/bin/sleep` wrapper pattern (no real LWE needed).
+    #[tokio::test]
+    async fn daemon_get_health_reflects_bound_outputs() {
+        let wrapper = std::env::temp_dir().join("paperforge-health-test-binary.sh");
+        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let lwe_ops = Arc::new(LweBackendOps::with_binary_and_pool(&wrapper, false));
+        let backend_dyn: Arc<dyn BackendOps> = lwe_ops.clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PlaylistStore::new(tmp.path()).unwrap();
+        let (daemon, _rx) = PaperforgeDaemon::with_lwe_backend_ops_and_store(
+            backend_dyn,
+            lwe_ops.clone(),
+            Arc::new(RwLock::new(store)),
+        );
+
+        // Use a Workshop-shaped path so the legacy per-output
+        // spawn path's parser accepts it. Per-output mode is
+        // bypassed by the binary (sleeps forever) so we get a
+        // real pid back.
+        let scene = tmp.path().join("workshop/content/431960/847261582");
+        std::fs::create_dir_all(scene.parent().unwrap()).unwrap();
+        std::fs::write(&scene, b"fake scene").unwrap();
+
+        daemon
+            .set_wallpaper("DP-1", scene.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let h = daemon.get_health().await.unwrap();
+        let dp1 = h
+            .per_output
+            .get("DP-1")
+            .expect("DP-1 must appear in per_output");
+        assert!(
+            dp1.lwe_pid.is_some(),
+            "lwe_pid must be Some after successful set"
+        );
+        let pid = dp1.lwe_pid.unwrap();
+        assert!(pid > 0, "real pid, got {pid}");
+        assert_eq!(
+            dp1.pid_state, "Running",
+            "fresh spawn must report Running; got {dp1:?}"
+        );
+        assert!(
+            dp1.last_set_at.is_some(),
+            "last_set_at must be populated after a set"
+        );
+        assert!(
+            dp1.last_transition_ms.is_some(),
+            "last_transition_ms must be populated after a set"
+        );
+        assert!(
+            h.aggregate.last_set_total_ms.is_some(),
+            "aggregate last_set_total_ms must be populated"
+        );
+        assert!(
+            h.aggregate.uptime_secs < 5,
+            "fresh daemon uptime must be < 5s"
+        );
+
+        // Per-output (non-LWE pool) doesn't populate
+        // pool_bindings, so aggregate should stay empty.
+        assert!(h.aggregate.pool_bindings.is_empty());
+
+        // Cleanup.
+        let _ = std::process::Command::new("/bin/kill")
+            .arg(pid.to_string())
+            .output();
+        let _ = lwe_ops.backend().outputs_with_pids().await;
+        let _ = std::fs::remove_file(&wrapper);
     }
 
     #[tokio::test]

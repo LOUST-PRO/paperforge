@@ -18,10 +18,11 @@
 //! isolation.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -33,6 +34,73 @@ use crate::{
     error::{Error, Result},
     pool::LweSinglePool,
 };
+
+/// Per-key rate limiter for `tracing::warn!` emissions.
+///
+/// Some operational WARNs (e.g. "no scene recorded for output X",
+/// "fullscreen ON on X: kill_per_output was a no-op") fire on a
+/// 20-30 minute cadence from the daemon's polling loops even when
+/// state has not changed. Emitting a fresh WARN every tick clutters
+/// `journalctl -u paperforge` and makes it hard to spot real
+/// anomalies.
+///
+/// This limiter suppresses repeats: the first WARN for a key in a
+/// given cooldown window passes through; subsequent WARNs with the
+/// same key inside the window are dropped (callers should demote
+/// them to `tracing::debug!`). After the cooldown elapses, the next
+/// WARN passes through again.
+///
+/// [`Self::clear_for_output`] is the escape hatch: when the
+/// underlying state actually changes for an output (e.g. a fresh
+/// bind succeeds), call it so the next WARN for that output
+/// passes through immediately instead of waiting out the cooldown.
+#[derive(Debug, Default)]
+pub struct WarnRateLimiter {
+    /// Map: `"output:warn_key"` → `Instant` of the last WARN emitted.
+    last_warn: HashMap<String, Instant>,
+    /// Cooldown window. WARN identical to the last one inside this
+    /// duration is suppressed.
+    cooldown: Duration,
+}
+
+impl WarnRateLimiter {
+    /// Construct with the given cooldown window (default in
+    /// production: 5 minutes; tests use 300s as the canonical
+    /// representation).
+    pub fn new(cooldown: Duration) -> Self {
+        Self {
+            last_warn: HashMap::new(),
+            cooldown,
+        }
+    }
+
+    /// Returns `true` if a WARN for `key` should be emitted (and
+    /// records it as the most-recent WARN for `key`), `false` if it
+    /// should be suppressed because a previous WARN with the same
+    /// key was emitted inside the cooldown window.
+    pub fn should_emit(&mut self, key: &str) -> bool {
+        let now = Instant::now();
+        match self.last_warn.get(key) {
+            Some(t) if now.duration_since(*t) < self.cooldown => false,
+            _ => {
+                self.last_warn.insert(key.to_string(), now);
+                true
+            }
+        }
+    }
+
+    /// Clear all keys that belong to `output` so the next WARN for
+    /// this output passes through immediately.
+    ///
+    /// Callers should invoke this after a successful bind
+    /// (`set_per_output_with_fps` or `bind_external_pid`) so that a
+    /// later "no scene recorded" WARN for the same output isn't
+    /// masked by the previous WARN that fired before the bind.
+    pub fn clear_for_output(&mut self, output: &str) {
+        let prefix = format!("{output}:");
+        self.last_warn.retain(|k, _| !k.starts_with(&prefix));
+    }
+}
 
 /// Identifier for a single LWE subprocess from the perspective of a
 /// pipe-drain task. Wrapped in a newtype so the call sites are
@@ -253,6 +321,11 @@ pub struct LweBackend {
     /// Reading tasks are stored as `(stdout_handle, stderr_handle)`
     /// per pid. Both are aborted together on child cleanup.
     pipe_drainers: Arc<Mutex<BTreeMap<i32, LwePipeDrainers>>>,
+    /// Rate limiter for repetitive operational WARNs. See
+    /// [`WarnRateLimiter`] for the rationale. 5-minute cooldown
+    /// matches the operator's complaint about WARNs every
+    /// 20-30 minutes (≈half the cooldown).
+    warn_limiter: Arc<Mutex<WarnRateLimiter>>,
 }
 
 /// Per-LWE-process pipe drainer pair. Type alias to keep the
@@ -417,6 +490,7 @@ impl LweBackend {
             per_output_scenes: Arc::new(Mutex::new(BTreeMap::new())),
             soft_pause_cancel: Arc::new(tokio::sync::Notify::new()),
             pipe_drainers: Arc::new(Mutex::new(BTreeMap::new())),
+            warn_limiter: Arc::new(Mutex::new(WarnRateLimiter::new(Duration::from_secs(300)))),
         }
     }
 
@@ -434,6 +508,7 @@ impl LweBackend {
             per_output_scenes: Arc::new(Mutex::new(BTreeMap::new())),
             soft_pause_cancel: Arc::new(tokio::sync::Notify::new()),
             pipe_drainers: Arc::new(Mutex::new(BTreeMap::new())),
+            warn_limiter: Arc::new(Mutex::new(WarnRateLimiter::new(Duration::from_secs(300)))),
         }
     }
 
@@ -450,6 +525,7 @@ impl LweBackend {
             per_output_scenes: Arc::new(Mutex::new(BTreeMap::new())),
             soft_pause_cancel: Arc::new(tokio::sync::Notify::new()),
             pipe_drainers: Arc::new(Mutex::new(BTreeMap::new())),
+            warn_limiter: Arc::new(Mutex::new(WarnRateLimiter::new(Duration::from_secs(300)))),
         }
     }
 
@@ -465,11 +541,31 @@ impl LweBackend {
         &self.per_output_pids
     }
 
+    /// Snapshot the per-output `(output, pid)` map. Used by
+    /// [`crate::daemon::PaperforgeDaemon::get_health`] to expose
+    /// per-output PIDs over D-Bus without forcing callers to take
+    /// the internal lock directly. Returns the `(output, pid)`
+    /// pairs with the per-output `BTreeMap`'s natural ordering.
+    pub async fn per_output_pids_snapshot(&self) -> Vec<(String, i32)> {
+        let guard = self.per_output_pids.lock().await;
+        guard.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
     /// Reference to the underlying multi-output pool. Used by the
     /// daemon layer when it wants to spawn or signal directly without
     /// going through the `WallpaperBackend` trait shim.
     pub fn pool(&self) -> &LweSinglePool {
         &self.pool
+    }
+
+    /// Accessor for the WARN-rate limiter. Used by the CLI's
+    /// fullscreen dispatcher (and any other long-running caller that
+    /// wants to apply the same 5-minute cooldown to its own
+    /// repetitive WARNs) so it can share a single cooldown window
+    /// with the backend's resume_per_output_specific emission. Cloning
+    /// the `Arc` is cheap; the limiter's internal state is shared.
+    pub fn warn_limiter(&self) -> Arc<Mutex<WarnRateLimiter>> {
+        Arc::clone(&self.warn_limiter)
     }
 
     /// Snapshot the LWE pool's process state for the daemon's reconciler.
@@ -524,6 +620,7 @@ impl LweBackend {
             per_output_scenes: self.per_output_scenes,
             soft_pause_cancel: self.soft_pause_cancel,
             pipe_drainers: self.pipe_drainers,
+            warn_limiter: self.warn_limiter,
         }
     }
 
@@ -531,6 +628,50 @@ impl LweBackend {
     /// because SIGUSR1/SIGUSR2 are tied to LWE).
     pub fn audio(&self) -> LweAudioController {
         LweAudioController::new(self.clone())
+    }
+
+    /// Sync the per-output pid/scene maps from the pool's current state.
+    ///
+    /// Called after every successful [`LweSinglePool::bind`] so the
+    /// legacy per-output maps (`per_output_pids` / `per_output_scenes`)
+    /// — which `kill_per_output` and `resume_per_output_specific`
+    /// consult — stay consistent with the pool as the single source
+    /// of truth. Without this sync, outputs that share a merged-LWE
+    /// process with the bind target would have no entry in
+    /// `per_output_pids`, and `kill_per_output` would silently
+    /// no-op for them (the CLI fullscreen dispatcher reports that
+    /// condition every ~30 s when fullscreen is on).
+    ///
+    /// For each output the pool currently tracks, we record the
+    /// pool's `current_pid` so `kill_per_output` finds the real
+    /// merged-LWE pid for every output. For `per_output_scenes`,
+    /// we only set the entry for `bind_output` — the pool only
+    /// stores `content_id`s, not scene paths, so the other
+    /// outputs' scenes are not knowable from the pool alone.
+    /// Leaving those empty is the correct behaviour:
+    /// `resume_per_output_specific` will fail with "no scene
+    /// recorded" for them, which is a genuine lack-of-information
+    /// rather than a stale-sync bug.
+    ///
+    /// Returns early (without touching either map) if the pool is
+    /// empty.
+    pub async fn sync_pid_map_from_pool(&self, bind_output: &str, scene: &Path) {
+        let Some(current_pid) = self.pool.current_pid().await else {
+            return; // pool empty: nothing to sync
+        };
+        let pool_bindings = self.pool.bindings().await;
+        let mut pids = self.per_output_pids.lock().await;
+        let mut scenes = self.per_output_scenes.lock().await;
+        for output in pool_bindings.keys() {
+            pids.insert(output.clone(), current_pid);
+        }
+        scenes.insert(bind_output.to_string(), scene.to_path_buf());
+        tracing::debug!(
+            target: "paperforge",
+            "synced per-output pid/scenes from pool: pool_pid={} outputs={:?}",
+            current_pid,
+            pool_bindings.keys().collect::<Vec<_>>()
+        );
     }
 
     /// Per-output spawn (v0.1 legacy path). Spawns a fresh LWE
@@ -559,6 +700,71 @@ impl LweBackend {
     pub async fn set_per_output(&self, scene: &Path, output: &str) -> Result<i32> {
         let fps = self.pool.active_fps();
         self.set_per_output_with_fps(scene, output, fps).await
+    }
+
+    /// Like [`Self::set`] but tags the pool's transition timing log
+    /// with the caller-provided `op` (e.g. `"playlist_apply"`). The
+    /// log line shape is identical — only the `op=` field differs —
+    /// so operators can grep `journalctl -u paperforge.service |
+    /// grep 'transition:'` and filter by op to separate user-facing
+    /// sets from playlist-driven ones.
+    ///
+    /// Inherent on `LweBackend` rather than on the `WallpaperBackend`
+    /// trait because the other backends (swww, hyprpaper, mpvpaper)
+    /// have no pool-side log line to tag — they'd have to ignore
+    /// `op` anyway, which is the default `set()` behaviour.
+    pub async fn set_with_op(
+        &self,
+        scene: &Path,
+        output: Option<&str>,
+        op: &'static str,
+    ) -> Result<()> {
+        if !scene.exists() {
+            return Err(Error::BackendUnreachable {
+                kind: self.kind().process_pattern().to_string(),
+                message: format!("scene path does not exist: {}", scene.display()),
+            });
+        }
+
+        // Translate the Workshop scene path to a numeric content_id.
+        // Falling back to the basename (numeric leaf) like LWE does
+        // internally is no longer wired here — the pool only knows
+        // Workshop scenes, matching the project's scope.
+        let content_id = workshop_content_id(scene).ok_or_else(|| Error::BackendFailure {
+            kind: self.kind().process_pattern().to_string(),
+            message: format!(
+                "scene path {} is not a Steam Workshop scene \
+                     (expected `workshop/content/<appid>/<numeric>`)",
+                scene.display()
+            ),
+        })?;
+
+        let out = output.ok_or_else(|| Error::BackendFailure {
+            kind: self.kind().process_pattern().to_string(),
+            message: "no --output specified (pool backend requires explicit output)".to_string(),
+        })?;
+
+        // The pool handles hot-swap: idempotent rebinds do nothing,
+        // new outputs trigger a single respawn with merged argv.
+        // Thread `op` through so the structured timing log in the
+        // pool carries the caller's tag (default "set", or e.g.
+        // "playlist_apply" when invoked from `apply_playlist`).
+        let pid = self.pool.bind_with_op(out, &content_id, op).await?;
+
+        // Sync the legacy per-output maps so `kill_per_output` /
+        // `resume_per_output_specific` find a real pid for every
+        // output the pool now owns (not just `out` — outputs that
+        // were bound on earlier `set` calls share the same merged
+        // LWE process and need their pid entries populated too).
+        self.sync_pid_map_from_pool(out, scene).await;
+
+        tracing::info!(
+            "pool bind: output={} scene={} pid={}",
+            out,
+            scene.display(),
+            pid,
+        );
+        Ok(())
     }
 
     /// Same as [`Self::set_per_output`] but with an explicit FPS
@@ -718,6 +924,17 @@ impl LweBackend {
         pids.insert(output.to_string(), pid);
         let mut scenes = self.per_output_scenes.lock().await;
         scenes.insert(output.to_string(), scene.to_path_buf());
+        // Successful bind: clear any pending rate-limited WARN
+        // entries for this output so a future "no scene recorded"
+        // (e.g. on a hot-unplug + re-bind) starts with a clean
+        // cooldown rather than waiting out stale entries from a
+        // previous lifecycle.
+        drop(pids);
+        drop(scenes);
+        {
+            let mut limiter = self.warn_limiter.lock().await;
+            limiter.clear_for_output(output);
+        }
         Ok(pid)
     }
 
@@ -1068,6 +1285,15 @@ impl LweBackend {
         let mut scenes = self.per_output_scenes.lock().await;
         pids.insert(output.to_string(), pid);
         scenes.insert(output.to_string(), scene.to_path_buf());
+        // Drop the per-output pid/scene locks before clearing the
+        // warn-limiter so we don't hold 2 mutexes at once. The warn
+        // limiter's cooldown is per-key, so dropping here is safe.
+        drop(pids);
+        drop(scenes);
+        {
+            let mut limiter = self.warn_limiter.lock().await;
+            limiter.clear_for_output(output);
+        }
         tracing::info!(
             target: "paperforge",
             "bind_external_pid: output={} pid={} scene={} adopted",
@@ -1091,6 +1317,30 @@ impl LweBackend {
             scenes.get(output).cloned()
         };
         let Some(scene) = scene else {
+            // Rate-limited WARN: the fullscreen dispatcher polls every
+            // ~30s, and the no-scene-yet condition is true for the
+            // entire window between "daemon started" and "operator's
+            // first bind". Emitting a fresh WARN every poll would
+            // flood journalctl. Suppress duplicates within the 5-min
+            // cooldown; re-emit after the window so a long-running
+            // operator-visible condition is still surfaced.
+            let key = format!("{output}:no_scene_recorded");
+            let should_warn = {
+                let mut limiter = self.warn_limiter.lock().await;
+                limiter.should_emit(&key)
+            };
+            if should_warn {
+                tracing::warn!(
+                    target: "paperforge",
+                    "resume_per_output_specific({output}): no scene recorded; \
+                     was a wallpaper ever bound to this output?"
+                );
+            } else {
+                tracing::debug!(
+                    target: "paperforge",
+                    "resume_per_output_specific({output}): no scene recorded (suppressed by warn-rate-limiter)"
+                );
+            }
             return Err(Error::BackendFailure {
                 kind: self.kind().process_pattern().to_string(),
                 message: format!(
@@ -1397,6 +1647,13 @@ impl WallpaperBackend for LweBackend {
         // new outputs trigger a single respawn with merged argv.
         let pid = self.pool.bind(out, &content_id).await?;
 
+        // Sync the legacy per-output maps so `kill_per_output` /
+        // `resume_per_output_specific` find a real pid for every
+        // output the pool now owns (not just `out` — outputs that
+        // were bound on earlier `set` calls share the same merged
+        // LWE process and need their pid entries populated too).
+        self.sync_pid_map_from_pool(out, scene).await;
+
         tracing::info!(
             "pool bind: output={} scene={} pid={}",
             out,
@@ -1448,10 +1705,16 @@ impl WallpaperBackend for LweBackend {
 /// - `BackendState::Paused` if the kernel reports `T (stopped)` —
 ///   typical after the caller sent SIGSTOP via the nix syscall.
 /// - `BackendState::Running` if the kernel reports any of `R (running)`,
-///   `S (sleeping)`, `D (disk sleep)`, `Z (zombie)`, `I (idle)`. We
-///   treat all of these as "alive, not paused".
+///   `S (sleeping)`, `D (disk sleep)`, `I (idle)`. We treat all of
+///   these as "alive, not paused".
 /// - `BackendState::NotRunning` if `/proc/<pid>/status` doesn't exist
-///   (process exited, or never existed).
+///   (process exited, or never existed) OR the kernel reports
+///   `Z (zombie)`. A zombie has finished executing — its task_struct
+///   is just waiting for the parent to `wait()`. From the daemon's
+///   perspective it is dead: it can't render frames, it can't respond
+///   to signals, it can't do anything. Treating it as `Running`
+///   would make `bind()`'s spawn-first-kill-after abort path miss
+///   the case where the new LWE crashed during the grace window.
 ///
 /// Errors only on actual I/O failures (permissions, transient FS
 /// issues). Most call sites should treat `NotRunning` as the signal
@@ -1477,15 +1740,15 @@ pub(crate) fn pid_state_quick(pid: i32) -> Result<BackendState> {
             if rest.contains('T') {
                 return Ok(BackendState::Paused);
             }
-            if rest.contains('R')
-                || rest.contains('S')
-                || rest.contains('D')
-                || rest.contains('I')
-                || rest.contains('Z')
+            if rest.contains('R') || rest.contains('S') || rest.contains('D') || rest.contains('I')
             {
                 return Ok(BackendState::Running);
             }
-            // Unknown state letter — fall through to NotRunning.
+            // Unknown state letter, or Z (zombie) — fall through to
+            // NotRunning. The wrapper script case (exits 1 within the
+            // grace window) lands here as a zombie: parent hasn't
+            // reaped yet, but the process has finished executing and
+            // is functionally dead.
             return Ok(BackendState::NotRunning);
         }
     }
@@ -2005,6 +2268,94 @@ async fn send_mpv_ipc(socket: &std::path::Path, command: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// First call to `should_emit` for a given key returns true and
+    /// records the timestamp. Subsequent identical calls within the
+    /// cooldown window return false. Different keys are
+    /// independent (the limiter's state is per-key, not global).
+    #[test]
+    fn warn_rate_limiter_suppresses_repeats() {
+        let mut limiter = WarnRateLimiter::new(Duration::from_secs(300));
+        assert!(
+            limiter.should_emit("DP-1:no_scene_recorded"),
+            "first call for a key must emit"
+        );
+        assert!(
+            !limiter.should_emit("DP-1:no_scene_recorded"),
+            "immediate repeat must be suppressed"
+        );
+        assert!(
+            !limiter.should_emit("DP-1:no_scene_recorded"),
+            "further repeats stay suppressed"
+        );
+        assert!(
+            limiter.should_emit("HDMI-A-1:no_scene_recorded"),
+            "different output is a different key — emit"
+        );
+    }
+
+    /// `clear_for_output` removes all keys that share the
+    /// `"{output}:"` prefix so the next WARN for that output passes
+    /// through immediately. Other outputs are untouched.
+    #[test]
+    fn warn_rate_limiter_clear_for_output() {
+        let mut limiter = WarnRateLimiter::new(Duration::from_secs(300));
+        assert!(limiter.should_emit("DP-1:no_scene_recorded"));
+        assert!(limiter.should_emit("DP-1:fullscreen_no_op"));
+        assert!(limiter.should_emit("HDMI-A-1:no_scene_recorded"));
+        limiter.clear_for_output("DP-1");
+        // DP-1 keys are gone — next call emits again.
+        assert!(
+            limiter.should_emit("DP-1:no_scene_recorded"),
+            "after clear_for_output, the next WARN passes through"
+        );
+        // HDMI-A-1 is independent — still suppressed.
+        assert!(
+            !limiter.should_emit("HDMI-A-1:no_scene_recorded"),
+            "clear_for_output(DP-1) must not touch other outputs"
+        );
+    }
+
+    /// `should_emit` returns true again once the cooldown has
+    /// elapsed. We use a 1ms cooldown so the test runs without
+    /// `tokio::time::sleep` (which would require a runtime).
+    #[test]
+    fn warn_rate_limiter_reemits_after_cooldown() {
+        let mut limiter = WarnRateLimiter::new(Duration::from_millis(1));
+        assert!(limiter.should_emit("DP-1:no_scene_recorded"));
+        assert!(!limiter.should_emit("DP-1:no_scene_recorded"));
+        // Sleep past the cooldown (1ms + safety margin for scheduler
+        // granularity). 25ms is enough on every reasonable system.
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(
+            limiter.should_emit("DP-1:no_scene_recorded"),
+            "after cooldown elapses, the next WARN must pass through again"
+        );
+    }
+
+    /// `LweBackend::warn_limiter()` returns a clone of the same
+    /// `Arc<Mutex<_>>`, so external callers (e.g. the CLI's
+    /// fullscreen dispatcher) share the cooldown window with the
+    /// backend's own emissions.
+    #[tokio::test]
+    async fn lwe_backend_warn_limiter_accessor_shares_state() {
+        let backend = LweBackend::new();
+        let limiter_clone = backend.warn_limiter();
+        // Drive the backend's own limiter to "emit" a key, then
+        // verify the external clone sees the same state.
+        {
+            let mut inner = limiter_clone.lock().await;
+            assert!(inner.should_emit("DP-1:fullscreen_no_op"));
+        }
+        // The backend's internal limiter should observe the same
+        // "already emitted" state.
+        let backend_inner = backend.warn_limiter();
+        let mut inner = backend_inner.lock().await;
+        assert!(
+            !inner.should_emit("DP-1:fullscreen_no_op"),
+            "shared Arc: external clone and backend see the same cooldown state"
+        );
+    }
+
     #[test]
     fn workshop_content_id_extracts_from_steam_layout() {
         // The canonical Steam Workshop layout:
@@ -2203,6 +2554,153 @@ mod tests {
         // Cleanup.
         backend.pool().shutdown().await.unwrap();
         let _ = std::fs::remove_file(&wrapper);
+    }
+
+    /// `LweBackend::set` (pool path) must populate `per_output_pids`
+    /// for **every** output currently bound in the pool, not just the
+    /// bind target. Outputs that share a merged-LWE process need their
+    /// pid entries so `kill_per_output` and `resume_per_output_specific`
+    /// find something to signal — without this sync, the fullscreen
+    /// dispatcher's `kill_per_output` silently no-ops for non-target
+    /// outputs and emits a WARN every ~30 s. See `sync_pid_map_from_pool`
+    /// for the rationale.
+    #[tokio::test]
+    async fn set_populates_per_output_pids_for_all_pool_outputs() {
+        // Wrapper that swallows the LWE-style argv and just sleeps —
+        // matches the pattern in `lwe_backend_set_via_pool_uses_single_process`.
+        let wrapper = std::env::temp_dir().join("paperforge-sync-pid-map-binary.sh");
+        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let backend = LweBackend::with_binary(&wrapper).with_empty_pool_flags();
+
+        // Build three Workshop-shaped paths on disk so the
+        // workshop_content_id check (which inspects the trailing
+        // components) passes. Each path's leaf is the numeric id.
+        let tmp = tempfile::tempdir().unwrap();
+        let scenes: Vec<std::path::PathBuf> = ["111", "222", "333"]
+            .iter()
+            .map(|id| {
+                let p = tmp
+                    .path()
+                    .join(format!("fake/workshop/content/431960/{id}"));
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, b"fake scene").unwrap();
+                p
+            })
+            .collect();
+
+        // Step 1: bind DP-1 directly via the pool (low-level) — this
+        // simulates a previous daemon state where the pool already
+        // owned an HDMI-A-1 binding before we got control. We need
+        // to populate the pool with two outputs *before* testing
+        // `set()` to verify the helper syncs both, not just the new
+        // bind target.
+        backend
+            .pool()
+            .bind("HDMI-A-1", "222")
+            .await
+            .expect("first pool bind");
+
+        // Step 2: call `LweBackend::set` for a different output.
+        // The helper should now sync pids for BOTH outputs (because
+        // the pool's `bindings()` returns {"HDMI-A-1": "222",
+        // "DP-1": "111"}) and record DP-1's scene.
+        backend
+            .set(&scenes[0], Some("DP-1"))
+            .await
+            .expect("LweBackend::set for DP-1");
+
+        let pool_pid = backend
+            .pool()
+            .current_pid()
+            .await
+            .expect("pool must own a pid after set");
+        let pool_bindings = backend.pool().bindings().await;
+        assert_eq!(
+            pool_bindings.len(),
+            2,
+            "pool should track both outputs (HDMI-A-1 pre-existing + DP-1 from set)"
+        );
+        assert!(pool_bindings.contains_key("DP-1"));
+        assert!(pool_bindings.contains_key("HDMI-A-1"));
+
+        // Crucial assertions: BOTH outputs have a recorded pid in the
+        // per_output_pids map, and that pid is the pool's pid (the
+        // merged-LWE pid).
+        let pids = backend.per_output_pids_test_accessor().lock().await;
+        assert_eq!(
+            pids.get("DP-1"),
+            Some(&pool_pid),
+            "DP-1 must be in per_output_pids with the pool pid"
+        );
+        assert_eq!(
+            pids.get("HDMI-A-1"),
+            Some(&pool_pid),
+            "HDMI-A-1 must be in per_output_pids with the pool pid (shared LWE process)"
+        );
+        assert_eq!(
+            pids.get("DP-1"),
+            pids.get("HDMI-A-1"),
+            "shared-LWE outputs must share the same pid"
+        );
+        drop(pids);
+
+        // per_output_scenes should have DP-1 (the bind target) but
+        // NOT HDMI-A-1 (the pool only knows content_ids, never the
+        // scene_path the operator passed earlier — we don't have that
+        // information here). Leaving HDMI-A-1 empty is intentional:
+        // `resume_per_output_specific` will surface a real "no scene
+        // recorded" warning for it, which is the correct outcome.
+        let scenes_map = backend.per_output_scenes.lock().await;
+        assert_eq!(
+            scenes_map.get("DP-1"),
+            Some(&scenes[0]),
+            "DP-1 must record the scene the caller passed to set()"
+        );
+        assert!(
+            scenes_map.get("HDMI-A-1").is_none(),
+            "HDMI-A-1 should not be set: we never had its scene path"
+        );
+        drop(scenes_map);
+
+        // Cleanup.
+        backend.pool().shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&wrapper);
+    }
+
+    /// `sync_pid_map_from_pool` is a no-op when the pool has no PID
+    /// (i.e. `current_pid()` returns None). Must not panic on the
+    /// empty map case — the maps stay empty, no spurious entries.
+    #[tokio::test]
+    async fn sync_pid_map_from_pool_is_noop_when_pool_empty() {
+        let backend = LweBackend::with_binary("/bin/sleep");
+        // Don't bind anything; pool is empty by construction.
+
+        // Call the helper directly with a stand-in scene path.
+        backend
+            .sync_pid_map_from_pool(
+                "DP-1",
+                std::path::Path::new("/tmp/workshop/content/431960/111"),
+            )
+            .await;
+
+        // Both maps remain empty.
+        let pids = backend.per_output_pids_test_accessor().lock().await;
+        assert!(
+            pids.is_empty(),
+            "per_output_pids must remain empty when pool is empty"
+        );
+        drop(pids);
+        let scenes_map = backend.per_output_scenes.lock().await;
+        assert!(
+            scenes_map.is_empty(),
+            "per_output_scenes must remain empty when pool is empty"
+        );
     }
 
     #[test]

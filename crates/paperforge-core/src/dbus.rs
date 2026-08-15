@@ -35,6 +35,9 @@
 //! - `ApplyPlaylist(s: name) → ()` — load and apply a named playlist.
 //! - `GetState() → s` — JSON snapshot of the daemon state (backend,
 //!   active playlist, known outputs, pool snapshot).
+//! - `GetHealth() → s` — JSON-encoded [`HealthSnapshot`] for the GUI
+//!   or external tooling (per-output PIDs + state, aggregate
+//!   uptime + last-set timing, pool bindings).
 //!
 //! # Signals
 //!
@@ -109,6 +112,71 @@ pub struct DaemonState {
     pub pool_argv: Option<Vec<String>>,
 }
 
+/// Per-output daemon health snapshot returned by [`PaperforgeControl::get_health`].
+///
+/// Serialized via serde for D-Bus (the `GetHealth()` method returns
+/// the JSON-encoded snapshot, parallel to `GetState()`). The struct
+/// is `pub` so the GUI crate can `use paperforge_core::dbus::HealthSnapshot`
+/// directly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthSnapshot {
+    /// Per-output health. Key = output name (e.g. `"DP-1"`).
+    ///
+    /// Empty for fresh daemons or non-LWE backends (the per-output
+    /// map is LWE-only; swww/hyprpaper/mpvpaper report everything
+    /// via the aggregate section instead).
+    pub per_output: BTreeMap<String, PerOutputHealth>,
+
+    /// Aggregate daemon state.
+    pub aggregate: AggregateHealth,
+}
+
+/// Per-output daemon health (one entry per Wayland output that has
+/// ever been bound in this daemon session).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PerOutputHealth {
+    /// PID of the LWE process rendering this output. `None` if no
+    /// wallpaper is bound or the daemon doesn't know the pid (e.g.
+    /// after a stale pid was reaped; the entry stays so the GUI can
+    /// show "daemon knew this output but lost the pid" rather than
+    /// dropping it silently).
+    pub lwe_pid: Option<i32>,
+    /// Backend state for the pid as a string. One of `"Running"`,
+    /// `"Paused"`, `"Dead"`, `"Unknown"`. String (not enum) to
+    /// avoid a serde ↔ zbus type adapter.
+    pub pid_state: String,
+    /// ISO 8601 / RFC 3339 timestamp of the last successful bind on
+    /// this output. `None` if the entry exists only because of a
+    /// reaped pid and the daemon never recorded a successful bind
+    /// (rare; defensive default for `per_output_pids` populated by
+    /// `bind_external_pid`).
+    pub last_set_at: Option<String>,
+    /// How long the last transition took in milliseconds. `None`
+    /// when no successful `set` has completed yet for this output
+    /// in this daemon session.
+    pub last_transition_ms: Option<u64>,
+}
+
+/// Aggregate daemon health (one per `HealthSnapshot`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AggregateHealth {
+    /// Current pool PID (single-LWE multi-output) or `None` when
+    /// no pool is running, the backend isn't LWE, or the pool
+    /// hasn't spawned a child yet.
+    pub current_pid: Option<i32>,
+    /// Pool bindings (output → workshop content_id). Empty when no
+    /// pool is running or the backend isn't LWE.
+    pub pool_bindings: BTreeMap<String, String>,
+    /// Daemon uptime in seconds since the `PaperforgeDaemon` was
+    /// constructed (the moment this struct's underlying `Instant`
+    /// was captured).
+    pub uptime_secs: u64,
+    /// UNIX epoch milliseconds of the last successful `set_wallpaper`
+    /// on any output. `None` if the daemon hasn't completed a bind
+    /// yet.
+    pub last_set_total_ms: Option<u64>,
+}
+
 /// Backend-agnostic control surface that the D-Bus interface adapts.
 ///
 /// All methods are async (the daemon runs on tokio). Implementations
@@ -170,6 +238,19 @@ pub trait PaperforgeControl: Send + Sync {
     async fn get_metrics_history(&self, _n: u32) -> Result<String> {
         Err(Error::Other(anyhow::anyhow!(
             "metrics history: not supported by this control impl"
+        )))
+    }
+
+    /// Return a structured [`HealthSnapshot`] (per-output PIDs +
+    /// state, aggregate uptime + last-set timing).
+    ///
+    /// Default impl returns `Err(NotSupported)` so existing stubs
+    /// compile without having to wire health. Production
+    /// `LweDaemonControl` overrides this to read from the live
+    /// backend state.
+    async fn get_health(&self) -> Result<HealthSnapshot> {
+        Err(Error::Other(anyhow::anyhow!(
+            "health: not supported by this control impl"
         )))
     }
 }
@@ -312,6 +393,18 @@ impl PaperforgeInterface {
             .get_metrics_history(n)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
+    }
+
+    /// Return the JSON-encoded [`HealthSnapshot`] for the daemon.
+    /// Wraps the trait's `get_health` result the same way `GetState`
+    /// does.
+    async fn get_health(&self) -> zbus::fdo::Result<String> {
+        let snap = self
+            .ctrl
+            .get_health()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))?;
+        serde_json::to_string(&snap).map_err(|e| zbus::fdo::Error::Failed(format!("{e}")))
     }
 
     /// Signal: a wallpaper instance just started rendering on `output`
@@ -486,6 +579,31 @@ impl PaperforgeClient {
             .map_err(|e| Error::Other(anyhow::anyhow!("D-Bus GetState body: {e}")))?;
         serde_json::from_str(&raw)
             .map_err(|e| Error::Other(anyhow::anyhow!("DaemonState JSON parse: {e}")))
+    }
+
+    /// Call `GetHealth()` on the daemon. Returns the parsed
+    /// [`HealthSnapshot`] (per-output PIDs + state, aggregate
+    /// uptime, last-set timing). Returns the same shape across LWE
+    /// and non-LWE backends: non-LWE backends have an empty
+    /// `per_output` map (LWE-only) and a `None` `aggregate.current_pid`.
+    pub async fn get_health(&self) -> crate::error::Result<HealthSnapshot> {
+        let reply = self
+            .conn
+            .call_method(
+                Some(BUS_NAME),
+                self.obj_path.clone(),
+                Some(self.if_name.clone()),
+                "GetHealth",
+                &(),
+            )
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("D-Bus GetHealth call: {e}")))?;
+        let body = reply.body();
+        let raw: String = body
+            .deserialize()
+            .map_err(|e| Error::Other(anyhow::anyhow!("D-Bus GetHealth body: {e}")))?;
+        serde_json::from_str(&raw)
+            .map_err(|e| Error::Other(anyhow::anyhow!("HealthSnapshot JSON parse: {e}")))
     }
 
     /// Call `Reconcile` on the daemon. Returns the `(output,
@@ -863,6 +981,101 @@ mod tests {
         assert_eq!(s.pool_pid, None);
         assert!(s.pool_bindings.is_empty());
         assert_eq!(s.pool_argv, None);
+    }
+
+    /// `HealthSnapshot` roundtrips through JSON. This is the
+    /// transport contract for the `GetHealth` D-Bus method — losing
+    /// a field on serialization would make the GUI's per-output
+    /// health panel silently show "no data" instead of the actual
+    /// PID / state.
+    #[test]
+    fn health_snapshot_json_roundtrip() {
+        let mut per_output = BTreeMap::new();
+        per_output.insert(
+            "DP-1".to_string(),
+            PerOutputHealth {
+                lwe_pid: Some(4242),
+                pid_state: "Running".to_string(),
+                last_set_at: Some("2026-08-15T10:00:00Z".to_string()),
+                last_transition_ms: Some(125),
+            },
+        );
+        per_output.insert(
+            "HDMI-A-1".to_string(),
+            PerOutputHealth {
+                lwe_pid: None,
+                pid_state: "Dead".to_string(),
+                last_set_at: Some("2026-08-15T09:55:30Z".to_string()),
+                last_transition_ms: None,
+            },
+        );
+        let mut pool_bindings = BTreeMap::new();
+        pool_bindings.insert("DP-1".to_string(), "847261582".to_string());
+        let snap = HealthSnapshot {
+            per_output,
+            aggregate: AggregateHealth {
+                current_pid: Some(4242),
+                pool_bindings,
+                uptime_secs: 3600,
+                last_set_total_ms: Some(1_700_000_000_000),
+            },
+        };
+        let json = serde_json::to_string(&snap).expect("HealthSnapshot serializes");
+        let back: HealthSnapshot = serde_json::from_str(&json).expect("HealthSnapshot parses");
+        assert_eq!(back, snap);
+        // Spot-check field names so a serde rename silently
+        // dropping `last_set_total_ms` etc. is caught.
+        assert!(json.contains("\"per_output\":"), "per_output key missing");
+        assert!(json.contains("\"aggregate\":"), "aggregate key missing");
+        assert!(json.contains("\"lwe_pid\":4242"), "lwe_pid missing/wrong");
+        assert!(
+            json.contains("\"pid_state\":\"Running\""),
+            "pid_state missing/wrong"
+        );
+        assert!(
+            json.contains("\"last_set_at\":\"2026-08-15T10:00:00Z\""),
+            "last_set_at missing"
+        );
+        assert!(
+            json.contains("\"last_transition_ms\":125"),
+            "last_transition_ms missing"
+        );
+        assert!(json.contains("\"uptime_secs\":3600"), "uptime_secs missing");
+        assert!(
+            json.contains("\"last_set_total_ms\":1700000000000"),
+            "last_set_total_ms missing"
+        );
+    }
+
+    /// Empty `HealthSnapshot` (no outputs bound) serializes cleanly.
+    /// This is what a fresh daemon (or a non-LWE backend daemon)
+    /// returns.
+    #[test]
+    fn health_snapshot_json_roundtrip_empty() {
+        let snap = HealthSnapshot::default();
+        let json = serde_json::to_string(&snap).expect("empty HealthSnapshot serializes");
+        let back: HealthSnapshot =
+            serde_json::from_str(&json).expect("empty HealthSnapshot parses");
+        assert_eq!(back, snap);
+        assert!(back.per_output.is_empty());
+        assert_eq!(back.aggregate.current_pid, None);
+        assert_eq!(back.aggregate.uptime_secs, 0);
+        assert_eq!(back.aggregate.last_set_total_ms, None);
+    }
+
+    /// The trait's default `get_health` impl returns `Err` so the
+    /// `StubControl` (which doesn't override it) inherits Err
+    /// without us having to plumb a fake snapshot through every
+    /// test.
+    #[tokio::test]
+    async fn stub_control_get_health_returns_default_err() {
+        let stub = Arc::new(StubControl::default());
+        let ctrl: Arc<dyn PaperforgeControl> = stub.clone();
+        let err = ctrl.get_health().await.unwrap_err();
+        assert!(
+            format!("{err}").contains("not supported"),
+            "default get_health must return NotSupported; got: {err}"
+        );
     }
 
     /// Verify the zbus interface compiles + the type is constructible.

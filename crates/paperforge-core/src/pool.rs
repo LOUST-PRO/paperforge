@@ -58,6 +58,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
+    time::Instant,
 };
 
 use nix::{
@@ -114,6 +115,13 @@ pub struct LweSinglePool {
     /// it without `&mut self`. Smart calibration reaches this via
     /// [`Self::set_active_fps`].
     active_fps: std::sync::atomic::AtomicU32,
+    /// Grace window (ms) for hot-swap transitions. `bind()` spawns
+    /// the new LWE first, waits this long, THEN kills the old one —
+    /// the new process steals the wlr-layer-shell surface from the
+    /// old immediately at spawn, eliminating the visible "no wallpaper"
+    /// gap during transitions. Interior-mutable for parity with
+    /// [`Self::active_fps`].
+    transition_grace_ms: std::sync::atomic::AtomicU64,
     inner: Arc<Mutex<Option<PoolProcess>>>,
     /// Cancellation notify for the active soft-pause cycle, if any.
     /// Fired by `resume` and `shutdown` so the cycle can exit
@@ -129,12 +137,97 @@ pub struct LweSinglePool {
     soft_pause_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
+/// Structured timing log emitted at the end of every bind/unbind.
+///
+/// Operators grep `journalctl -u paperforge.service | grep 'transition:'`
+/// to see all transitions and their phase timings. All durations are
+/// milliseconds since `started_at`; absolute wall-clock time is
+/// captured only at the spawn moment so the log line remains
+/// self-consistent even if logging is slightly delayed.
+///
+/// Field-by-field:
+/// - `op`: caller label — `"set"`, `"unset"`, or `"playlist_apply"`.
+/// - `output`: the Wayland output name (`DP-1`, `HDMI-A-1`, etc).
+/// - `scene_id`: Workshop numeric content_id, or `"<none>"` for
+///   `unbind()` paths and the abort branches of `bind()`.
+/// - `spawn_ms`: time from `started_at` to successful `Command::spawn`
+///   of the new LWE process. `0` when spawn failed or was skipped
+///   (e.g. unbind leaves the pool empty).
+/// - `grace_ms`: time from `started_at` to end of the post-spawn
+///   grace sleep. `0` for unbind (no grace) and for the spawn-failure
+///   branch of bind (no grace reached).
+/// - `kill_ms`: time from `started_at` to completion of SIGTERM +
+///   reap of the OLD LWE. `0` when no kill happened (fast-path
+///   idempotent rebind, spawn failure, abort-during-grace).
+/// - `total_ms`: time from `started_at` to log emission — i.e. the
+///   end-to-end latency of the transition.
+/// - `new_pid`/`old_pid`: PIDs in play. `<none>` when not applicable.
+#[derive(Debug)]
+struct TransitionTiming {
+    op: &'static str,
+    output: String,
+    scene_id: String,
+    started_at: Instant,
+    spawn_completed_at: Option<Instant>,
+    grace_completed_at: Option<Instant>,
+    kill_completed_at: Option<Instant>,
+    new_pid: Option<i32>,
+    old_pid: Option<i32>,
+}
+
+impl TransitionTiming {
+    fn new(op: &'static str, output: String, scene_id: String, old_pid: Option<i32>) -> Self {
+        Self {
+            op,
+            output,
+            scene_id,
+            started_at: Instant::now(),
+            spawn_completed_at: None,
+            grace_completed_at: None,
+            kill_completed_at: None,
+            new_pid: None,
+            old_pid,
+        }
+    }
+
+    /// Emit the structured log line. Uses a single `Instant::now()`
+    /// so all phase deltas are consistent with each other even if
+    /// logging itself is slightly delayed.
+    fn log(&self) {
+        let now = Instant::now();
+        let since = |t: Instant| now.duration_since(t).as_millis() as u64;
+        let pid_or_none = |p: Option<i32>| {
+            p.map(|x| x.to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        };
+        tracing::info!(
+            target: "paperforge",
+            "transition: op={} output={} scene_id={} \
+             spawn_ms={} grace_ms={} kill_ms={} total_ms={} \
+             new_pid={} old_pid={}",
+            self.op,
+            self.output,
+            self.scene_id,
+            self.spawn_completed_at.map(since).unwrap_or(0),
+            self.grace_completed_at.map(since).unwrap_or(0),
+            self.kill_completed_at.map(since).unwrap_or(0),
+            since(self.started_at),
+            pid_or_none(self.new_pid),
+            pid_or_none(self.old_pid),
+        );
+    }
+}
+
 impl Clone for LweSinglePool {
     fn clone(&self) -> Self {
+        use std::sync::atomic::Ordering;
         Self {
             binary: self.binary.clone(),
             common_flags: self.common_flags.clone(),
             active_fps: std::sync::atomic::AtomicU32::new(self.active_fps()),
+            transition_grace_ms: std::sync::atomic::AtomicU64::new(
+                self.transition_grace_ms.load(Ordering::Relaxed),
+            ),
             inner: self.inner.clone(),
             soft_pause_cancel: self.soft_pause_cancel.clone(),
             soft_pause_task: self.soft_pause_task.clone(),
@@ -158,10 +251,12 @@ impl LweSinglePool {
     /// `[fps].active_max` value flows in instead of being hardcoded
     /// to LWE's own 30-fps default.
     pub fn with_binary_and_fps(binary: impl Into<PathBuf>, active_fps: u32) -> Self {
+        use std::sync::atomic::AtomicU64;
         Self {
             binary: binary.into(),
             common_flags: default_flags(),
             active_fps: std::sync::atomic::AtomicU32::new(active_fps),
+            transition_grace_ms: AtomicU64::new(default_transition_grace_ms()),
             inner: Arc::new(Mutex::new(None)),
             soft_pause_cancel: Arc::new(tokio::sync::Notify::new()),
             soft_pause_task: Arc::new(Mutex::new(None)),
@@ -197,6 +292,32 @@ impl LweSinglePool {
     pub fn set_active_fps(&self, fps: u32) {
         use std::sync::atomic::Ordering;
         self.active_fps.store(fps, Ordering::Relaxed);
+    }
+
+    /// Read the current transition grace window (ms) used by
+    /// `bind()` between spawning the new LWE and killing the old.
+    pub fn transition_grace_ms(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.transition_grace_ms.load(Ordering::Relaxed)
+    }
+
+    /// Override the transition grace window (ms). Setting to 0
+    /// reverts `bind()` to the v0.1 "kill-then-spawn" flow (visible
+    /// black gap during transitions). The default is
+    /// [`default_transition_grace_ms`] (2000 ms).
+    pub fn set_transition_grace_ms(&self, ms: u64) {
+        use std::sync::atomic::Ordering;
+        self.transition_grace_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Builder-form of [`Self::set_transition_grace_ms`]. Mostly
+    /// useful for tests that want a non-default grace window
+    /// without going through `set_transition_grace_ms` after
+    /// construction.
+    pub fn with_transition_grace_ms(self, ms: u64) -> Self {
+        self.transition_grace_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+        self
     }
 
     /// Cancel any active soft-pause cycle. Fires the cancellation
@@ -250,9 +371,50 @@ impl LweSinglePool {
     /// is bound to a different scene, OR not bound at all, the pool
     /// performs a hot-swap with the merged argv.
     ///
+    /// This is a thin wrapper over [`Self::bind_with_op`] that tags
+    /// the resulting log line with `op = "set"`. Use [`Self::bind_with_op`]
+    /// directly when the caller is something other than a single
+    /// user-facing `set` (e.g. `playlist apply`).
+    ///
+    /// ## Spawn-first-kill-after flow (v0.4)
+    ///
+    /// Unlike the v0.1 / v0.3 "kill-then-spawn" flow (which left a
+    /// visible black gap of 1-3 s between the old SIGTERM and the
+    /// new LWE's first frame), this implementation:
+    ///
+    /// 1. Builds the merged bindings (existing + updated).
+    /// 2. Spawns the new LWE process and captures its PID.
+    /// 3. Sleeps for `transition_grace_ms` (default 2000 ms) so
+    ///    the new LWE has time to render its first frame.
+    /// 4. Checks the new PID is still alive — if it died during the
+    ///    grace window (e.g. bad scene ID, OOM at startup), SIGKILL
+    ///    the new PID, REAP the zombie, and return `Err` while
+    ///    leaving the OLD process untouched.
+    /// 5. Only then takes the old process out, SIGTERMs it with a
+    ///    200 ms grace + SIGKILL fallback, and reaps.
+    /// 6. Stores the new process in `inner`.
+    ///
+    /// The visual effect is seamless because the new LWE steals the
+    /// wlr-layer-shell surface from the old immediately at spawn —
+    /// both processes are alive during the grace window, so the
+    /// compositor never sees an empty layer-shell surface.
+    ///
     /// Returns the new PID after the swap, or the existing PID if no
     /// respawn was needed.
     pub async fn bind(&self, output: &str, content_id: &str) -> Result<i32> {
+        self.bind_with_op(output, content_id, "set").await
+    }
+
+    /// Like [`Self::bind`] but lets the caller tag the resulting
+    /// structured log line with an `op` label (`"set"`, `"unset"`,
+    /// `"playlist_apply"`, etc.). The timing log itself is identical
+    /// in shape — only the `op=` field differs.
+    pub async fn bind_with_op(
+        &self,
+        output: &str,
+        content_id: &str,
+        op: &'static str,
+    ) -> Result<i32> {
         if output.is_empty() {
             return Err(Error::Other(anyhow::anyhow!(
                 "bind() requires a non-empty output name"
@@ -265,9 +427,13 @@ impl LweSinglePool {
         }
 
         let mut guard = self.inner.lock().await;
+        let old_pid = guard.as_ref().map(|p| p.pid);
+        let mut timing =
+            TransitionTiming::new(op, output.to_string(), content_id.to_string(), old_pid);
 
         // Fast path: output already bound to the same content_id,
-        // AND process is alive. No respawn needed.
+        // AND process is alive. No respawn needed → no transition
+        // log line (would spam the journal on every idempotent set).
         if let Some(proc) = guard.as_ref() {
             if let Some(existing) = proc.bindings.get(output) {
                 if existing == content_id {
@@ -288,12 +454,100 @@ impl LweSinglePool {
             .unwrap_or_default();
         new_bindings.insert(output.to_string(), content_id.to_string());
 
-        // Kill the previous process if any.
+        // Read grace once (atomic load + cheap) before spawning so
+        // the value is captured even if `set_transition_grace_ms`
+        // races with this bind.
+        let grace_ms = self.transition_grace_ms();
+
+        // Step 1: spawn the NEW process FIRST. We deliberately do
+        // not touch the existing process yet — that's the whole
+        // point of the spawn-first-kill-after flow.
+        let argv = build_argv(
+            &self.binary,
+            &new_bindings,
+            &self.common_flags,
+            self.active_fps(),
+        );
+        let mut cmd = Command::new(&self.binary);
+        cmd.args(&argv[1..]); // argv[0] is the binary itself; Command already has it
+        let mut new_child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                // Spawn failed before any process existed — emit
+                // the transition log with spawn_completed_at unset
+                // so the operator can grep for it. kill_completed_at
+                // and new_pid stay None.
+                timing.log();
+                return Err(Error::BackendFailure {
+                    kind: BackendKind::LinuxWallpaperEngine
+                        .process_pattern()
+                        .to_string(),
+                    message: format!("spawn LWE failed: {e}"),
+                });
+            }
+        };
+        let new_pid = new_child.id() as i32;
+        timing.spawn_completed_at = Some(Instant::now());
+
+        // Step 2: wait for the grace window. The new LWE has this
+        // long to initialize WebGL, load the scene, and render its
+        // first frame on the layer-shell surface it just stole from
+        // the old process. We use `tokio::time::sleep` (not
+        // `std::thread::sleep`) so the runtime can service other
+        // tasks; the lock held here only blocks concurrent `bind()`
+        // calls, which is intentional (no two swaps should race).
+        //
+        // Plain sleep (no `tokio::select!` cancel) per design: a
+        // daemon shutdown during a transition is rare, and 2 s is
+        // acceptable cleanup latency.
+        tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
+        timing.grace_completed_at = Some(Instant::now());
+
+        // Step 3: confirm the new LWE is still alive. If it died
+        // during the grace window (bad scene ID, OOM, missing
+        // Wayland session, etc.) we must NOT kill the old one —
+        // abort the transition and let the caller retry with a
+        // valid scene.
+        match crate::backend::pid_state_quick(new_pid) {
+            Ok(BackendState::Running) | Ok(BackendState::Paused) => {
+                // Healthy. Continue to kill the old process.
+            }
+            _ => {
+                // New LWE died in the grace window. Clean up the
+                // zombie, signal SIGKILL as a belt-and-braces
+                // measure in case it's stuck in uninterruptible
+                // sleep, and return Err. The OLD process is left
+                // untouched in `guard` so the next bind() call
+                // can pick up from it. Per the spec we emit the
+                // transition log with new_pid = None so the
+                // operator can grep for the abort.
+                let _ = kill(Pid::from_raw(new_pid), Signal::SIGKILL);
+                let _ = new_child.wait();
+                timing.new_pid = None;
+                timing.log();
+                tracing::warn!(
+                    target: "paperforge",
+                    "new LWE (pid={}) died during transition grace \
+                     ({}ms); old process preserved",
+                    new_pid,
+                    grace_ms,
+                );
+                return Err(Error::BackendFailure {
+                    kind: BackendKind::LinuxWallpaperEngine
+                        .process_pattern()
+                        .to_string(),
+                    message: format!(
+                        "new LWE (pid={new_pid}) died during transition grace \
+                         ({grace_ms} ms); old process preserved"
+                    ),
+                });
+            }
+        }
+
+        // Step 4: kill the old process. Same grace + SIGKILL
+        // fallback as the v0.3 flow — 200 ms because the typical
+        // case is "LWE was already idle and responsive to SIGTERM".
         if let Some(mut prev) = guard.take() {
-            // Best-effort SIGTERM. If LWE is stuck, SIGKILL after a
-            // short grace period. The grace is small (200 ms) because
-            // the typical case is "LWE was already idle from a previous
-            // respawn and is responsive to SIGTERM".
             let _ = kill(Pid::from_raw(prev.pid), Signal::SIGTERM);
             let grace = std::time::Duration::from_millis(200);
             let start = std::time::Instant::now();
@@ -312,43 +566,43 @@ impl LweSinglePool {
                 }
             }
         }
+        timing.kill_completed_at = Some(Instant::now());
 
-        // Spawn the new process.
-        let argv = build_argv(
-            &self.binary,
-            &new_bindings,
-            &self.common_flags,
-            self.active_fps(),
-        );
-        let mut cmd = Command::new(&self.binary);
-        cmd.args(&argv[1..]); // argv[0] is the binary itself; Command already has it
-        let child = cmd.spawn().map_err(|e| Error::BackendFailure {
-            kind: BackendKind::LinuxWallpaperEngine
-                .process_pattern()
-                .to_string(),
-            message: format!("spawn LWE failed: {e}"),
-        })?;
-        let pid = child.id() as i32;
-
+        // Step 5: store the new process in the pool.
         *guard = Some(PoolProcess {
-            pid,
+            pid: new_pid,
             bindings: new_bindings,
-            child: Some(child),
+            child: Some(new_child),
         });
+        timing.new_pid = Some(new_pid);
+        timing.log();
 
         tracing::info!(
             target: "paperforge",
-            "LWE pool respawn: pid={} bindings={:?}",
-            pid,
+            "LWE pool respawn: pid={} bindings={:?} grace_ms={}",
+            new_pid,
             guard.as_ref().unwrap().bindings,
+            grace_ms,
         );
 
-        Ok(pid)
+        Ok(new_pid)
     }
 
     /// Convenience: translate a Workshop scene path to its content_id
-    /// and call [`bind`](Self::bind).
+    /// and call [`bind`](Self::bind). Thin wrapper over
+    /// [`Self::bind_scene_with_op`] with `op = "set"`.
     pub async fn bind_scene(&self, output: &str, scene: &Path) -> Result<i32> {
+        self.bind_scene_with_op(output, scene, "set").await
+    }
+
+    /// Like [`Self::bind_scene`] but lets the caller tag the
+    /// resulting log line with `op` (e.g. `"playlist_apply"`).
+    pub async fn bind_scene_with_op(
+        &self,
+        output: &str,
+        scene: &Path,
+        op: &'static str,
+    ) -> Result<i32> {
         if !scene.exists() {
             return Err(Error::BackendUnreachable {
                 kind: BackendKind::LinuxWallpaperEngine
@@ -367,18 +621,36 @@ impl LweSinglePool {
                 scene.display()
             ),
         })?;
-        self.bind(output, &content_id).await
+        self.bind_with_op(output, &content_id, op).await
     }
 
     /// Unbind an output. Removes the binding from the map and respawns
     /// the pool with the remaining bindings (if any). If no bindings
     /// remain, the pool is killed entirely.
+    ///
+    /// This is a thin wrapper over [`Self::unbind_with_op`] with
+    /// `op = "unset"`. Use [`Self::unbind_with_op`] directly when a
+    /// distinct caller label is needed.
     pub async fn unbind(&self, output: &str) -> Result<()> {
+        self.unbind_with_op(output, "unset").await
+    }
+
+    /// Like [`Self::unbind`] but tags the resulting log line with
+    /// `op`. Use `"hotplug"` or similar when the caller is something
+    /// other than a direct unset request — the log shape is the same,
+    /// only the `op=` field changes.
+    pub async fn unbind_with_op(&self, output: &str, op: &'static str) -> Result<()> {
         let mut guard = self.inner.lock().await;
+        let old_pid = guard.as_ref().map(|p| p.pid);
+        // unbind has no scene — always log "<none>" so operators
+        // can grep for unset transitions independently of set ones.
+        let mut timing =
+            TransitionTiming::new(op, output.to_string(), "<none>".to_string(), old_pid);
 
         // Step 1: take the current process out so we can decide what
         // to do with it without fighting the borrow checker. If there
-        // is no current process, the pool is already empty.
+        // is no current process, the pool is already empty — no
+        // transition happened, no log line.
         let mut prev = match guard.take() {
             Some(p) => p,
             None => return Ok(()),
@@ -386,7 +658,7 @@ impl LweSinglePool {
 
         // Step 2: clone the bindings and remove the output. We clone
         // (not move) because if the output wasn't bound, we put the
-        // process back untouched.
+        // process back untouched. Again, no transition happened.
         let mut new_bindings = prev.bindings.clone();
         if new_bindings.remove(output).is_none() {
             // Output wasn't bound; put the process back untouched.
@@ -400,9 +672,14 @@ impl LweSinglePool {
         if let Some(c) = prev.child.as_mut() {
             let _ = c.wait();
         }
+        timing.kill_completed_at = Some(Instant::now());
 
         // Step 4: if no bindings remain, leave the pool empty.
         if new_bindings.is_empty() {
+            // No respawn — new_pid stays None, spawn_completed_at
+            // stays None. Emit the log so operators can see the
+            // unset landed (kill_ms=N, spawn_ms=0).
+            timing.log();
             tracing::info!(
                 target: "paperforge",
                 "LWE pool empty after unbind({})",
@@ -420,18 +697,28 @@ impl LweSinglePool {
         );
         let mut cmd = Command::new(&self.binary);
         cmd.args(&argv[1..]);
-        let child = cmd.spawn().map_err(|e| Error::BackendFailure {
-            kind: BackendKind::LinuxWallpaperEngine
-                .process_pattern()
-                .to_string(),
-            message: format!("respawn after unbind failed: {e}"),
+        let child = cmd.spawn().map_err(|e| {
+            // Spawn failed after we already killed the old process.
+            // Emit the transition log with spawn_completed_at unset
+            // and new_pid=None so the operator sees the partial
+            // transition (kill completed, respawn didn't).
+            timing.log();
+            Error::BackendFailure {
+                kind: BackendKind::LinuxWallpaperEngine
+                    .process_pattern()
+                    .to_string(),
+                message: format!("respawn after unbind failed: {e}"),
+            }
         })?;
         let pid = child.id() as i32;
+        timing.spawn_completed_at = Some(Instant::now());
         *guard = Some(PoolProcess {
             pid,
             bindings: new_bindings,
             child: Some(child),
         });
+        timing.new_pid = Some(pid);
+        timing.log();
         tracing::info!(
             target: "paperforge",
             "LWE pool respawn after unbind({}): pid={} bindings={:?}",
@@ -608,6 +895,15 @@ fn default_flags() -> Vec<String> {
     ]
 }
 
+/// Default grace window (ms) for `bind()` spawn-first-kill-after.
+/// 2000 ms is enough for most Steam Workshop scenes to render their
+/// first frame; heavier scenes may need 3000-4000 ms. Mirrors
+/// `default_transition_grace_ms()` in `config.rs` so production
+/// values stay in sync if either default is tuned.
+fn default_transition_grace_ms() -> u64 {
+    2000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,14 +1019,17 @@ mod tests {
         assert!(matches!(err, Error::BackendUnreachable { .. }));
     }
 
-    /// End-to-end: spawn `/bin/sleep` as the "LWE binary" with a
+    /// End-to-end: spawn a sleep wrapper as the "LWE binary" with a
     /// multi-output argv, then SIGTERM and verify exit. We can't use
     /// the real LWE binary in CI (no Wayland session), but the pool's
     /// argv construction + spawn + kill path is identical regardless
-    /// of the binary.
+    /// of the binary. The wrapper ignores its argv and just sleeps so
+    /// it stays alive past the grace window — `/bin/sleep` itself
+    /// rejects `--screen-root`/`--bg`/etc. and would die immediately.
     #[tokio::test]
     async fn bind_spawns_and_pause_resume_real_process() {
-        let pool = LweSinglePool::with_binary("/bin/sleep").with_flags(vec!["60".to_string()]);
+        let wrapper = write_sleep_wrapper(60);
+        let pool = LweSinglePool::with_binary(&wrapper).with_flags(vec![]);
         let pid = pool.bind("DP-1", "111").await.unwrap();
         assert!(pid > 0);
         assert_eq!(pool.current_pid().await, Some(pid));
@@ -767,10 +1066,15 @@ mod tests {
 
         // shutdown is idempotent.
         pool.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&wrapper);
     }
 
     #[tokio::test]
     async fn unbind_when_pool_empty_is_noop() {
+        // Use a no-op-argv wrapper: `unbind` doesn't actually need a
+        // running process but constructing the pool still does not
+        // require spawn, so `/bin/sleep` would also work — kept
+        // consistent with the surrounding tests for simplicity.
         let pool = LweSinglePool::with_binary("/bin/sleep");
         pool.unbind("DP-1").await.unwrap();
         assert!(pool.current_pid().await.is_none());
@@ -778,11 +1082,13 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_idempotent() {
-        let pool = LweSinglePool::with_binary("/bin/sleep").with_flags(vec!["60".to_string()]);
+        let wrapper = write_sleep_wrapper(60);
+        let pool = LweSinglePool::with_binary(&wrapper).with_flags(vec![]);
         pool.bind("DP-1", "111").await.unwrap();
         pool.shutdown().await.unwrap();
         pool.shutdown().await.unwrap(); // second call must not panic
         assert!(pool.current_pid().await.is_none());
+        let _ = std::fs::remove_file(&wrapper);
     }
 
     /// Output hotplug: a new output is bound after the pool already
@@ -791,7 +1097,8 @@ mod tests {
     /// again with the original pair.
     #[tokio::test]
     async fn single_pool_handles_output_hotplug() {
-        let pool = LweSinglePool::with_binary("/bin/sleep").with_flags(vec!["60".to_string()]);
+        let wrapper = write_sleep_wrapper(60);
+        let pool = LweSinglePool::with_binary(&wrapper).with_flags(vec![]);
 
         // Initial: bind DP-1.
         let pid_initial = pool.bind("DP-1", "111").await.unwrap();
@@ -817,29 +1124,19 @@ mod tests {
         assert_eq!(b.get("DP-1").map(String::as_str), Some("111"));
 
         pool.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&wrapper);
     }
 
     /// Pause/resume: SIGSTOP + SIGCONT to the single LWE PID must
-    /// toggle `/proc/<pid>/status` State field T ↔ R/S. We use
-    /// `/bin/sleep` as a stand-in for the real LWE binary. Because
-    /// sleep rejects the `--screen-root` argv that the pool emits,
-    /// we override the flag list with empty so sleep sees only its
-    /// own arg (`60` seconds) and stays alive long enough for us
-    /// to signal it.
+    /// toggle `/proc/<pid>/status` State field T ↔ R/S. We use a
+    /// sleep-wrapper script as a stand-in for the real LWE binary
+    /// (see `write_sleep_wrapper`). The wrapper ignores any argv
+    /// and just runs `/bin/sleep N`, so the pool can emit its full
+    /// `--screen-root / --bg / --fps` argv and the underlying sleep
+    /// still stays alive past the grace window.
     #[tokio::test]
     async fn single_pool_pause_global_via_sigstop() {
-        // With zero common flags the argv is just
-        //   /bin/sleep --screen-root DP-1 --bg 111
-        // which sleep still rejects (--screen-root not understood).
-        // So we use a long sleep + bypass the LWE argv entirely via
-        // a tiny shell wrapper that ignores its argv and just sleeps.
-        let wrapper = std::env::temp_dir().join("paperforge-sleep-wrapper.sh");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
-        std::fs::set_permissions(
-            &wrapper,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        let wrapper = write_sleep_wrapper(60);
 
         // Build pool with empty flags so the wrapper sees zero argv
         // past the binary path (sleep just sleeps 60s).
@@ -915,5 +1212,624 @@ mod tests {
         assert_eq!(pool.active_fps(), 24);
         let pool2 = LweSinglePool::with_binary_and_fps("/bin/sleep", 1);
         assert_eq!(pool2.active_fps(), 1);
+    }
+
+    /// Default grace window is 2000 ms; operators can override via
+    /// `set_transition_grace_ms` or the `with_transition_grace_ms`
+    /// builder. Interior-mutable atomic works through `Arc` clones,
+    /// parallel to [`Self::set_active_fps`].
+    #[tokio::test]
+    async fn transition_grace_ms_default_and_overrides() {
+        let pool = LweSinglePool::with_binary("/bin/sleep");
+        assert_eq!(
+            pool.transition_grace_ms(),
+            2000,
+            "default transition_grace_ms must be 2000 ms"
+        );
+        pool.set_transition_grace_ms(500);
+        assert_eq!(pool.transition_grace_ms(), 500);
+
+        // Builder form.
+        let pool2 = LweSinglePool::with_binary("/bin/sleep").with_transition_grace_ms(0);
+        assert_eq!(
+            pool2.transition_grace_ms(),
+            0,
+            "with_transition_grace_ms(0) must store zero (legacy v0.1 mode)"
+        );
+
+        // Arc-shared mutation: the setter propagates across clones.
+        let pool_arc = std::sync::Arc::new(pool);
+        let writer = pool_arc.clone();
+        let reader = pool_arc.clone();
+        writer.set_transition_grace_ms(3500);
+        assert_eq!(
+            reader.transition_grace_ms(),
+            3500,
+            "Arc-shared pool must observe transition_grace_ms updates"
+        );
+    }
+
+    /// Wrapper script that ignores its argv (so /bin/sleep never
+    /// sees the LWE-specific flags) and writes its PID to the
+    /// given output file on startup. The sleep duration is long
+    /// enough to outlast any grace window used in the tests. The
+    /// file name is uniquified per call so parallel test
+    /// invocations don't race on a shared path.
+    fn write_pid_wrapper(out_file: &Path, sleep_seconds: u64) -> PathBuf {
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-grace-wrapper-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq(),
+        ));
+        let body = format!(
+            "#!/bin/sh\n# paperforge grace-window test wrapper\n\
+             echo $$ > {out_file}\n\
+             exec /bin/sleep {sleep_seconds}\n",
+            out_file = out_file.display(),
+            sleep_seconds = sleep_seconds,
+        );
+        std::fs::write(&wrapper, body).unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        wrapper
+    }
+
+    /// Wrapper script that dies immediately when invoked — used to
+    /// exercise the abort path in `bind()`.
+    fn write_dying_wrapper() -> PathBuf {
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-dying-wrapper-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq(),
+        ));
+        std::fs::write(&wrapper, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        wrapper
+    }
+
+    /// Monotonic counter used to uniquify wrapper script paths so
+    /// parallel test invocations don't clobber each other.
+    fn next_wrapper_seq() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Build a tiny `/bin/sh` wrapper at a unique temp path that
+    /// ignores its argv and runs `/bin/sleep <sleep_seconds>`. This
+    /// is the workhorse stand-in for the LWE binary in end-to-end
+    /// pool tests: the wrapper cannot accidentally reject the pool's
+    /// real argv (which `/bin/sleep` does for `--screen-root`/etc.)
+    /// and it stays alive past the default 2000 ms grace window so
+    /// the "OLD survives, NEW takes over" branch is exercised. The
+    /// filename includes `getpid()` + `next_wrapper_seq()` so two
+    /// tests running in parallel don't race on the same path.
+    fn write_sleep_wrapper(sleep_seconds: u64) -> PathBuf {
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-sleep-wrapper-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq(),
+        ));
+        let body = format!(
+            "#!/bin/sh\n\
+             # paperforge sleep-wrapper test helper (ignores its argv)\n\
+             exec /bin/sleep {sleep_seconds}\n"
+        );
+        std::fs::write(&wrapper, body).unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        wrapper
+    }
+
+    /// End-to-end: bind("DP-1", "111") → bind("DP-1", "222") must
+    /// spawn the second LWE BEFORE killing the first. While the
+    /// second bind() is mid-flight (inside the 500 ms grace window)
+    /// the OLD PID must still be Running — that's the spawn-first
+    /// invariant. After the second bind() returns, the OLD PID is
+    /// dead and the new PID is the only one tracked by the pool.
+    #[tokio::test]
+    async fn bind_overlap_kills_old_after_grace() {
+        let pid_file =
+            std::env::temp_dir().join(format!("paperforge-overlap-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+
+        // Long sleep (600s) so the first wrapper's PID can't be
+        // recycled during the test.
+        let wrapper = write_pid_wrapper(&pid_file, 600);
+
+        // 500 ms grace: long enough to mid-flight observe the old
+        // PID still alive while keeping the test fast.
+        let pool = LweSinglePool::with_binary(&wrapper)
+            .with_flags(vec![])
+            .with_transition_grace_ms(500);
+
+        // First bind: this writes pid1 to the file.
+        let pid1 = pool.bind("DP-1", "111").await.unwrap();
+        let pid1_from_file: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(pid1, pid1_from_file, "first wrapper must write its PID");
+        assert_eq!(
+            crate::backend::pid_state_quick(pid1).unwrap(),
+            BackendState::Running,
+            "first LWE must be Running before second bind"
+        );
+
+        // Kick off the second bind in a background task so we can
+        // sample the OLD PID's state mid-grace.
+        let pool_bg = pool.clone();
+        let bg_task = tokio::spawn(async move { pool_bg.bind("DP-1", "222").await });
+
+        // Sample during grace: the second spawn overwrites the
+        // pid file with pid2. We sleep long enough for the spawn
+        // to land but well inside the 500 ms grace so the old
+        // PID has NOT been killed yet.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let pid2_from_file: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_ne!(
+            pid2_from_file, pid1,
+            "second bind must spawn a different PID"
+        );
+        assert_eq!(
+            crate::backend::pid_state_quick(pid1).unwrap(),
+            BackendState::Running,
+            "old LWE must survive the grace window (spawn-first-kill-after)"
+        );
+        assert_eq!(
+            crate::backend::pid_state_quick(pid2_from_file).unwrap(),
+            BackendState::Running,
+            "new LWE must be Running mid-grace"
+        );
+
+        // Wait for second bind to complete; then verify old is dead,
+        // new is the canonical pool PID, and bindings reflect "222".
+        let pid2 = bg_task.await.unwrap().unwrap();
+        assert_eq!(pid2, pid2_from_file);
+        assert_eq!(
+            crate::backend::pid_state_quick(pid1).unwrap(),
+            BackendState::NotRunning,
+            "old LWE must be dead after grace + 200 ms SIGTERM grace"
+        );
+        assert_eq!(
+            crate::backend::pid_state_quick(pid2).unwrap(),
+            BackendState::Running,
+            "new LWE must still be Running after transition"
+        );
+        assert_eq!(pool.current_pid().await, Some(pid2));
+        assert_eq!(
+            pool.bindings().await.get("DP-1").map(String::as_str),
+            Some("222"),
+            "bindings must point at the new scene after the swap"
+        );
+
+        pool.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&wrapper);
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    /// Abort path: when the NEW LWE dies during the grace window,
+    /// `bind()` must (a) return Err, (b) leave the OLD process
+    /// untouched so the caller can retry.
+    ///
+    /// We use a wrapper that exits immediately. The wrapper takes
+    /// no args and always exits — so every bind() invocation that
+    /// spawns it will get a dead process after the grace window.
+    /// The first bind uses a healthy /bin/sleep wrapper so we have
+    /// an OLD process to preserve; the second bind uses the dying
+    /// wrapper via a separate pool because the binary path is
+    /// fixed at construction. To exercise the abort path with a
+    /// single binary, we instead use a wrapper that ALWAYS dies
+    /// and verify `bind()` on an empty pool: with no OLD process,
+    /// the abort should still return Err cleanly. Then we use a
+    /// SECOND pool where the OLD wrapper stays alive and a SECOND
+    /// bind with the dying wrapper aborts while preserving the
+    /// OLD process.
+    #[tokio::test]
+    async fn bind_aborts_when_new_dies_in_grace() {
+        // Pool A: a healthy wrapper that stays alive long enough
+        // to be the OLD process during the abort test.
+        let healthy_pid_file = std::env::temp_dir().join(format!(
+            "paperforge-abort-healthy-{}.pid",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&healthy_pid_file);
+        let healthy_wrapper = write_pid_wrapper(&healthy_pid_file, 600);
+
+        // Dying wrapper: exits immediately, regardless of argv.
+        let dying_wrapper = write_dying_wrapper();
+
+        // Pool: the binary is the dying wrapper. Even the FIRST
+        // bind will fail because the dying wrapper exits before
+        // the grace elapses. To verify "OLD preserved" we need a
+        // different shape: the OLD process is held by the pool's
+        // `inner` state, not a separate pool. So we make TWO
+        // pools, both pointing at the dying wrapper, and assert
+        // that bind() returns Err when the new LWE dies — that's
+        // the contract we care about.
+        //
+        // Specifically: pool starts empty, first bind spawns
+        // dying wrapper → after grace, wrapper is dead → bind
+        // returns Err (no OLD to preserve, just abort cleanly).
+        let pool = LweSinglePool::with_binary(&dying_wrapper)
+            .with_flags(vec![])
+            .with_transition_grace_ms(150);
+
+        let err = pool.bind("DP-1", "111").await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transition grace"),
+            "error message must mention the grace window: {msg}"
+        );
+        // Pool must remain empty after the abort.
+        assert_eq!(
+            pool.current_pid().await,
+            None,
+            "pool must stay empty when spawn fails during grace"
+        );
+        assert!(pool.bindings().await.is_empty());
+
+        // Now verify the "OLD preserved" branch: pool has a
+        // healthy process via the healthy wrapper, then a
+        // SECOND bind is made via a pool that ALSO uses the
+        // healthy wrapper — but the second bind goes through
+        // a different code path where we manually swap the
+        // pool's binary to a dying one. Since we can't change
+        // the binary post-construction, we use a different
+        // strategy: spin up a SECOND pool that points at the
+        // healthy wrapper, get a process running, then make a
+        // second bind on the FIRST pool (dying wrapper) but
+        // that doesn't test the OLD-preserved branch.
+        //
+        // Alternative: use the healthy wrapper for the FIRST
+        // bind, then call bind() on the dying-wrapper pool —
+        // but the dying pool is independent.
+        //
+        // Cleanest test of the OLD-preserved branch: same pool
+        // binary must stay constant. We use a wrapper that
+        // chooses to die based on argv: it inspects the full
+        // argv for a literal "die" token.
+        drop(pool); // we're done with the dying-only pool
+        let _ = std::fs::remove_file(&dying_wrapper);
+
+        // Conditional-die wrapper: dies if any argv equals "die",
+        // else sleeps long. This lets us use a single pool to
+        // test both branches.
+        let cond_wrapper = std::env::temp_dir().join(format!(
+            "paperforge-cond-wrapper-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq(),
+        ));
+        std::fs::write(
+            &cond_wrapper,
+            "#!/bin/sh\n\
+             # paperforge conditional-die wrapper\n\
+             for arg in \"$@\"; do\n  \
+               if [ \"$arg\" = \"die\" ]; then\n    \
+                 exit 1\n  \
+               fi\n\
+             done\n\
+             exec /bin/sleep 600\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &cond_wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let pool = LweSinglePool::with_binary(&cond_wrapper)
+            .with_flags(vec![])
+            .with_transition_grace_ms(150);
+
+        // First bind: content_id "alive" → wrapper sleeps long.
+        let pid1 = pool.bind("DP-1", "alive").await.unwrap();
+        assert_eq!(
+            crate::backend::pid_state_quick(pid1).unwrap(),
+            BackendState::Running,
+            "first LWE must be Running before the abort-triggering bind"
+        );
+
+        // Second bind: content_id "die" → wrapper exits 1
+        // immediately. bind() must return Err and leave pid1 alive.
+        let err = pool.bind("DP-1", "die").await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transition grace"),
+            "error message must mention the grace window: {msg}"
+        );
+
+        // pid1 must still be alive — the abort path must NOT
+        // have killed it. This is the whole point.
+        assert_eq!(
+            crate::backend::pid_state_quick(pid1).unwrap(),
+            BackendState::Running,
+            "old LWE must survive the abort (spawn-first-kill-after rollback)"
+        );
+        assert_eq!(
+            pool.current_pid().await,
+            Some(pid1),
+            "pool must keep tracking the old PID after a failed swap"
+        );
+        assert_eq!(
+            pool.bindings().await.get("DP-1").map(String::as_str),
+            Some("alive"),
+            "bindings must NOT have been updated to the failing scene"
+        );
+
+        pool.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&healthy_wrapper);
+        let _ = std::fs::remove_file(&healthy_pid_file);
+        let _ = std::fs::remove_file(&cond_wrapper);
+    }
+
+    /// Setting `transition_grace_ms = 0` reverts to the v0.1
+    /// kill-then-spawn flow. The spawn still succeeds but there's
+    /// no observable "overlap" window — by the time bind() returns,
+    /// the old PID is already dead. This is documented behaviour
+    /// for operators who want the legacy semantics.
+    #[tokio::test]
+    async fn bind_with_zero_grace_kills_old_first() {
+        let pid_file =
+            std::env::temp_dir().join(format!("paperforge-zero-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        let wrapper = write_pid_wrapper(&pid_file, 600);
+
+        let pool = LweSinglePool::with_binary(&wrapper)
+            .with_flags(vec![])
+            .with_transition_grace_ms(0);
+
+        let pid1 = pool.bind("DP-1", "111").await.unwrap();
+        assert_eq!(
+            crate::backend::pid_state_quick(pid1).unwrap(),
+            BackendState::Running
+        );
+
+        let pid2 = pool.bind("DP-1", "222").await.unwrap();
+        assert_ne!(pid1, pid2);
+
+        // With grace=0 there's no wait, so the old PID is killed
+        // immediately after spawn + immediate check. pid1 should
+        // be NotRunning by the time bind() returns.
+        assert_eq!(
+            crate::backend::pid_state_quick(pid1).unwrap(),
+            BackendState::NotRunning,
+            "with grace=0 the old PID must be dead by the time bind() returns"
+        );
+        assert_eq!(
+            crate::backend::pid_state_quick(pid2).unwrap(),
+            BackendState::Running,
+            "new PID must be the canonical one with grace=0"
+        );
+        assert_eq!(pool.current_pid().await, Some(pid2));
+
+        pool.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&wrapper);
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    /// Verify `bind_with_op` emits the structured transition timing
+    /// log line with the expected `op`, `output`, `scene_id`, and
+    /// PID fields. Uses a thread-local `tracing_subscriber::fmt`
+    /// writer to capture the output, then asserts the line matches
+    /// the documented shape. The thread-local scope is safe here
+    /// because `#[tokio::test]` runs on a single-threaded current-thread
+    /// runtime so no task hops a thread.
+    #[tokio::test]
+    async fn bind_with_op_emits_transition_timing_log() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let captured_clone = captured.clone();
+        let make_writer =
+            move || -> Box<dyn std::io::Write> { Box::new(CapturedWriter(captured_clone.clone())) };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(make_writer)
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .with_target(true)
+            .with_ansi(false)
+            .finish();
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let wrapper = write_sleep_wrapper(60);
+        let pool = LweSinglePool::with_binary(&wrapper)
+            .with_flags(vec![])
+            .with_transition_grace_ms(100);
+
+        // First bind: spawns the wrapper, captures a transition log.
+        let pid1 = pool.bind("DP-1", "111").await.unwrap();
+        // Second bind with explicit op label — also a transition.
+        let pid2 = pool
+            .bind_with_op("HDMI-A-1", "222", "playlist_apply")
+            .await
+            .unwrap();
+        // Third bind is an idempotent rebind (same output, same
+        // content_id) — must NOT emit a transition log.
+        let pid3 = pool.bind_with_op("HDMI-A-1", "222", "set").await.unwrap();
+        assert_eq!(pid3, pid2, "idempotent rebind reuses the same PID");
+
+        pool.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&wrapper);
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+
+        // We expect at least two transition log lines (the two
+        // actual transitions). Each is on its own line and starts
+        // with the INFO-level `transition: ` marker.
+        let transition_lines: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains("transition:"))
+            .collect();
+        assert!(
+            transition_lines.len() >= 2,
+            "expected at least two transition log lines, got {}:\n{output}",
+            transition_lines.len()
+        );
+
+        // First line: bind() default op="set".
+        let line0 = transition_lines[0];
+        assert!(
+            line0.contains("op=set"),
+            "first transition must use op=set: {line0}"
+        );
+        assert!(
+            line0.contains("output=DP-1"),
+            "first transition must report output=DP-1: {line0}"
+        );
+        assert!(
+            line0.contains("scene_id=111"),
+            "first transition must report scene_id=111: {line0}"
+        );
+        assert!(
+            line0.contains(&format!("new_pid={pid1}")),
+            "first transition must report new_pid={pid1}: {line0}"
+        );
+        assert!(
+            line0.contains("old_pid=<none>"),
+            "first transition (cold start) must report old_pid=<none>: {line0}"
+        );
+
+        // Second line: bind_with_op(... "playlist_apply").
+        let line1 = transition_lines[1];
+        assert!(
+            line1.contains("op=playlist_apply"),
+            "second transition must use op=playlist_apply: {line1}"
+        );
+        assert!(
+            line1.contains("output=HDMI-A-1"),
+            "second transition must report output=HDMI-A-1: {line1}"
+        );
+        assert!(
+            line1.contains("scene_id=222"),
+            "second transition must report scene_id=222: {line1}"
+        );
+        assert!(
+            line1.contains(&format!("old_pid={pid1}")),
+            "second transition must report old_pid={pid1}: {line1}"
+        );
+
+        // All timing fields must be present and non-negative. We
+        // can't assert exact values (CI clock jitter) but the
+        // fields must exist.
+        for line in &transition_lines[..2] {
+            assert!(line.contains("spawn_ms="), "missing spawn_ms: {line}");
+            assert!(line.contains("grace_ms="), "missing grace_ms: {line}");
+            assert!(line.contains("kill_ms="), "missing kill_ms: {line}");
+            assert!(line.contains("total_ms="), "missing total_ms: {line}");
+        }
+
+        // Idempotent rebind must NOT have produced a transition
+        // log line for the third bind.
+        let idempotent_lines: Vec<&str> = transition_lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains("op=set") && l.contains("output=HDMI-A-1"))
+            .collect();
+        assert_eq!(
+            idempotent_lines.len(),
+            0,
+            "idempotent rebind must not emit a transition log: {idempotent_lines:?}"
+        );
+    }
+
+    /// Verify `unbind_with_op` emits a transition log with `op=unset`
+    /// (via the default `unbind()` wrapper) and `scene_id=<none>`.
+    /// The log line must come through even when no respawn happens
+    /// (i.e. the output being unbound was the last binding).
+    #[tokio::test]
+    async fn unbind_emits_transition_timing_log() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let captured_clone = captured.clone();
+        let make_writer =
+            move || -> Box<dyn std::io::Write> { Box::new(CapturedWriter(captured_clone.clone())) };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(make_writer)
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .with_target(true)
+            .with_ansi(false)
+            .finish();
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let wrapper = write_sleep_wrapper(60);
+        let pool = LweSinglePool::with_binary(&wrapper)
+            .with_flags(vec![])
+            .with_transition_grace_ms(100);
+
+        // First: bind so there's something to unbind.
+        let pid1 = pool.bind("DP-1", "111").await.unwrap();
+        // Now unbind via the default op="unset".
+        pool.unbind("DP-1").await.unwrap();
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        let unset_lines: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains("transition:") && l.contains("op=unset"))
+            .collect();
+        assert_eq!(
+            unset_lines.len(),
+            1,
+            "expected exactly one op=unset transition line, got {unset_lines:?}\nfull output:\n{output}"
+        );
+        let line = unset_lines[0];
+        assert!(line.contains("output=DP-1"), "missing output=DP-1: {line}");
+        assert!(
+            line.contains("scene_id=<none>"),
+            "unbind must report scene_id=<none>: {line}"
+        );
+        assert!(
+            line.contains(&format!("old_pid={pid1}")),
+            "unbind must report old_pid={pid1}: {line}"
+        );
+        assert!(
+            line.contains("new_pid=<none>"),
+            "unbind with no remaining bindings must report new_pid=<none>: {line}"
+        );
+
+        // Pool is now empty; second unbind is a no-op and must
+        // NOT emit a transition log.
+        let captured_before = captured.lock().unwrap().len();
+        pool.unbind("DP-1").await.unwrap();
+        let captured_after = captured.lock().unwrap().len();
+        assert_eq!(
+            captured_before, captured_after,
+            "no-op unbind on empty pool must not emit a log line"
+        );
+
+        let _ = std::fs::remove_file(&wrapper);
+    }
+}
+
+/// Test-only writer that captures into a shared `Vec<u8>`. Used by
+/// `tracing_subscriber::fmt::MakeWriter` to capture structured log
+/// lines into a buffer the test can assert against.
+#[cfg(test)]
+#[derive(Clone)]
+struct CapturedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl std::io::Write for CapturedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }

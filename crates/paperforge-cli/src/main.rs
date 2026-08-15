@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 
 use paperforge_core::{
     audio::AudioCommand,
-    backend::BackendState,
+    backend::{BackendState, WarnRateLimiter},
     config::{Config, ConfigPaths},
     daemon::{BackendOps, PaperforgeDaemon},
     dbus::{serve_dbus, PaperforgeControl},
@@ -1050,6 +1050,13 @@ async fn fullscreen_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Dur
     // outputs.
     ticker.tick().await;
     let mut prev: BTreeSet<String> = BTreeSet::new();
+    // Rate limiter for the recurring "fullscreen ON on X: kill_per_output
+    // was a no-op" WARN. Without this the daemon's journal fills with
+    // one entry per poll (~every 20-30s) for outputs whose LWE pid
+    // isn't tracked — same pattern as the no-scene-recorded limiter
+    // in the backend. 5min cooldown: first occurrence is actionable;
+    // repeats are noise until state changes.
+    let mut kill_no_op_limiter = WarnRateLimiter::new(Duration::from_secs(300));
     loop {
         ticker.tick().await;
         let snap = match paperforge_core::fullscreen::snapshot().await {
@@ -1080,14 +1087,24 @@ async fn fullscreen_dispatcher(daemon: Arc<PaperforgeDaemon>, poll_interval: Dur
                              see backend log for actual pid/SIGTERM outcome"
                         );
                     } else {
-                        tracing::warn!(
-                            target: "paperforge",
-                            "fullscreen ON on {output}: kill_per_output was a no-op \
-                             (daemon owns no pid for this output — likely a fullscreen \
-                             window appeared on an output whose LWE was launched outside \
-                             the daemon, e.g. before paperforge daemon started; \
-                             adopt_existing_lwes() runs at boot to fix this)"
-                        );
+                        let key = format!("{output}:fullscreen_kill_no_op");
+                        if kill_no_op_limiter.should_emit(&key) {
+                            tracing::warn!(
+                                target: "paperforge",
+                                "fullscreen ON on {output}: kill_per_output was a no-op \
+                                 (daemon owns no pid for this output — likely a fullscreen \
+                                 window appeared on an output whose LWE was launched outside \
+                                 the daemon, e.g. before paperforge daemon started; \
+                                 adopt_existing_lwes() runs at boot to fix this)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "paperforge",
+                                "fullscreen ON on {output}: kill_per_output was a no-op \
+                                 (suppressed by warn-rate-limiter; first occurrence within \
+                                 last 5min logged at WARN)"
+                            );
+                        }
                     }
                 }
                 Err(e) => tracing::warn!(

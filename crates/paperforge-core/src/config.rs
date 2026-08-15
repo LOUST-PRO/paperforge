@@ -138,6 +138,22 @@ pub struct Config {
     /// `~/.cache/paperforge/last-frame/`.
     #[serde(default)]
     pub fallback: FallbackConfig,
+
+    /// Grace window for hot-swap transitions in the v0.2 single-pool
+    /// architecture. `bind()` spawns the new LWE first, waits this
+    /// long, THEN kills the old one. The new process steals the
+    /// wlr-layer-shell surface from the old immediately at spawn,
+    /// so the visual effect is "old rendering → new rendering from
+    /// t=0" — no black gap.
+    ///
+    /// Default 2000 ms — long enough for most Workshop scenes to
+    /// render their first frame; heavier scenes may need 3000–4000 ms
+    /// (`transition_grace_ms = 4000` in `config.toml`).
+    ///
+    /// Set to 0 to revert to the v0.1 "kill-then-spawn" behaviour
+    /// (visible 1-3 s black gap during transitions).
+    #[serde(default = "default_transition_grace_ms")]
+    pub transition_grace_ms: u64,
 }
 
 /// Static-image fallback for when LWE is not running. The renderer
@@ -406,6 +422,10 @@ fn default_pool_enabled() -> bool {
     true
 }
 
+fn default_transition_grace_ms() -> u64 {
+    2000
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -420,6 +440,7 @@ impl Default for Config {
             pause: PauseConfig::default(),
             fps: FpsConfig::default(),
             fallback: FallbackConfig::default(),
+            transition_grace_ms: default_transition_grace_ms(),
         }
     }
 }
@@ -486,6 +507,10 @@ impl Config {
             ),
             None => LweBackendOps::with_fps_and_pool(self.fps.active_max, self.pool_enabled),
         };
+        // Thread the configured grace window into the pool so the
+        // spawn-first-kill-after bind() flow uses it. Without this
+        // call the pool falls back to its 2000 ms default.
+        ops.set_transition_grace_ms(self.transition_grace_ms);
         Arc::new(ops)
     }
 
@@ -760,6 +785,67 @@ mod tests {
         // out via `pool_enabled = false` in config.toml.
         let cfg = Config::default();
         assert!(cfg.pool_enabled, "pool_enabled must default to true");
+    }
+
+    #[test]
+    fn default_transition_grace_ms_is_2000() {
+        // The spawn-first-kill-after window defaults to 2000 ms so
+        // most Workshop scenes have time to render their first
+        // frame before the old LWE is killed. Operators with
+        // heavier scenes can raise it to 3000-4000 ms.
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.transition_grace_ms, 2000,
+            "transition_grace_ms must default to 2000 ms"
+        );
+    }
+
+    #[test]
+    fn roundtrip_transition_grace_ms_custom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths {
+            config_dir: tmp.path().to_path_buf(),
+            playlists_dir: tmp.path().join("playlists"),
+            cache_dir: tmp.path().join("cache"),
+            thumbnails_dir: tmp.path().join("cache").join("thumbnails"),
+            inventory_cache: tmp.path().join("cache").join("inventory.json"),
+        };
+        for d in [
+            &paths.config_dir,
+            &paths.playlists_dir,
+            &paths.cache_dir,
+            &paths.thumbnails_dir,
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let cfg = Config {
+            transition_grace_ms: 4000,
+            ..Config::default()
+        };
+        cfg.save(&paths).unwrap();
+        let loaded = Config::load(&paths).unwrap();
+        assert_eq!(
+            loaded.transition_grace_ms, 4000,
+            "transition_grace_ms override must roundtrip through toml"
+        );
+    }
+
+    #[test]
+    fn build_backend_ops_threads_transition_grace_ms() {
+        // `build_backend_ops()` must propagate Config.transition_grace_ms
+        // to the underlying pool, otherwise the configured value
+        // would silently fall back to the pool's 2000 ms default.
+        let cfg = Config {
+            transition_grace_ms: 3500,
+            ..Config::default()
+        };
+        let ops = cfg.build_backend_ops();
+        let pool = ops.backend().pool();
+        assert_eq!(
+            pool.transition_grace_ms(),
+            3500,
+            "build_backend_ops must thread transition_grace_ms into the pool"
+        );
     }
 
     #[test]
