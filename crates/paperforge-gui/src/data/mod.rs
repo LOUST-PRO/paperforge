@@ -20,3 +20,4 @@ pub mod bindings;
 pub mod inventory;
 pub mod outputs;
 pub mod playlists;
+pub mod thumbnails;

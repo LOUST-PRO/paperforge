@@ -3645,11 +3645,14 @@ name = "paperforge-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "dioxus",
  "dioxus-desktop",
  "dirs 5.0.1",
  "futures-util",
+ "image",
  "paperforge-core",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",

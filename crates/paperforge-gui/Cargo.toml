@@ -43,6 +43,20 @@ anyhow = { workspace = true }
 # XDG path resolution for the playlist store root (matches TUI behavior)
 dirs = { workspace = true }
 
+# Image decode + resize + encode (PR 8.1 thumbnails). Pinned to
+# 0.25.x to match the version already resolved transitively in the
+# workspace lockfile (Cargo.lock pins 0.25.10).
+image = "0.25"
+
+# base64 encode for data URLs (`<img src="data:image/png;base64,...">`).
+# Phase 1 of Fase 6C.1 — Phase 2 may switch to a `dioxus-desktop` custom
+# protocol scheme to avoid inline base64 bloat for larger inventories.
+base64 = "0.22"
+
+# SHA-256 for thumbnail cache key (PR 8.1). Reused from workspace so
+# the version matches `paperforge-core` (lockfile-pinned `0.10`).
+sha2 = { workspace = true }
+
 [features]
 default = []
 devtools = ["dioxus-desktop/devtools"]
