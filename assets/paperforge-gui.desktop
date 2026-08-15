@@ -1,0 +1,56 @@
+[Desktop Entry]
+# paperforge-gui — Dioxus 0.8-alpha desktop GUI for paperforge.
+#
+# This file ships in the repo under assets/. Operators install it via
+# `scripts/install-desktop-entry.sh` which copies it to
+# `~/.local/share/applications/` and substitutes the resolved binary
+# path into Exec= (so it works even if cargo bin isn't on $PATH).
+#
+# Fields:
+#   Type=Application    — required for app launchers (fuzzel, rofi,
+#                          GNOME Shell, KDE Plasma) to show the entry.
+#   Name / GenericName  — Name is what the launcher displays;
+#                          GenericName is the category hint (used by
+#                          GNOME Shell's category grouping).
+#   Comment             — single-line tooltip / search snippet.
+#   Exec                — substituted at install time to the absolute
+#                          path of the paperforge-gui binary.
+#                          The %U and %F placeholders are unused here
+#                          (no URL/file open semantics).
+#   Icon                — name looked up via the freedesktop icon
+#                          theme (hicolor/scalable/apps/paperforge-gui.svg
+#                          or raster fallbacks). Install script copies
+#                          the SVG into the theme path.
+#   Terminal=false      — this is a GUI app; no terminal wrapper.
+#   Categories          — freedesktop taxonomy. Utility;Settings;
+#                          places it under both "System" (Settings)
+#                          and "Accessories" (Utility). Graphics added
+#                          because the app manages wallpaper imagery.
+#   StartupNotify=true  — asks the compositor to show a busy cursor
+#                          while the app is starting; helps the
+#                          operator know the click registered.
+#   StartupWMClass      — matches the GTK app_id we set in
+#                          `crates/paperforge-gui/src/main.rs` via
+#                          Dioxus's default windowing. Required for
+#                          GNOME Shell to group multi-window apps;
+#                          harmless for single-window.
+#   Keywords            — semicolon-separated, used by launcher search.
+#                          "wallpaper;background;desktop;steam"
+#                          surfaces the app when the operator types
+#                          "wallpaper" or "background".
+#   SingleMainWindow    — non-standard but read by some launchers
+#                          (e.g. elementary OS) to disable the
+#                          "launch new instance" button.
+Type=Application
+Version=1.0
+Name=Paperforge
+GenericName=Wallpaper Manager
+Comment=Manage Wallpaper Engine wallpapers and playlists from your desktop
+Exec=PAPERFORGE_GUI_EXEC_PLACEHOLDER
+Icon=paperforge-gui
+Terminal=false
+Categories=Utility;Settings;Graphics;
+StartupNotify=true
+StartupWMClass=paperforge-gui
+Keywords=wallpaper;background;desktop;steam;scene;
+SingleMainWindow=true

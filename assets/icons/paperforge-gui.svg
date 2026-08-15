@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  paperforge-gui app icon — scalable SVG.
+  Ships in the repo under assets/icons/. Install script copies it
+  to ~/.local/share/icons/hicolor/scalable/apps/ so the freedesktop
+  icon theme picks it up.
+
+  Design rationale:
+    - Outer rounded rectangle = a display / monitor wallpaper
+      surface (the thing paperforge manages).
+    - Inner "P" with a folded corner = paperforge (P + paper sheet
+      visual cue).
+    - Gradient stroke on the "P" = signal of motion (wallpapers
+      animate; Wallpaper Engine scenes).
+    - viewBox 256×256 matches the freedesktop recommended size
+      for `hicolor/scalable/apps/`. Launchers (fuzzel, rofi,
+      GNOME Shell) scale this down to 48-128 px as needed.
+    - No rasterized effects (no filter:, no embedded bitmap) so
+      it stays sharp at all sizes — the launcher may render it at
+      16px in a panel, 256px in a grid, or 512px on a hi-DPI dock.
+    - stroke + fill use direct hex values rather than
+      currentColor because freedesktop launchers don't set a CSS
+      context for app icons (currentColor would fall back to
+      black, breaking dark themes).
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 256 256"
+     width="256"
+     height="256"
+     role="img"
+     aria-label="Paperforge">
+  <title>Paperforge</title>
+  <desc>Wallpaper manager for Wallpaper Engine scenes</desc>
+
+  <!-- Monitor outline: dark background + accent stroke.
+       Slightly rounded corners (rx=24) so it reads as "device"
+       rather than "rectangle". The dark fill matches the GUI's
+       #0d1117 background so the icon feels native in the
+       launcher's dark surface. -->
+  <rect x="16"
+        y="16"
+        width="224"
+        height="224"
+        rx="24"
+        ry="24"
+        fill="#0d1117"
+        stroke="#484f58"
+        stroke-width="3" />
+
+  <!-- "P" letterform (paperforge P).
+       Two paths: a vertical stem and a rounded bowl. Built from
+       primitives rather than <text> because launchers don't
+       guarantee a system font is available — a path renders
+       identically across hosts. -->
+  <path d="M 80 64
+           L 80 192
+           L 104 192
+           L 104 144
+           L 144 144
+           C 172 144 192 124 192 104
+           C 192 84 172 64 144 64
+           Z
+           M 104 88
+           L 144 88
+           C 156 88 168 96 168 104
+           C 168 112 156 120 144 120
+           L 104 120
+           Z"
+        fill="#79c0ff"
+        stroke="#1f6feb"
+        stroke-width="2"
+        stroke-linejoin="round" />
+
+  <!-- Motion accent: small triangle at top-right, evoking a
+       play arrow / scene motion. Sits in the negative space
+       inside the "P" bowl without overlapping the letterform.
+       The accent is what makes this icon distinct from a
+       generic "P" — it's the "this is a wallpaper / scene
+       manager" cue. -->
+  <path d="M 180 80
+           L 200 92
+           L 180 104
+           Z"
+        fill="#3fb950"
+        opacity="0.85" />
+
+  <!-- Bottom stand / dock hint: thin horizontal line below the
+       monitor outline. Subtle — gives the icon a "device" feel
+       without being a literal monitor base. -->
+  <rect x="96"
+        y="208"
+        width="64"
+        height="4"
+        rx="2"
+        fill="#484f58" />
+</svg>
