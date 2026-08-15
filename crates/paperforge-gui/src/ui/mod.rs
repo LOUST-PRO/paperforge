@@ -25,7 +25,7 @@ pub mod playlist_editor;
 pub mod playlists;
 pub mod preview;
 pub mod root;
+pub mod settings_panel;
 pub mod sidebar;
 pub mod status;
-pub mod settings_panel;
 pub mod theme;

@@ -25,7 +25,10 @@ use crate::error::GuiError;
 /// Save `Config` to disk. Overwrites the existing TOML file. The
 /// `extra_sources` mutations are pure on the in-memory `Config`
 /// struct; this is the only place that hits disk.
-pub fn save_config(cache_paths: &paperforge_core::config::ConfigPaths, cfg: &Config) -> Result<(), GuiError> {
+pub fn save_config(
+    cache_paths: &paperforge_core::config::ConfigPaths,
+    cfg: &Config,
+) -> Result<(), GuiError> {
     let cp = cache_paths.clone();
     let cfg_clone = cfg.clone();
     tokio::task::block_in_place(move || cfg_clone.save(&cp))
@@ -98,16 +101,28 @@ mod tests {
     #[test]
     fn push_extra_source_dedups_exact_match() {
         let mut cfg = empty_cfg();
-        assert!(push_extra_source(&mut cfg, PathBuf::from("/home/lou/Wallpapers")));
-        assert!(!push_extra_source(&mut cfg, PathBuf::from("/home/lou/Wallpapers")));
+        assert!(push_extra_source(
+            &mut cfg,
+            PathBuf::from("/home/lou/Wallpapers")
+        ));
+        assert!(!push_extra_source(
+            &mut cfg,
+            PathBuf::from("/home/lou/Wallpapers")
+        ));
         assert_eq!(cfg.extra_sources.len(), 1);
     }
 
     #[test]
     fn push_extra_source_dedups_trailing_separator() {
         let mut cfg = empty_cfg();
-        assert!(push_extra_source(&mut cfg, PathBuf::from("/home/lou/Wallpapers")));
-        assert!(!push_extra_source(&mut cfg, PathBuf::from("/home/lou/Wallpapers/")));
+        assert!(push_extra_source(
+            &mut cfg,
+            PathBuf::from("/home/lou/Wallpapers")
+        ));
+        assert!(!push_extra_source(
+            &mut cfg,
+            PathBuf::from("/home/lou/Wallpapers/")
+        ));
         assert_eq!(cfg.extra_sources.len(), 1);
     }
 
@@ -125,7 +140,10 @@ mod tests {
             workshop_roots: vec![PathBuf::from("/workshop")],
             local_roots: vec![PathBuf::from("/home/lou/Wallpapers")],
         };
-        let extra = vec![PathBuf::from("/home/lou/Wallpapers"), PathBuf::from("/data/wps")];
+        let extra = vec![
+            PathBuf::from("/home/lou/Wallpapers"),
+            PathBuf::from("/data/wps"),
+        ];
         let merged = merge_inventory_roots(&detected, &extra);
         assert_eq!(merged.len(), 3); // deduped locally
         assert_eq!(merged[0], PathBuf::from("/workshop"));
