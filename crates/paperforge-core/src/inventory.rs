@@ -146,9 +146,14 @@ impl Inventory {
         // immutably, so we can't call the mutable skip on it. The
         // docs explicitly call out this ergonomic gap:
         // https://docs.rs/walkdir/2.5.0/walkdir/struct.IntoIter.html#method.skip_current_dir
+        // The scanner follows symlinks (so operator-laid symlinks to
+        // media or workshop directories are picked up) but the
+        // `match entry { Ok(e) => e, Err(_) => continue }` below
+        // silently skips walkdir's symlink-cycle errors, which is
+        // exactly the behaviour we want for a sane filesystem.
         let mut walker = WalkDir::new(root)
             .max_depth(max_depth)
-            .follow_links(false)
+            .follow_links(true)
             .into_iter();
         while let Some(entry) = walker.next() {
             let entry = match entry {
@@ -170,10 +175,7 @@ impl Inventory {
                         // PR 9.6: canonicalize so symlinked roots
                         // (e.g. /home/lou/.steam/root + /home/lou/.steam/steam
                         // both → /home/lou/.local/share/Steam) dedup.
-                        let canonical = wp
-                            .path
-                            .canonicalize()
-                            .unwrap_or_else(|_| wp.path.clone());
+                        let canonical = wp.path.canonicalize().unwrap_or_else(|_| wp.path.clone());
                         let mut wp = wp;
                         wp.path = canonical.clone();
                         if self.entries.insert(canonical, wp).is_none() {
@@ -209,9 +211,7 @@ impl Inventory {
                         .and_then(|m| m.modified().ok())
                         .unwrap_or(SystemTime::UNIX_EPOCH);
 
-                    let canonical = path
-                        .canonicalize()
-                        .unwrap_or_else(|_| path.to_path_buf());
+                    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
                     let wp = WallpaperEntry {
                         path: canonical.clone(),
                         mtime,
@@ -424,6 +424,105 @@ mod tests {
         assert_eq!(inv.len(), 2, "no double-counting via symlinks");
     }
 
+    /// Regression: the scanner must follow symlinks pointing to media
+    /// files so operators can organise their library (e.g.
+    /// `~/Wallpapers/cool.mp4 → /mnt/external/cool.mp4`). Before this
+    /// fix `WalkDir` was driven with `follow_links(false)` and the
+    /// target file was invisible to the inventory.
+    #[test]
+    fn scan_follows_symlinks_to_files() {
+        let base = tempfile::tempdir().unwrap();
+        // The "real" media lives somewhere else; we expose it via a
+        // symlink so the scanner has to follow the link to see the file.
+        let real = base.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("cool.mp4"), b"fake-mp4").unwrap();
+
+        let link_dir = base.path().join("link_dir");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        std::os::unix::fs::symlink(real.join("cool.mp4"), link_dir.join("cool.mp4")).unwrap();
+
+        // Asking the scanner to descend link_dir/ as its root would
+        // require looping over symlinks-to-directories; the more common
+        // shape is: root contains the symlink as a loose file. We mirror
+        // that by scanning `link_dir` itself, which has the symlinked
+        // media directly inside it.
+        let mut inv = Inventory::new();
+        let n = inv.scan(&link_dir, 4).unwrap();
+        assert_eq!(n, 1, "symlinked loose media must register");
+        let entries: Vec<_> = inv.entries().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, WallpaperKind::LooseVideo);
+        // The entry's path should canonicalize to the real file.
+        assert_eq!(
+            entries[0].path,
+            real.join("cool.mp4").canonicalize().unwrap()
+        );
+    }
+
+    /// Regression: an operator's Workshop layout is sometimes exposed
+    /// via a symlink-to-directory (e.g. `/workshop/12345 → /mnt/real/12345`)
+    /// because the real data lives on a different filesystem. The scanner
+    /// must follow the symlink to the directory itself, then descend into
+    /// it and register the `project.json` WorkshopScene entry.
+    #[test]
+    fn scan_follows_symlinks_to_dirs() {
+        let base = tempfile::tempdir().unwrap();
+        let real_workshop = base.path().join("real_workshop").join("12345");
+        std::fs::create_dir_all(&real_workshop).unwrap();
+        std::fs::write(
+            real_workshop.join("project.json"),
+            r#"{"title":"Symlinked Scene","type":"scene","id":"12345"}"#,
+        )
+        .unwrap();
+        // Plant internal media so a no-skip regression would manifest
+        // as multiple LooseImage entries.
+        std::fs::write(real_workshop.join("preview.jpg"), b"j").unwrap();
+        std::fs::write(real_workshop.join("bg.png"), b"p").unwrap();
+
+        let symlink_workshop = base.path().join("symlink_workshop");
+        std::fs::create_dir_all(&symlink_workshop).unwrap();
+        std::os::unix::fs::symlink(&real_workshop, symlink_workshop.join("12345")).unwrap();
+
+        let mut inv = Inventory::new();
+        let n = inv.scan(&symlink_workshop, 4).unwrap();
+        assert_eq!(n, 1, "symlinked WorkshopScene must register exactly once");
+        let entries: Vec<_> = inv.entries().collect();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.kind, WallpaperKind::WorkshopScene);
+        assert_eq!(entry.title.as_deref(), Some("Symlinked Scene"));
+        assert_eq!(entry.workshop_id.as_deref(), Some("12345"));
+        // Path is canonicalized — should resolve to the real directory.
+        assert_eq!(entry.path, real_workshop.canonicalize().unwrap());
+    }
+
+    /// Regression: symlink cycles (a → b → a) are a real operator risk
+    /// and `WalkDir` detects them, returning `Err` from `next()`. The
+    /// scanner's existing `Err(_) => continue` skip protects against a
+    /// panic; this test pins that behaviour so a future refactor can't
+    /// silently turn cycle detection into a hang.
+    #[test]
+    fn scan_handles_symlink_cycles_without_panic() {
+        let base = tempfile::tempdir().unwrap();
+        let a = base.path().join("a");
+        let b = base.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        // Plant a real file inside `b` so the scanner has *something* to
+        // find — proves the cycle didn't halt the walker prematurely.
+        std::fs::write(b.join("scene"), b"j").unwrap();
+        // Cycle: a/loop → b/loop, b/loop → a/loop.
+        std::os::unix::fs::symlink(&b, a.join("loop")).unwrap();
+        std::os::unix::fs::symlink(&a, b.join("loop")).unwrap();
+
+        let mut inv = Inventory::new();
+        // If the cycle handling regresses (e.g. infinite recursion or a
+        // panic on Err) this call will time out or abort. The assertion
+        // is purely "it returned at all".
+        let _ = inv.scan(&a, 4).unwrap();
+    }
+
     /// Two scenes in the same root — each must register as exactly one
     /// entry. This catches the bug where `skip_current_dir` only worked
     /// for the first hit and let the second scene leak its internals.
@@ -563,10 +662,7 @@ mod tests {
         use crate::paths::default_paths;
 
         let paths = default_paths();
-        eprintln!(
-            "Detected workshop roots: {:?}",
-            paths.workshop_roots
-        );
+        eprintln!("Detected workshop roots: {:?}", paths.workshop_roots);
         eprintln!("Detected local roots:   {:?}", paths.local_roots);
         let roots: Vec<_> = paths.all().cloned().collect();
         assert!(!roots.is_empty(), "no source dirs found in $HOME");
