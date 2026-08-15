@@ -121,6 +121,16 @@ impl Inventory {
     /// media (`bg.png`, `preview.jpg`, scene sub-folders) belong to
     /// the scene entry, not as separate `LooseImage` rows. Without
     /// that skip, one scene produces 5–10 inventory rows.
+    ///
+    /// **Dedup**: each entry's path is canonicalized (symlinks
+    /// resolved) before being used as the BTreeMap key. This means
+    /// scanning two roots that point to the same filesystem data
+    /// (e.g. `/home/lou/.steam/root` and `/home/lou/.steam/steam`
+    /// are both symlinks to `/home/lou/.local/share/Steam`) does
+    /// NOT register each scene twice. Without canonicalization the
+    /// strings differ (`/root/.../123456` vs `/steam/.../123456`)
+    /// and the dedup misses. On Lou's machine this drops the
+    /// inventory from 369 entries to 184.
     pub fn scan(&mut self, root: &Path, max_depth: usize) -> Result<usize> {
         if !root.exists() {
             tracing::debug!("skip non-existent root: {}", root.display());
@@ -157,7 +167,16 @@ impl Inventory {
                 let project_json = path.join("project.json");
                 if project_json.is_file() {
                     if let Ok(wp) = self.read_workshop_scene(&project_json, path) {
-                        if self.entries.insert(wp.path.clone(), wp).is_none() {
+                        // PR 9.6: canonicalize so symlinked roots
+                        // (e.g. /home/lou/.steam/root + /home/lou/.steam/steam
+                        // both → /home/lou/.local/share/Steam) dedup.
+                        let canonical = wp
+                            .path
+                            .canonicalize()
+                            .unwrap_or_else(|_| wp.path.clone());
+                        let mut wp = wp;
+                        wp.path = canonical.clone();
+                        if self.entries.insert(canonical, wp).is_none() {
                             added += 1;
                         }
                     }
@@ -190,14 +209,17 @@ impl Inventory {
                         .and_then(|m| m.modified().ok())
                         .unwrap_or(SystemTime::UNIX_EPOCH);
 
+                    let canonical = path
+                        .canonicalize()
+                        .unwrap_or_else(|_| path.to_path_buf());
                     let wp = WallpaperEntry {
-                        path: path.to_path_buf(),
+                        path: canonical.clone(),
                         mtime,
                         kind,
                         title: None,
                         workshop_id: None,
                     };
-                    if self.entries.insert(wp.path.clone(), wp).is_none() {
+                    if self.entries.insert(canonical, wp).is_none() {
                         added += 1;
                     }
                 }
@@ -363,6 +385,43 @@ mod tests {
                 .all(|e| matches!(e.kind, WallpaperKind::WorkshopScene)),
             "only WorkshopScene entries should exist"
         );
+    }
+
+    /// Regression for the 369-entries bug: when two source roots are
+    /// symlinks to the same filesystem path (e.g. `/home/lou/.steam/root`
+    /// and `/home/lou/.steam/steam` are both symlinks to
+    /// `/home/lou/.local/share/Steam`), scanning both should NOT
+    /// register each scene twice. The InventoryHashMap is keyed by
+    /// the *canonical* path (with symlinks resolved), so the second
+    /// scan's collision is a no-op.
+    #[test]
+    fn scan_dedups_symlinked_roots() {
+        let base = tempfile::tempdir().unwrap();
+        // The real Workshop layout. We simulate by creating one
+        // directory per scene + project.json; then we expose the
+        // same parent via two symlinks.
+        let real = base.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        for (id, title) in [("alpha", "Alpha"), ("bravo", "Bravo")] {
+            let scene = real.join(id);
+            std::fs::create_dir_all(&scene).unwrap();
+            std::fs::write(
+                scene.join("project.json"),
+                format!(r#"{{"title":"{title}","id":"{id}"}}"#),
+            )
+            .unwrap();
+        }
+        let link_a = base.path().join("link_a");
+        let link_b = base.path().join("link_b");
+        std::os::unix::fs::symlink(&real, &link_a).unwrap();
+        std::os::unix::fs::symlink(&real, &link_b).unwrap();
+
+        let mut inv = Inventory::new();
+        let n1 = inv.scan(&link_a, 4).unwrap();
+        let n2 = inv.scan(&link_b, 4).unwrap();
+        assert_eq!(n1, 2, "first scan should register 2 scenes");
+        assert_eq!(n2, 0, "second scan via symlink must be a no-op");
+        assert_eq!(inv.len(), 2, "no double-counting via symlinks");
     }
 
     /// Two scenes in the same root — each must register as exactly one
