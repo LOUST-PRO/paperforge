@@ -19,7 +19,7 @@
 
 #![allow(clippy::incompatible_msrv)]
 
-use dioxus::prelude::launch;
+use dioxus::prelude::LaunchBuilder;
 // Crate names with `-` are referenced as `_` in Rust (Cargo convention).
 // Aliased to `core` so clippy::single_component_path_imports stays clean.
 use paperforge_core as core;
@@ -57,5 +57,27 @@ fn main() {
         }
     }
 
-    launch(ui::root::Root);
+    // PR 9.1: Configure the WebKitGTK window background so the area
+    // outside our rendered divs doesn't paint white. The default
+    // WebView background is `(255, 255, 255, 255)` which clashes with
+    // the dark theme and shows through during layout transitions.
+    // Pair with `body { background-color: #0d1117 }` in the inline
+    // root style for defense in depth.
+    //
+    // Dioxus 0.8-alpha's `LaunchBuilder::with_cfg` takes anything
+    // implementing `LaunchConfig`; the desktop `Config` is the
+    // canonical target. We pass `Config::new().with_background_color`
+    // + a `WindowBuilder` with a sensible default size so the
+    // window opens at 1100x720 instead of the platform default
+    // (which on WebKitGTK can be tiny on hi-DPI Wayland sessions).
+    let cfg = dioxus_desktop::Config::new()
+        .with_background_color((0x0d, 0x11, 0x17, 0xff))
+        .with_window(
+            dioxus_desktop::WindowBuilder::new()
+                .with_title("paperforge — desktop GUI")
+                .with_inner_size(dioxus_desktop::LogicalSize::new(1100.0, 720.0))
+                .with_min_inner_size(dioxus_desktop::LogicalSize::new(800.0, 500.0)),
+        );
+
+    LaunchBuilder::new().with_cfg(cfg).launch(ui::root::Root);
 }
