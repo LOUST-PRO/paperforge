@@ -36,6 +36,7 @@ use crate::ipc::client::{IpcClient, SignalEvent};
 use crate::ipc::reconnect::next_backoff;
 use crate::ipc::ConnectionStatus;
 use crate::ui::bindings::BindingsPanel;
+use crate::ui::inventory_panel::InventoryPanel;
 use crate::ui::picker::Picker;
 use crate::ui::playlist_editor::{DragPayload, OpenEditor, PlaylistEditor};
 use crate::ui::playlists::PlaylistsPanel;
@@ -544,6 +545,26 @@ pub fn Root() -> Element {
         });
     };
 
+    // on_browse: PR 9.3 — fired by the always-visible InventoryPanel
+    // when the operator clicks a wallpaper row. PR 9.3 doesn't have
+    // a per-output preview pane yet (niri has no outputs), so we
+    // surface the path in a Notice banner as the UX feedback. PR 9.4
+    // will add a proper preview pane; this signal is the integration
+    // point so the panel doesn't need to change again.
+    let error_for_browse = error;
+    let mut browse_preview: Signal<Option<PathBuf>> = use_signal(|| None);
+    let on_browse = move |path: PathBuf| {
+        // Stash the selected path so a future preview pane can read
+        // it. For now, push a Notice with the path so the operator
+        // sees their click landed.
+        let mut notice = error_for_browse;
+        browse_preview.set(Some(path.clone()));
+        notice.set(Some(GuiError::Notice(format!(
+            "Selected: {}",
+            path.display()
+        ))));
+    };
+
     // ---- Playlist editor callbacks (PR 7) ----
     //
     // on_open_editor: kicks off an async load of the on-disk playlist
@@ -695,6 +716,18 @@ pub fn Root() -> Element {
                     on_apply,
                     on_edit: on_open_editor,
                 }
+            }
+            // PR 9.3: InventoryPanel — always-visible wallpapers
+            // browser. Sits in its own row below the 3-column grid
+            // because the modal Picker is unreachable when `outputs`
+            // is empty (niri / headless). The operator needs to see
+            // the inventory without a Set-action prerequisite. Click
+            // → on_browse (currently surfaces the path in a Notice
+            // banner; PR 9.4 wires a preview pane).
+            InventoryPanel {
+                entries: inventory_snapshot.clone(),
+                cache_dir: use_context::<crate::app::AppState>().cache_paths.thumbnails_dir.clone(),
+                on_browse,
             }
             // Picker modal (PR 6). Renders only when the operator
             // has clicked Set on some output. Sits at the bottom of

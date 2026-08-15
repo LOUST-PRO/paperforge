@@ -11,12 +11,14 @@
 //! - `picker` — PR 6 (per-output wallpaper picker)
 //! - `playlist_editor` — PR 7 (full playlist editor modal)
 //! - `preview` — PR 8 (static `preview.jpg` pane)
+//! - `inventory_panel` — PR 9.3 (always-visible wallpapers browser)
 //!
 //! Until each PR lands the module may be empty or absent. We
 //! declare them eagerly here so the navigation graph is stable
 //! across the sprint.
 
 pub mod bindings;
+pub mod inventory_panel;
 pub mod picker;
 pub mod playlist_editor;
 pub mod playlists;
