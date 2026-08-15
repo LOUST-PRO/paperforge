@@ -9,6 +9,7 @@
 //! - `status` — PR 3 (banner UX)
 //! - `playlists` — PR 3 (read-only list), PR 7 (drag-drop editor)
 //! - `picker` — PR 6 (per-output wallpaper picker)
+//! - `playlist_editor` — PR 7 (full playlist editor modal)
 //! - `preview` — PR 8 (static `preview.jpg` pane)
 //!
 //! Until each PR lands the module may be empty or absent. We
@@ -17,6 +18,7 @@
 
 pub mod bindings;
 pub mod picker;
+pub mod playlist_editor;
 pub mod playlists;
 pub mod root;
 pub mod sidebar;

@@ -47,7 +47,10 @@ async fn save_playlist_overwrites_and_round_trips() {
         .unwrap()
         .load("roundtrip")
         .unwrap();
-    assert_eq!(reloaded, pl, "second save should overwrite without duplicates");
+    assert_eq!(
+        reloaded, pl,
+        "second save should overwrite without duplicates"
+    );
 
     // Verify the file count is exactly one (no sharding or
     // accidental concat). `store.list()` returns the sorted stems.
@@ -76,9 +79,6 @@ async fn save_playlist_creates_store_directory_if_missing() {
         .await
         .expect("save into fresh nested dir");
     assert!(nested.is_dir(), "store root should be created");
-    let loaded = PlaylistStore::new(&nested)
-        .unwrap()
-        .load("first")
-        .unwrap();
+    let loaded = PlaylistStore::new(&nested).unwrap().load("first").unwrap();
     assert_eq!(loaded, pl);
 }

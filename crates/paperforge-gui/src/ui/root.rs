@@ -26,9 +26,10 @@ use dioxus::prelude::*;
 use paperforge_core::backend::BackendState;
 use paperforge_core::hotplug::{CompositorHotplugSource, Output};
 use paperforge_core::inventory::WallpaperEntry;
+use paperforge_core::playlist::{Playlist, PlaylistStore};
 
 use crate::data::bindings::Binding;
-use crate::data::playlists::{refresh_playlists, PlaylistSummary};
+use crate::data::playlists::{refresh_playlists, save_playlist, PlaylistSummary};
 use crate::data::{inventory as data_inventory, outputs as data_outputs};
 use crate::error::GuiError;
 use crate::ipc::client::{IpcClient, SignalEvent};
@@ -36,6 +37,7 @@ use crate::ipc::reconnect::next_backoff;
 use crate::ipc::ConnectionStatus;
 use crate::ui::bindings::BindingsPanel;
 use crate::ui::picker::Picker;
+use crate::ui::playlist_editor::{OpenEditor, PlaylistEditor};
 use crate::ui::playlists::PlaylistsPanel;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::status::StatusBanner;
@@ -82,6 +84,14 @@ pub fn Root() -> Element {
     // PR 6: which output's picker modal is open. `None` = no modal.
     // When set, the Picker overlay renders on top of the panels.
     let picker_open_for: Signal<Option<String>> = use_signal(|| None);
+    // PR 7: which playlist is being edited. `None` = editor closed.
+    // `Some(OpenEditor)` carries the on-disk name + a live `Playlist`
+    // draft the operator mutates before Save hits disk.
+    let editor_draft: Signal<Option<OpenEditor>> = use_signal(|| None);
+    // PR 7: sub-picker visibility inside the editor. Toggled by the
+    // editor's "Add wallpaper" button. Lives here so the editor
+    // remains a controlled component (no nested `use_signal`).
+    let editor_show_picker: Signal<bool> = use_signal(|| false);
 
     // ---- Coroutines ----
 
@@ -111,6 +121,13 @@ pub fn Root() -> Element {
     // Playlists loop: every 10s, list summaries from the on-disk
     // playlist store. Missing root defaults to
     // ~/.config/paperforge/playlists — matches the TUI.
+    //
+    // PR 7: we clone the root into `playlists_root_for_editor`
+    // before the `use_coroutine` consumes a clone of it. The editor's
+    // `on_open_editor` / `on_save_editor` closures need their own
+    // copy to load + save playlists asynchronously — the coroutine
+    // captures its clone by `move` and the editor closures read
+    // `playlists_root_for_editor` (also a clone).
     let playlists_root = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -120,6 +137,7 @@ pub fn Root() -> Element {
         })
         .join("paperforge")
         .join("playlists");
+    let playlists_root_for_editor = playlists_root.clone();
     let _playlists_loop = use_coroutine(move |_rx: UnboundedReceiver<()>| {
         let root = playlists_root.clone();
         let mut playlists_sig = playlists;
@@ -522,6 +540,69 @@ pub fn Root() -> Element {
         });
     };
 
+    // ---- Playlist editor callbacks (PR 7) ----
+    //
+    // on_open_editor: kicks off an async load of the on-disk playlist
+    // and sets `editor_draft` to `Some(OpenEditor)` on success. The
+    // editor modal renders only when `editor_draft` is `Some(_)`.
+    //
+    // The load goes through `spawn_blocking` because `PlaylistStore`
+    // is sync. On failure (broken / missing playlist file), we surface
+    // the error via the banner and leave the editor closed.
+    let editor_for_open = editor_draft;
+    let error_for_open = error;
+    let root_for_open = playlists_root_for_editor.clone();
+    let on_open_editor = move |name: String| {
+        let mut editor = editor_for_open;
+        let mut err = error_for_open;
+        let root = root_for_open.clone();
+        spawn(async move {
+            let load_result = tokio::task::spawn_blocking(move || -> Result<Playlist, GuiError> {
+                let store = PlaylistStore::new(&root).map_err(GuiError::from_core)?;
+                store.load(&name).map_err(GuiError::from_core)
+            })
+            .await;
+            match load_result {
+                Ok(Ok(playlist)) => {
+                    editor.set(Some(OpenEditor {
+                        name: playlist.name.clone(),
+                        draft: playlist,
+                    }));
+                }
+                Ok(Err(e)) => err.set(Some(e)),
+                Err(join_err) => err.set(Some(GuiError::Core(format!(
+                    "spawn_blocking (open_editor): {join_err}"
+                )))),
+            }
+        });
+    };
+
+    // on_save_editor: writes the live draft back to disk via
+    // `save_playlist`, then closes the editor on success. On failure,
+    // surfaces the error but keeps the editor open so the operator
+    // can retry (no data is lost — the draft is in `editor_draft`).
+    let editor_for_save = editor_draft;
+    let error_for_save = error;
+    let root_for_save = playlists_root_for_editor;
+    let on_save_editor = move |playlist: Playlist| {
+        let mut editor = editor_for_save;
+        let mut err = error_for_save;
+        let root = root_for_save.clone();
+        spawn(async move {
+            match save_playlist(root, playlist).await {
+                Ok(()) => editor.set(None),
+                Err(e) => err.set(Some(e)),
+            }
+        });
+    };
+
+    // on_cancel_editor: drops the draft and closes the editor. No
+    // disk write happens — the on-disk playlist is untouched.
+    let mut editor_for_cancel = editor_draft;
+    let on_cancel_editor = move |_| {
+        editor_for_cancel.set(None);
+    };
+
     rsx! {
         document::Title { "paperforge — Dioxus GUI" }
         div {
@@ -599,6 +680,7 @@ pub fn Root() -> Element {
                     playlists: playlists_snapshot.clone(),
                     connected,
                     on_apply,
+                    on_edit: on_open_editor,
                 }
             }
             // Picker modal (PR 6). Renders only when the operator
@@ -611,6 +693,20 @@ pub fn Root() -> Element {
                     entries: inventory_snapshot.clone(),
                     on_pick: on_pick_wallpaper,
                     on_close: on_close_picker,
+                }
+            }
+            // Playlist editor modal (PR 7). Renders only when
+            // `editor_draft` is `Some(_)`. Mirrors the Picker pattern
+            // but carries a `Signal<Option<OpenEditor>>` for
+            // bidirectional draft mutation (Save reads the live
+            // draft; Up/Down/Remove buttons mutate it).
+            if editor_draft.cloned().is_some() {
+                PlaylistEditor {
+                    draft: editor_draft,
+                    show_picker: editor_show_picker,
+                    inventory: inventory_snapshot.clone(),
+                    on_save: on_save_editor,
+                    on_cancel: on_cancel_editor,
                 }
             }
             div {
