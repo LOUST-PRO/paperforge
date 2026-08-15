@@ -1,0 +1,61 @@
+# paperforge project-level cargo config.
+#
+# Why this file exists (separate from `~/.cargo/config.toml`):
+#   The user-level config has `jobs = 4` and `debug = 0` for dev —
+#   those are personal hardware choices. Release build settings are
+#   a project decision: they affect CI, downstream packagers, and
+#   every `cargo build --release` invocation in this repo.
+#
+# This file applies to anyone building paperforge, including:
+#   - GitHub Actions CI (releases need determinism)
+#   - The operator's laptop (low-peak-RSS builds)
+#   - `make build-gui` and `make build-gui-low-mem` Makefile targets
+#
+# For per-laptop hardware-specific knobs (e.g. `CARGO_BUILD_JOBS=N`
+# env var, custom `[target.x86_64-unknown-linux-musl]` linker),
+# keep those in the user-level `~/.cargo/config.toml`.
+
+# ---------------------------------------------------------------------------
+# Release profile: lower peak memory at the cost of ~30% slower build.
+#
+# Why these knobs (each affects peak RSS at a different phase):
+#
+#   codegen-units = 1
+#     Single-threaded codegen per crate. The Rust default is 16
+#     (one unit per build thread), which means each crate spikes to
+#     N-thread codegen memory at the end of compilation. With 1 unit,
+#     codegen is serial — much smaller per-crate peak. The dominant
+#     knob for peak memory on multi-core machines.
+#
+#     Cost: ~30% slower wall-clock release build. For a hobby OSS with
+#     one binary, this is acceptable. Operators on fast hardware who
+#     prefer speed can override with `--config "profile.release.codegen-units=16"`.
+#
+#   lto = "thin"
+#     Thin LTO (~75% of fat LTO's optimization benefit) at ~25% of the
+#     link-time memory cost. Fat LTO links all crates into one LLVM
+#     module and can spike 2-4 GiB at link time; thin LTO only links
+#     cross-crate call sites. The Rust default is no LTO for release —
+#     explicit here to prevent a future toolchain bump from silently
+#     switching us to "fat" (the lto default is technically false, but
+#     some build scripts request fat).
+#
+#   incremental = false
+#     Release builds aren't incremental by default — but explicit is
+#     better than implicit. Prevents a future config change from
+#     turning this on, which would inflate the `target/` dir size and
+#     keep stale debug artifacts around.
+#
+# What's NOT here:
+#   - `debuginfo = 0` — kept opt-in via `make build-gui-low-mem`. For
+#     CI smoke builds the debug info is useful for stack traces; the
+#     operator's laptop can strip on demand.
+#   - `panic = "abort"` — too aggressive; we want unwinding for the
+#     daemon's error propagation.
+#   - `opt-level = "z"` / `"s"` — too aggressive for a wallpaper daemon
+#     with image decode hot paths; the default opt-level=3 is correct.
+# ---------------------------------------------------------------------------
+[profile.release]
+codegen-units = 1
+lto = "thin"
+incremental = false
