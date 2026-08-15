@@ -668,7 +668,16 @@ pub fn Root() -> Element {
                 }
             }
             div {
-                style: "display: flex; gap: 0.75rem; align-items: stretch;",
+                // PR 9.2: Switched from `display: flex` (rigid equal
+                // widths) to CSS grid with named tracks. The
+                // sidebar gets a fixed 240px track, the two main
+                // panels share `1fr` and `1.4fr` respectively so
+                // Playlists gets more room for its long names
+                // (default · 10 wp · 2 out) without wrapping
+                // awkwardly. On narrower windows the panels stay
+                // side-by-side; window-level min size (800x500 from
+                // main.rs) prevents pathological narrow layouts.
+                style: "display: grid; grid-template-columns: 240px minmax(0, 1fr) minmax(0, 1.4fr); gap: 0.75rem; align-items: stretch;",
                 Sidebar {
                     outputs: outputs_snapshot.clone(),
                     running: running_snapshot.clone(),

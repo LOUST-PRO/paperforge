@@ -51,13 +51,24 @@ pub fn PlaylistsPanel(
                             let name_for_edit = pl.name.clone();
                             rsx! {
                                 div {
-                                    style: "display: flex; align-items: center; gap: 0.5rem; padding: 0.25rem 0;",
+                                    // PR 9.2: Each row is now a CSS
+                                    // grid with fixed-width columns for
+                                    // the badges + buttons, and the name
+                                    // takes the remaining space (truncates
+                                    // with ellipsis if too long). The
+                                    // earlier `display: flex` row allowed
+                                    // names like "default" to wrap to
+                                    // two lines, which broke visual
+                                    // rhythm across playlists of different
+                                    // lengths.
+                                    style: "display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content max-content; gap: 0.5rem 0.75rem; align-items: center; padding: 0.3rem 0;",
                                     span {
-                                        style: "font-family: monospace; flex: 1;",
+                                        style: "font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                                        title: "{pl.name}",
                                         "{pl.name}"
                                     }
                                     span {
-                                        style: "color: #8b949e; font-size: 0.75rem;",
+                                        style: "color: #8b949e; font-size: 0.75rem; white-space: nowrap;",
                                         "{pl.wallpapers} wp · {pl.outputs} out"
                                     }
                                     button {
