@@ -695,6 +695,7 @@ pub fn Root() -> Element {
                 Picker {
                     output: out,
                     entries: inventory_snapshot.clone(),
+                    cache_dir: use_context::<crate::app::AppState>().cache_paths.thumbnails_dir.clone(),
                     on_pick: on_pick_wallpaper,
                     on_close: on_close_picker,
                 }

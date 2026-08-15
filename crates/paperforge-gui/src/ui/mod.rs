@@ -20,6 +20,7 @@ pub mod bindings;
 pub mod picker;
 pub mod playlist_editor;
 pub mod playlists;
+pub mod preview;
 pub mod root;
 pub mod sidebar;
 pub mod status;

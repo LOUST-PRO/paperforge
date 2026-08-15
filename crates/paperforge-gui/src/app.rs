@@ -36,6 +36,7 @@
 
 use std::path::PathBuf;
 
+use paperforge_core::config::ConfigPaths;
 use paperforge_core::paths::{default_paths, require_at_least_one, WorkshopPaths};
 
 /// Top-level GUI state. Mounted once at the root, consumed via
@@ -51,6 +52,11 @@ pub struct AppState {
     /// Surface in the welcome banner so the operator can fix the
     /// Steam Workshop install before the GUI becomes useless.
     pub path_warnings: Vec<String>,
+    /// Resolved XDG config / cache / playlist paths. The
+    /// `thumbnails_dir` is consumed by `data::thumbnails` and the
+    /// preview / picker components in PR 8.2. `ConfigPaths::defaults`
+    /// creates the directories on disk if missing.
+    pub cache_paths: ConfigPaths,
 }
 
 impl AppState {
@@ -64,14 +70,29 @@ impl AppState {
             Ok(()) => Vec::new(),
             Err(e) => vec![format!("{e}")],
         };
+        let cache_paths = ConfigPaths::defaults().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "ConfigPaths::defaults failed; falling back to empty cache dir");
+            // Fallback so the GUI still starts even if XDG dirs
+            // are unreadable — thumbnails will simply not cache,
+            // the picker will still render (re-decoding each open).
+            ConfigPaths {
+                config_dir: PathBuf::new(),
+                playlists_dir: PathBuf::new(),
+                cache_dir: PathBuf::new(),
+                thumbnails_dir: PathBuf::new(),
+                inventory_cache: PathBuf::new(),
+            }
+        });
         tracing::info!(
             roots = ?paths.all().collect::<Vec<_>>(),
             warnings = ?path_warnings,
+            thumbnails_dir = %cache_paths.thumbnails_dir.display(),
             "AppState::new: paths detected"
         );
         Self {
             paths,
             path_warnings,
+            cache_paths,
         }
     }
 
