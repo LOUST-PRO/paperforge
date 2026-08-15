@@ -117,15 +117,29 @@ pub fn Root() -> Element {
     // ---- Coroutines ----
 
     // Outputs loop: every 2s, drain the compositor source.
+    //
+    // PR 9.5 fix: the previous `ticker.tick().await; ticker.tick().await`
+    // pattern discarded `interval`'s immediate first tick, so the loop
+    // ran an empty first refresh 2s in (instead of immediately). For
+    // inventory (30s tick) that meant the picker stayed empty for
+    // 30s on every launch — a real UX bug. The pattern below runs
+    // refresh once unconditionally before entering the ticker loop,
+    // so the panel populates immediately on mount.
     let outputs_src = Arc::new(CompositorHotplugSource::detect());
     let _outputs_loop = use_coroutine(move |_rx: UnboundedReceiver<()>| {
         let src = outputs_src.clone();
         let mut outputs_sig = outputs;
         let mut error_sig = error;
         async move {
+            let (v, err) = data_outputs::refresh_outputs(src.clone()).await;
+            if !v.is_empty() {
+                outputs_sig.set(v);
+            }
+            if let Some(e) = err {
+                error_sig.set(Some(e));
+            }
             let mut ticker = tokio::time::interval(OUTPUTS_TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ticker.tick().await; // first tick fires immediately
             loop {
                 ticker.tick().await;
                 let (v, err) = data_outputs::refresh_outputs(src.clone()).await;
@@ -164,9 +178,15 @@ pub fn Root() -> Element {
         let mut playlists_sig = playlists;
         let mut error_sig = error;
         async move {
+            // PR 9.5: refresh once before the ticker so the list is
+            // populated on mount (the ticker would otherwise wait 10s).
+            let (v, err) = refresh_playlists(root.clone()).await;
+            playlists_sig.set(v);
+            if let Some(e) = err {
+                error_sig.set(Some(GuiError::from_core(e)));
+            }
             let mut ticker = tokio::time::interval(PLAYLISTS_TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ticker.tick().await;
             loop {
                 ticker.tick().await;
                 let (v, err) = refresh_playlists(root.clone()).await;
@@ -180,6 +200,12 @@ pub fn Root() -> Element {
 
     // Inventory loop: every 30s, scan detected roots at depth 4.
     // PR 9.4: also includes `extra_sources` from the Settings panel.
+    //
+    // PR 9.5 fix: previous pattern was `ticker.tick().await;
+    // ticker.tick().await` which discarded `interval`'s immediate
+    // first tick — meaning the inventory didn't scan until 30s after
+    // launch. We now run the scan unconditionally once before
+    // entering the ticker, so the picker is populated on mount.
     let detected_paths = use_context::<crate::app::AppState>().paths.clone();
     let _inventory_loop = use_coroutine(move |_rx: UnboundedReceiver<()>| {
         let detected = detected_paths.clone();
@@ -187,9 +213,23 @@ pub fn Root() -> Element {
         let mut error_sig = error;
         let cache_paths = cache_paths_for_inventory.clone();
         async move {
+            // Initial scan on mount (no 30s wait).
+            let extra_initial = match paperforge_core::config::Config::load(&cache_paths) {
+                Ok(cfg) => cfg.extra_sources,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Config::load failed at inventory mount; skipping extra_sources");
+                    Vec::new()
+                }
+            };
+            let roots_initial =
+                crate::data::settings::merge_inventory_roots(&detected, &extra_initial);
+            let (v, err) = data_inventory::refresh_inventory(roots_initial).await;
+            inventory_sig.set(v);
+            if let Some(e) = err {
+                error_sig.set(Some(e));
+            }
             let mut ticker = tokio::time::interval(INVENTORY_TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ticker.tick().await;
             loop {
                 ticker.tick().await;
                 // Re-read extra_sources from disk each tick so a manual
@@ -611,17 +651,15 @@ pub fn Root() -> Element {
         spawn(async move {
             let cp = cache_paths.clone();
             let path_clone = path.clone();
-            let save_result = tokio::task::spawn_blocking(move || -> Result<
-                (Vec<PathBuf>, bool),
-                GuiError,
-            > {
-                let mut cfg = paperforge_core::config::Config::load(&cp)
-                    .map_err(|e| GuiError::Config(format!("load: {e}")))?;
-                let added = crate::data::settings::push_extra_source(&mut cfg, path_clone);
-                crate::data::settings::save_config(&cp, &cfg)?;
-                Ok((cfg.extra_sources, added))
-            })
-            .await;
+            let save_result =
+                tokio::task::spawn_blocking(move || -> Result<(Vec<PathBuf>, bool), GuiError> {
+                    let mut cfg = paperforge_core::config::Config::load(&cp)
+                        .map_err(|e| GuiError::Config(format!("load: {e}")))?;
+                    let added = crate::data::settings::push_extra_source(&mut cfg, path_clone);
+                    crate::data::settings::save_config(&cp, &cfg)?;
+                    Ok((cfg.extra_sources, added))
+                })
+                .await;
             match save_result {
                 Ok(Ok((new_sources, true))) => {
                     sources.set(new_sources);
@@ -655,22 +693,20 @@ pub fn Root() -> Element {
         spawn(async move {
             let cp = cache_paths.clone();
             let path_clone = path.clone();
-            let save_result = tokio::task::spawn_blocking(move || -> Result<
-                Vec<PathBuf>,
-                GuiError,
-            > {
-                let mut cfg = paperforge_core::config::Config::load(&cp)
-                    .map_err(|e| GuiError::Config(format!("load: {e}")))?;
-                if !crate::data::settings::remove_extra_source(&mut cfg, &path_clone) {
-                    return Err(GuiError::Core(format!(
-                        "path not present in extra_sources: {}",
-                        path_clone.display()
-                    )));
-                }
-                crate::data::settings::save_config(&cp, &cfg)?;
-                Ok(cfg.extra_sources)
-            })
-            .await;
+            let save_result =
+                tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>, GuiError> {
+                    let mut cfg = paperforge_core::config::Config::load(&cp)
+                        .map_err(|e| GuiError::Config(format!("load: {e}")))?;
+                    if !crate::data::settings::remove_extra_source(&mut cfg, &path_clone) {
+                        return Err(GuiError::Core(format!(
+                            "path not present in extra_sources: {}",
+                            path_clone.display()
+                        )));
+                    }
+                    crate::data::settings::save_config(&cp, &cfg)?;
+                    Ok(cfg.extra_sources)
+                })
+                .await;
             match save_result {
                 Ok(Ok(new_sources)) => {
                     sources.set(new_sources);
@@ -749,7 +785,13 @@ pub fn Root() -> Element {
     rsx! {
         document::Title { "paperforge — Dioxus GUI" }
         div {
-            style: "padding: 1rem 1.5rem; font-family: {FONT_STACK}; background: #0d1117; color: #e6edf3; min-height: 100vh;",
+            // PR 9.5 layout fix: switch from `min-height: 100vh` (which
+            // lets the panel column end mid-screen, leaving ~60% of the
+            // viewport as empty black) to a flex column that fills the
+            // viewport and lets the inventory row grow with `flex: 1`.
+            // `box-sizing: border-box` keeps `padding` from inflating
+            // the height beyond 100vh.
+            style: "display: flex; flex-direction: column; min-height: 100vh; box-sizing: border-box; padding: 1rem 1.5rem; gap: 0.75rem; font-family: {FONT_STACK}; background: #0d1117; color: #e6edf3;",
             header {
                 style: "display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem;",
                 h1 {
@@ -842,20 +884,29 @@ pub fn Root() -> Element {
             // the inventory without a Set-action prerequisite. Click
             // → on_browse (currently surfaces the path in a Notice
             // banner; PR 9.4 wires a preview pane).
-            InventoryPanel {
-                entries: inventory_snapshot.clone(),
-                cache_dir: use_context::<crate::app::AppState>().cache_paths.thumbnails_dir.clone(),
-                on_browse,
-            }
-            // PR 9.4: SettingsPanel — extra_sources editor. Sits
-            // below InventoryPanel because changes here directly
-            // affect what the InventoryPanel will show on the next
-            // 30s tick (or the immediate re-render driven by the
-            // signal update).
-            SettingsPanel {
-                extra_sources: extra_sources_snapshot.clone(),
-                on_add,
-                on_remove,
+            //
+            // PR 9.5: wrap in a flex column that fills the rest of
+            // the viewport (`flex: 1; min-height: 0`) so the
+            // inventory grows to occupy the bottom 60% of the window
+            // instead of leaving a black void below the panels. The
+            // InventoryPanel's own scroll area caps internally.
+            div {
+                style: "display: flex; flex-direction: column; gap: 0.75rem; flex: 1; min-height: 0;",
+                InventoryPanel {
+                    entries: inventory_snapshot.clone(),
+                    cache_dir: use_context::<crate::app::AppState>().cache_paths.thumbnails_dir.clone(),
+                    on_browse,
+                }
+                // PR 9.4: SettingsPanel — extra_sources editor. Sits
+                // below InventoryPanel because changes here directly
+                // affect what the InventoryPanel will show on the next
+                // 30s tick (or the immediate re-render driven by the
+                // signal update).
+                SettingsPanel {
+                    extra_sources: extra_sources_snapshot.clone(),
+                    on_add,
+                    on_remove,
+                }
             }
             // Picker modal (PR 6). Renders only when the operator
             // has clicked Set on some output. Sits at the bottom of

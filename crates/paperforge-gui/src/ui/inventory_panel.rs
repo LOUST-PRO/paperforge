@@ -55,20 +55,43 @@ pub fn InventoryPanel(
 
     rsx! {
         div {
-            style: "{PANEL_BORDER} background: #161b22; padding: 0.75rem 1rem; display: flex; flex-direction: column; min-width: 0;",
-            h3 {
-                style: "font-size: 0.95rem; margin: 0 0 0.5rem 0; color: #e6edf3;",
-                "Inventario"
+            // PR 9.5: was `padding + display: flex; flex-direction: column`
+            // only. The parent (root.rs) now wraps us in a
+            // `flex: 1; min-height: 0` column, so we add `flex: 1; min-height: 0`
+            // here so our panel grows to fill that space, and the
+            // internal scroll area can shrink inside it. Without
+            // `min-height: 0` flex children won't shrink below their
+            // content size and the scroll area collapses.
+            style: "{PANEL_BORDER} background: #161b22; padding: 0.75rem 1rem; display: flex; flex-direction: column; min-width: 0; flex: 1; min-height: 0;",
+            div {
+                style: "display: flex; align-items: baseline; gap: 0.75rem; margin-bottom: 0.4rem;",
+                h3 {
+                    style: "font-size: 0.95rem; margin: 0; color: #e6edf3;",
+                    "Inventario"
+                }
+                span {
+                    style: "color: #8b949e; font-size: 0.875rem;",
+                    if entries.is_empty() {
+                        "No wallpapers detected"
+                    } else {
+                        "{entries.len()} entries · click to preview"
+                    }
+                }
             }
             if entries.is_empty() {
                 p {
                     style: "color: #8b949e; font-size: 0.875rem;",
-                    "No wallpapers detected. Add a path via Settings → Source paths, \
-                     or install Workshop items into your Steam library."
+                    "Add a path via Settings → Source paths, or install Workshop items into your Steam library."
                 }
             } else {
                 div {
-                    style: "overflow-y: auto; max-height: 50vh; padding-right: 0.25rem;",
+                    // PR 9.5: was `overflow-y: auto; max-height: 50vh`
+                    // which capped the inventory at half the viewport.
+                    // Now `flex: 1; min-height: 0` lets it grow to fill
+                    // the parent (which is the flex-grow column in
+                    // root.rs). The scroll area adapts to whatever
+                    // vertical space is left after the header.
+                    style: "overflow-y: auto; flex: 1; min-height: 0; padding-right: 0.25rem;",
                     div {
                         style: "display: grid; grid-template-columns: 1fr; gap: 0.4rem;",
                         for (idx, entry) in entries.iter().enumerate() {
@@ -118,10 +141,6 @@ pub fn InventoryPanel(
                             }
                         }
                     }
-                }
-                div {
-                    style: "color: #8b949e; font-size: 0.75rem; padding-top: 0.5rem; border-top: 1px solid #21262d; margin-top: 0.5rem;",
-                    "{entries.len()} wallpaper(s) · click to preview / apply"
                 }
             }
         }
