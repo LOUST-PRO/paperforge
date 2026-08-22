@@ -882,6 +882,16 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         Arc::new(RwLock::new(pause_cfg)),
     );
 
+    // 3b. Spawn the LWE pool watchdog. The watchdog tick is 5s by
+    //     default; it re-spawns LWE from the last-known bindings
+    //     when the tracked PID dies (OOM, segfault, manual kill) or
+    //     is recycled by the kernel. No-op when the pool has never
+    //     been bound. The watchdog is aborted by `pool.shutdown()`
+    //     in step 7 below so SIGTERM-driven shutdown exits cleanly.
+    if cfg.pool_enabled {
+        lwe_ops.backend().pool().spawn_watchdog().await;
+    }
+
     // 4. D-Bus layer (consumes event_rx).
     let ctrl: Arc<dyn PaperforgeControl> = daemon.clone();
     let dbus_handle = tokio::spawn(serve_dbus(ctrl, event_rx));

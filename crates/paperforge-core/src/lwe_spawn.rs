@@ -71,7 +71,26 @@ pub struct SpawnConfig<'a> {
 /// `true` if `systemd-run` is on `$PATH` and the user systemd
 /// socket exists under `$XDG_RUNTIME_DIR/systemd/`. Cached after
 /// the first call — cheap to query on every spawn.
+///
+/// Test escape hatch: under `cfg(test)` the env var
+/// `PAPERFORGE_FORCE_NO_SYSTEMD=1` short-circuits to `false` so
+/// `build_command` falls back to direct spawn. Direct spawn is
+/// what the test wrappers expect — `set_per_output_with_fps`
+/// records `child.id()` from `Command::spawn`, and with
+/// `systemd-run` that PID is the transient systemd-run process,
+/// not the LWE process it forks. The PID-recycling defense
+/// (`pid_state_quick` + cmdline cross-check) would correctly
+/// flag the systemd-run PID as non-LWE and the test would
+/// falsely report the spawned output as dead. Set the env var
+/// BEFORE the first `build_command` call inside the test.
+///
+/// The check happens before the `OnceLock` lookup so a parallel
+/// test that doesn't set the env var can't poison the cache for
+/// tests that do.
 pub fn systemd_run_available() -> bool {
+    if cfg!(test) && std::env::var_os("PAPERFORGE_FORCE_NO_SYSTEMD").is_some() {
+        return false;
+    }
     *SYSTEMD_RUN_AVAILABLE.get_or_init(detect_systemd_run)
 }
 

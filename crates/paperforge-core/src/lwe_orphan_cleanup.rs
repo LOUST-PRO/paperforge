@@ -173,7 +173,7 @@ pub async fn kill_orphan(pid: i32, grace: Duration) -> Result<KillOutcome> {
     // SIGKILL follows.
     tokio::time::sleep(grace).await;
 
-    let alive = match pid_state_quick(pid) {
+    let alive = match pid_state_quick(pid, BackendKind::LinuxWallpaperEngine) {
         Ok(BackendState::Running) | Ok(BackendState::Paused) => true,
         // NotRunning + read errors both mean "process is gone" —
         // SIGTERM was enough.

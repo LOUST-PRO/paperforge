@@ -1104,7 +1104,7 @@ impl PaperforgeControl for PaperforgeDaemon {
             let last_set_map = self.per_output_last_set_at.read().await;
             let last_trans_map = self.per_output_last_transition_ms.read().await;
             for (output, pid) in pids_snapshot {
-                let pid_state = match pid_state_quick(pid) {
+                let pid_state = match pid_state_quick(pid, BackendKind::LinuxWallpaperEngine) {
                     Ok(BackendState::Running) => "Running",
                     Ok(BackendState::Paused) => "Paused",
                     Ok(BackendState::NotRunning) => "Dead",
@@ -1387,8 +1387,23 @@ mod tests {
     /// Uses the `/bin/sleep` wrapper pattern (no real LWE needed).
     #[tokio::test]
     async fn daemon_get_health_reflects_bound_outputs() {
+        // Force direct spawn (bypass systemd-run) so the recorded
+        // `child.id()` is the actual LWE PID. With systemd-run,
+        // `set_per_output_with_fps` would record systemd-run's
+        // transient PID, and the PID-recycling defense
+        // (`pid_state_quick` cmdline cross-check) correctly flags
+        // it as non-LWE — making this test falsely fail.
+        std::env::set_var("PAPERFORGE_FORCE_NO_SYSTEMD", "1");
         let wrapper = std::env::temp_dir().join("paperforge-health-test-binary.sh");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        // bash + exec -a so the pid_state_quick recycling defense
+        // accepts the wrapper (cmdline carries the LWE pattern).
+        // /bin/sh on Debian is dash which lacks `exec -a`.
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-health-test /bin/sleep 60\n",
+        )
+        .unwrap();
         std::fs::set_permissions(
             &wrapper,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -1417,6 +1432,13 @@ mod tests {
             .set_wallpaper("DP-1", scene.to_str().unwrap())
             .await
             .unwrap();
+
+        // Give the scheduler a moment so /proc/<pid>/cmdline reflects
+        // the post-exec argv[0] (the wrapper's `exec -a` only lands
+        // after the kernel schedules the new process). The `bind`
+        // grace window already waits 2s, so this is mostly a belt-
+        // and-suspenders for the cmdline recycling defense.
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
         let h = daemon.get_health().await.unwrap();
         let dp1 = h
@@ -1567,7 +1589,15 @@ mod tests {
         // runs (otherwise the path's existence check is the only
         // guarantee).
         let wrapper = std::env::temp_dir().join("paperforge-pool-disabled-binary.sh");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        // bash + exec -a so the pid_state_quick recycling defense
+        // accepts the wrapper (cmdline carries the LWE pattern).
+        // /bin/sh on Debian is dash which lacks `exec -a`.
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-pool-disabled /bin/sleep 60\n",
+        )
+        .unwrap();
         std::fs::set_permissions(
             &wrapper,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -1622,7 +1652,15 @@ mod tests {
     #[tokio::test]
     async fn daemon_handle_hotplug_unbinds_removed_output() {
         let wrapper = std::env::temp_dir().join("paperforge-hotplug-pool-binary.sh");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        // bash + exec -a so the pid_state_quick recycling defense
+        // accepts the wrapper (cmdline carries the LWE pattern).
+        // /bin/sh on Debian is dash which lacks `exec -a`.
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-hotplug-pool /bin/sleep 60\n",
+        )
+        .unwrap();
         std::fs::set_permissions(
             &wrapper,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -1705,7 +1743,15 @@ mod tests {
         // Wrapper script: sleep long enough for the test to receive
         // the event before the process exits.
         let wrapper = std::env::temp_dir().join("paperforge-daemon-pool-binary.sh");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        // bash + exec -a so the pid_state_quick recycling defense
+        // accepts the wrapper (cmdline carries the LWE pattern).
+        // /bin/sh on Debian is dash which lacks `exec -a`.
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-daemon-pool /bin/sleep 60\n",
+        )
+        .unwrap();
         std::fs::set_permissions(
             &wrapper,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -1771,7 +1817,15 @@ mod tests {
     #[tokio::test]
     async fn daemon_initial_then_remove_yields_empty_pool() {
         let wrapper = std::env::temp_dir().join("paperforge-fase4-initial-pool.sh");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        // bash + exec -a so the pid_state_quick recycling defense
+        // accepts the wrapper (cmdline carries the LWE pattern).
+        // /bin/sh on Debian is dash which lacks `exec -a`.
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-fase4-initial /bin/sleep 60\n",
+        )
+        .unwrap();
         std::fs::set_permissions(
             &wrapper,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -1886,6 +1940,15 @@ mod tests {
         // Force per-output mode (pool=false) so reconcile uses the
         // spawn path the user's v0.1 daemon also uses.
         let lwe_ops = std::sync::Arc::new(LweBackendOps::with_binary_and_pool("/bin/true", false));
+        // Force direct spawn (bypass systemd-run) so the recorded
+        // `child.id()` from the `set_per_output` call below is the
+        // actual LWE PID. With systemd-run, that PID is the transient
+        // systemd-run process, and the PID-recycling defense
+        // (`pid_state_quick` cmdline cross-check) correctly flags it
+        // as non-LWE — making this test falsely fail.
+        // SAFETY: single-threaded test, env var set before any
+        // thread spawns the wrapper.
+        std::env::set_var("PAPERFORGE_FORCE_NO_SYSTEMD", "1");
         // Inject a "dead pid" + scene by spawning a real child and
         // immediately replacing its entry with a pid that's
         // certainly dead (high PID). The spawn itself isn't needed
@@ -1920,13 +1983,34 @@ mod tests {
         // health_check still passes (because the canonical pid from
         // the map is the alive one — sort_unstable picks the lowest,
         // and the fake pid 2_999_999 sorts above any reasonable pid).
-        let mut canonical_child = std::process::Command::new("/bin/sleep")
-            .arg("60")
+        // Use a bash wrapper with `exec -a` so the cmdline carries
+        // the LWE pattern; the linter-integrated `pid_state_quick`
+        // cross-check rejects PIDs whose cmdline doesn't match.
+        let canonical_wrapper = std::env::temp_dir().join(format!(
+            "paperforge-reconcile-canonical-{}.sh",
+            std::process::id()
+        ));
+        std::fs::write(
+            &canonical_wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-reconcile-canonical /bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &canonical_wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let mut canonical_child = std::process::Command::new(&canonical_wrapper)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawn canonical /bin/sleep");
+            .expect("spawn canonical wrapper");
         let canonical_pid = canonical_child.id() as i32;
+        // Give the scheduler a moment so /proc/<pid>/cmdline reflects
+        // the post-exec argv[0] (the wrapper's `exec -a` only lands
+        // after the kernel schedules the new process).
+        std::thread::sleep(std::time::Duration::from_millis(50));
         {
             let mut pids = backend.per_output_pids_test_accessor().lock().await;
             // Insert the canonical alive pid first (smaller) so it
@@ -1948,6 +2032,7 @@ mod tests {
             .arg(canonical_pid.to_string())
             .output();
         let _ = canonical_child.wait();
+        let _ = std::fs::remove_file(&canonical_wrapper);
     }
 
     /// D-Bus `pause()` honours `[pause].mode` from the supplied
@@ -1962,7 +2047,15 @@ mod tests {
         // Use the pool path: easier to drive without spawning real
         // LWE for every test invocation.
         let wrapper = std::env::temp_dir().join("paperforge-pause-mode-test.sh");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        // bash + exec -a so the pid_state_quick recycling defense
+        // accepts the wrapper (cmdline carries the LWE pattern).
+        // /bin/sh on Debian is dash which lacks `exec -a`.
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-pause-mode-test /bin/sleep 60\n",
+        )
+        .unwrap();
         std::fs::set_permissions(
             &wrapper,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -2113,25 +2206,72 @@ mod pool_health_tests {
     use std::process::Command;
     use std::time::Duration;
 
-    /// Spawn `/bin/sleep 60` and return its PID. Detaches the child
-    /// so it survives past the test and the next `kill` reaps it.
-    /// Clippy `zombie_processes` lint is satisfied by storing the
-    /// handle for the caller to `kill` (which closes the wait
-    /// contract by exiting the child cleanly).
+    /// Spawn a wrapper that execs `/bin/sleep` with `argv[0]`
+    /// re-stamped to a name containing `linux-wallpaperengine`, so
+    /// the resulting process looks like an LWE to the
+    /// `pid_state_quick` cmdline cross-check. Returns the spawned
+    /// `Child` (so the caller can `kill`/`wait` it) plus the PID.
+    /// clippy `zombie_processes` lint is satisfied by handing the
+    /// handle to the caller — the caller is responsible for
+    /// reaping.
+    ///
+    /// Implements the spawn with a temp shim because
+    /// `std::process::Command` doesn't expose a way to overwrite
+    /// `argv[0]` for the spawned child directly. The wrapper path
+    /// uses a UUID so parallel test invocations don't race on
+    /// the same file (the previous "Text file busy" error came
+    /// from two tests overwriting the same wrapper mid-exec).
     fn spawn_alive_child() -> (std::process::Child, i32) {
-        let child = Command::new("/bin/sleep")
-            .arg("60")
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-pool-health-spawn-{}-{}.sh",
+            std::process::id(),
+            next_seq()
+        ));
+        // bash + exec -a so the LWE pattern ends up in argv[0].
+        // /bin/sh on Debian is dash which lacks `exec -a`.
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-pool-health /bin/sleep 60\n",
+        )
+        .expect("write wrapper");
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod wrapper");
+        let child = Command::new(&wrapper)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawn /bin/sleep");
+            .expect("spawn wrapper");
         let pid = child.id() as i32;
+        // Give the scheduler a moment so /proc/<pid>/cmdline reflects
+        // the post-exec argv[0] (the wrapper's `exec -a` only lands
+        // after the kernel schedules the new process).
+        std::thread::sleep(std::time::Duration::from_millis(50));
         (child, pid)
+    }
+
+    /// Monotonic counter used to uniquify wrapper script paths so
+    /// parallel test invocations don't race on the same file.
+    fn next_seq() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        SEQ.fetch_add(1, Ordering::Relaxed)
     }
 
     #[tokio::test]
     async fn health_check_alive_when_pid_running() {
         let (mut _child, pid) = spawn_alive_child();
+        // Brief yield so the wrapper's `exec -a` syscall lands
+        // before we query /proc/<pid>/cmdline. Without this the
+        // test races: the spawn returns before the kernel has
+        // rewritten the cmdline buffer, and `pid_state_quick` sees
+        // the bash command line (which doesn't contain the LWE
+        // pattern) instead of the renamed `linux-wallpaperengine-...`
+        // final argv.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let backend = crate::backend::LweBackend::new();
         {
             let pids_arc = backend.per_output_pids_test_accessor();
