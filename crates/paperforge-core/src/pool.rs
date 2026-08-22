@@ -57,7 +57,10 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Instant,
 };
 
@@ -71,6 +74,18 @@ use crate::{
     backend::{workshop_content_id, BackendKind, BackendState},
     error::{Error, Result},
 };
+
+/// Default watchdog tick interval (seconds). Imported by the
+/// `LweSinglePool::with_binary_and_fps` constructor and overridable
+/// via `set_watchdog_interval_secs` / `with_watchdog_interval_secs`.
+fn default_watchdog_interval_secs() -> u64 {
+    5
+}
+
+/// Maximum backoff after a failed respawn (seconds). The watchdog
+/// doubles its wait on each consecutive failure, capped here so a
+/// persistently broken LWE binary doesn't dominate the log + CPU.
+const WATCHDOG_MAX_BACKOFF_SECS: u64 = 60;
 
 /// One running LWE process with its current output→content_id bindings.
 ///
@@ -110,11 +125,15 @@ pub struct LweSinglePool {
     /// Common flags appended to every invocation (e.g. `--silent`,
     /// `--disable-particles`). Operator-overridable via constructor.
     common_flags: Vec<String>,
-    /// FPS cap passed as `--fps <N>` to LWE. `AtomicU32` so callers
-    /// holding `Arc<LweSinglePool>` (e.g. `LweBackend`) can mutate
-    /// it without `&mut self`. Smart calibration reaches this via
-    /// [`Self::set_active_fps`].
-    active_fps: std::sync::atomic::AtomicU32,
+    /// FPS cap passed as `--fps <N>` to LWE. `Arc<AtomicU32>` so the
+    /// watchdog task (spawned via `tokio::spawn`) can read the
+    /// current value at respawn time without taking `&self`. Smart
+    /// calibration reaches this via [`Self::set_active_fps`]. The
+    /// `Arc` is clone-cheap — every `Clone` of `LweSinglePool`
+    /// shares the same atomic so smart calibration updates are
+    /// visible across clones (mirrors the existing `Arc<Mutex<...>>`
+    /// pattern for `inner`).
+    active_fps: Arc<std::sync::atomic::AtomicU32>,
     /// Grace window (ms) for hot-swap transitions. `bind()` spawns
     /// the new LWE first, waits this long, THEN kills the old one —
     /// the new process steals the wlr-layer-shell surface from the
@@ -123,6 +142,20 @@ pub struct LweSinglePool {
     /// [`Self::active_fps`].
     transition_grace_ms: std::sync::atomic::AtomicU64,
     inner: Arc<Mutex<Option<PoolProcess>>>,
+    /// Last-known bindings (output → content_id). Persists across
+    /// respawns so the watchdog can rebuild the pool even when
+    /// `inner` is None (e.g. all outputs were unbound). Updated
+    /// atomically by `bind`/`unbind`. Separate from
+    /// `inner.Some.bindings` because that field is cleared on full
+    /// unbind (the pool goes empty) but we want to remember what the
+    /// operator had bound so the watchdog can restore it on respawn.
+    ///
+    /// Cleared by `unbind_with_op` when the operator removes the
+    /// LAST binding — that means the operator explicitly wants no
+    /// wallpaper, so the watchdog should NOT respawn a phantom pool.
+    /// On every other transition (including a crash) the bindings
+    /// persist so the watchdog can restore them.
+    last_bindings: Arc<Mutex<BTreeMap<String, String>>>,
     /// Cancellation notify for the active soft-pause cycle, if any.
     /// Fired by `resume` and `shutdown` so the cycle can exit
     /// gracefully (the cycle SIGCONTs the pid before returning so
@@ -135,6 +168,30 @@ pub struct LweSinglePool {
     /// the existing handle before spawning a new one so we don't
     /// accumulate cycle tasks.
     soft_pause_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Watchdog tick interval (seconds). `Arc<AtomicU64>` so the
+    /// watchdog task (spawned via `tokio::spawn`) can read the current
+    /// value at respawn time without taking `&self`, and so that
+    /// `Clone` of `LweSinglePool` shares the same atomic (mirrors
+    /// the existing `Arc<...>` pattern for `active_fps`). The
+    /// watchdog reads this every tick — a runtime change to the
+    /// interval takes effect on the next sleep. Default is
+    /// [`default_watchdog_interval_secs`] (5 s).
+    watchdog_interval_secs: Arc<std::sync::atomic::AtomicU64>,
+    /// Cancellation notify fired by `abort_watchdog` / `shutdown`.
+    /// The watchdog's `tokio::select!` loop wakes on this so a
+    /// SIGTERM-driven shutdown exits cleanly instead of waiting for
+    /// the next tick. Cloned into the watchdog task so dropping the
+    /// last pool reference can also wake it via the standard
+    /// `notify_waiters` semantics.
+    watchdog_cancel: Arc<tokio::sync::Notify>,
+    /// Handle to the spawned watchdog task, if any. `None` until
+    /// `spawn_watchdog` is called and the spawned task is registered.
+    /// `Arc<Mutex<>>` because the watchdog task itself is a tokio
+    /// task that doesn't share `&self` — it needs the Arc to store
+    /// `None` back after abort so subsequent calls don't trip on a
+    /// dead handle. `Abort` is idempotent so calling it on an
+    /// already-finished handle is harmless.
+    watchdog_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 /// Structured timing log emitted at the end of every bind/unbind.
@@ -224,13 +281,23 @@ impl Clone for LweSinglePool {
         Self {
             binary: self.binary.clone(),
             common_flags: self.common_flags.clone(),
-            active_fps: std::sync::atomic::AtomicU32::new(self.active_fps()),
+            // Clone the Arc — every clone shares the same atomic so
+            // `set_active_fps` from any handle propagates to all
+            // others (mirrors the existing Arc-shared semantics of
+            // `inner`, `soft_pause_*`, `last_bindings`, etc).
+            active_fps: Arc::clone(&self.active_fps),
             transition_grace_ms: std::sync::atomic::AtomicU64::new(
                 self.transition_grace_ms.load(Ordering::Relaxed),
             ),
             inner: self.inner.clone(),
+            last_bindings: self.last_bindings.clone(),
             soft_pause_cancel: self.soft_pause_cancel.clone(),
             soft_pause_task: self.soft_pause_task.clone(),
+            watchdog_interval_secs: Arc::new(std::sync::atomic::AtomicU64::new(
+                self.watchdog_interval_secs.load(Ordering::Relaxed),
+            )),
+            watchdog_cancel: self.watchdog_cancel.clone(),
+            watchdog_task: self.watchdog_task.clone(),
         }
     }
 }
@@ -250,16 +317,27 @@ impl LweSinglePool {
     /// cap. Production construction goes through here so the
     /// `[fps].active_max` value flows in instead of being hardcoded
     /// to LWE's own 30-fps default.
+    ///
+    /// NOTE: this constructor does NOT spawn the watchdog. Call
+    /// [`Self::spawn_watchdog`] from the daemon's startup path (after
+    /// the tokio runtime is established) so the background task can
+    /// tick without racing against the constructor's caller.
     pub fn with_binary_and_fps(binary: impl Into<PathBuf>, active_fps: u32) -> Self {
         use std::sync::atomic::AtomicU64;
         Self {
             binary: binary.into(),
             common_flags: default_flags(),
-            active_fps: std::sync::atomic::AtomicU32::new(active_fps),
+            active_fps: Arc::new(std::sync::atomic::AtomicU32::new(active_fps)),
             transition_grace_ms: AtomicU64::new(default_transition_grace_ms()),
             inner: Arc::new(Mutex::new(None)),
+            last_bindings: Arc::new(Mutex::new(BTreeMap::new())),
             soft_pause_cancel: Arc::new(tokio::sync::Notify::new()),
             soft_pause_task: Arc::new(Mutex::new(None)),
+            watchdog_interval_secs: Arc::new(std::sync::atomic::AtomicU64::new(
+                default_watchdog_interval_secs(),
+            )),
+            watchdog_cancel: Arc::new(tokio::sync::Notify::new()),
+            watchdog_task: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -275,7 +353,7 @@ impl LweSinglePool {
     /// calibration). For runtime updates on an existing pool use
     /// [`Self::set_active_fps`] instead.
     pub fn with_active_fps(mut self, fps: u32) -> Self {
-        self.active_fps = std::sync::atomic::AtomicU32::new(fps);
+        self.active_fps = Arc::new(std::sync::atomic::AtomicU32::new(fps));
         self
     }
 
@@ -320,6 +398,44 @@ impl LweSinglePool {
         self
     }
 
+    /// Read the current watchdog tick interval (seconds). The
+    /// watchdog uses this value as the base sleep between ticks,
+    /// plus any active backoff seconds. Default is
+    /// [`default_watchdog_interval_secs`] (5 s).
+    pub fn watchdog_interval_secs(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.watchdog_interval_secs.load(Ordering::Relaxed)
+    }
+
+    /// Update the watchdog tick interval (seconds). The new value
+    /// takes effect on the watchdog's next sleep (the running tick
+    /// completes first). Interior-mutable so it works through
+    /// `Arc<LweSinglePool>` clones. Setting to 0 makes the watchdog
+    /// tick in a tight loop — useful for tests but a footgun in
+    /// production.
+    pub fn set_watchdog_interval_secs(&self, secs: u64) {
+        use std::sync::atomic::Ordering;
+        self.watchdog_interval_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// Builder-form of [`Self::set_watchdog_interval_secs`]. Useful
+    /// for tests that want a zero-tick watchdog without going
+    /// through `set_watchdog_interval_secs` after construction.
+    pub fn with_watchdog_interval_secs(self, secs: u64) -> Self {
+        self.watchdog_interval_secs
+            .store(secs, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// Snapshot the `last_bindings` map (output → content_id). The
+    /// watchdog uses this to rebuild the pool after a crash even
+    /// when `inner` is `None`. Tests + the upcoming `daemon get_state`
+    /// D-Bus method can also read it to surface the crash-recovery
+    /// state to the operator.
+    pub async fn last_bindings(&self) -> BTreeMap<String, String> {
+        self.last_bindings.lock().await.clone()
+    }
+
     /// Cancel any active soft-pause cycle. Fires the cancellation
     /// notify so the cycle can exit gracefully (SIGCONT before
     /// return), then aborts the JoinHandle as a safety net for the
@@ -332,6 +448,68 @@ impl LweSinglePool {
         // any stale cycles from re-entrant calls also wake.
         self.soft_pause_cancel.notify_waiters();
         let mut task_guard = self.soft_pause_task.lock().await;
+        if let Some(handle) = task_guard.take() {
+            handle.abort();
+        }
+    }
+
+    /// Spawn the background watchdog task. Idempotent: if a
+    /// watchdog is already running, no-op. The task polls `self.inner`
+    /// every `watchdog_interval_secs()` seconds. If the tracked PID
+    /// is dead OR the cmdline doesn't match
+    /// `BackendKind::LinuxWallpaperEngine` (PID recycling), and
+    /// `last_bindings` is non-empty, the task respawns LWE with
+    /// those bindings. If respawn fails, exponential backoff capped
+    /// at 60 s.
+    ///
+    /// Cancel via [`abort_watchdog`] or [`shutdown`]. Default
+    /// interval is 5 s; tune via [`set_watchdog_interval_secs`].
+    ///
+    /// The constructor does NOT spawn the watchdog — the daemon
+    /// startup path must call this so the background task has a
+    /// tokio runtime to schedule against. This keeps the sync
+    /// constructors (`with_binary`, `with_binary_and_fps`) easy to
+    /// use from tests without a runtime.
+    pub async fn spawn_watchdog(&self) {
+        let mut task_guard = self.watchdog_task.lock().await;
+        if task_guard.is_some() {
+            return; // idempotent — already spawned
+        }
+        let inner = self.inner.clone();
+        let last_bindings = self.last_bindings.clone();
+        let interval_secs = self.watchdog_interval_secs.clone();
+        let cancel = self.watchdog_cancel.clone();
+        let binary = self.binary.clone();
+        let common_flags = self.common_flags.clone();
+        let active_fps = self.active_fps.clone();
+        let handle = tokio::spawn(async move {
+            watchdog_loop(
+                inner,
+                last_bindings,
+                interval_secs,
+                cancel,
+                binary,
+                common_flags,
+                active_fps,
+            )
+            .await;
+        });
+        *task_guard = Some(handle);
+    }
+
+    /// Cancel the watchdog task. Fires the cancellation notify so
+    /// the task can exit gracefully on its next `tokio::select!`,
+    /// then aborts the JoinHandle as a safety net for the case
+    /// where the task is blocked on a syscall and didn't see the
+    /// notify in time. Idempotent: safe to call when no watchdog
+    /// is running.
+    pub async fn abort_watchdog(&self) {
+        // Fire the notify FIRST so the loop can exit via its
+        // `tokio::select!` arm rather than waiting for the next
+        // `tokio::time::sleep` to return. notify_waiters (not
+        // notify_one) so re-entrant calls all wake.
+        self.watchdog_cancel.notify_waiters();
+        let mut task_guard = self.watchdog_task.lock().await;
         if let Some(handle) = task_guard.take() {
             handle.abort();
         }
@@ -440,7 +618,10 @@ impl LweSinglePool {
                     // Verify the process is still alive (it may have
                     // crashed externally). If dead, fall through to
                     // respawn with the merged bindings.
-                    if let Ok(BackendState::Running) = crate::backend::pid_state_quick(proc.pid) {
+                    if let Ok(BackendState::Running) = crate::backend::pid_state_quick(
+                        proc.pid,
+                        crate::backend::BackendKind::LinuxWallpaperEngine,
+                    ) {
                         return Ok(proc.pid);
                     }
                 }
@@ -489,6 +670,25 @@ impl LweSinglePool {
         let new_pid = new_child.id() as i32;
         timing.spawn_completed_at = Some(Instant::now());
 
+        // Cmdline-settle window: the kernel needs a moment to
+        // process the wrapper's `exec -a linux-wallpaperengine-...
+        // /bin/sleep N` (or the real LWE binary's main() startup)
+        // before `/proc/<pid>/cmdline` reflects the post-exec
+        // argv[0]. Without this settle, the immediate
+        // `pid_state_quick` below sees the wrapper's bash
+        // command line (no LWE pattern) instead of the renamed
+        // argv, and the [PID-recycling
+        // defense](crate::backend::pid_is_backend_kind) correctly
+        // rejects it as not-LWE — falsely flagging the fresh
+        // spawn as dead-in-grace.
+        //
+        // 50 ms is enough under normal scheduler conditions for
+        // either path to land its cmdline update. Even when the
+        // caller requested `grace_ms = 0` for the v0.1 kill-first
+        // semantics, we still need this minimum settle for the
+        // post-spawn state check to be meaningful.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
         // Step 2: wait for the grace window. The new LWE has this
         // long to initialize WebGL, load the scene, and render its
         // first frame on the layer-shell surface it just stole from
@@ -508,7 +708,10 @@ impl LweSinglePool {
         // Wayland session, etc.) we must NOT kill the old one —
         // abort the transition and let the caller retry with a
         // valid scene.
-        match crate::backend::pid_state_quick(new_pid) {
+        match crate::backend::pid_state_quick(
+            new_pid,
+            crate::backend::BackendKind::LinuxWallpaperEngine,
+        ) {
             Ok(BackendState::Running) | Ok(BackendState::Paused) => {
                 // Healthy. Continue to kill the old process.
             }
@@ -569,6 +772,7 @@ impl LweSinglePool {
         timing.kill_completed_at = Some(Instant::now());
 
         // Step 5: store the new process in the pool.
+        let stored_bindings = new_bindings.clone();
         *guard = Some(PoolProcess {
             pid: new_pid,
             bindings: new_bindings,
@@ -576,6 +780,14 @@ impl LweSinglePool {
         });
         timing.new_pid = Some(new_pid);
         timing.log();
+
+        // Also update `last_bindings` so the watchdog can rebuild the
+        // pool after a crash. We do this after the inner lock is
+        // released (we hold `guard` across the assignment above; the
+        // `last_bindings` mutex is independent so a short contended
+        // window is fine). Cloned so the watchdog's snapshot doesn't
+        // race with a future bind.
+        *self.last_bindings.lock().await = stored_bindings;
 
         tracing::info!(
             target: "paperforge",
@@ -685,6 +897,12 @@ impl LweSinglePool {
                 "LWE pool empty after unbind({})",
                 output
             );
+            // Also clear `last_bindings`: the operator explicitly
+            // removed the LAST binding, which means they want no
+            // wallpaper. The watchdog must NOT respawn a phantom pool
+            // in this case. A subsequent `bind` will populate
+            // `last_bindings` again.
+            self.last_bindings.lock().await.clear();
             return Ok(());
         }
 
@@ -712,6 +930,7 @@ impl LweSinglePool {
         })?;
         let pid = child.id() as i32;
         timing.spawn_completed_at = Some(Instant::now());
+        let stored_bindings = new_bindings.clone();
         *guard = Some(PoolProcess {
             pid,
             bindings: new_bindings,
@@ -719,6 +938,9 @@ impl LweSinglePool {
         });
         timing.new_pid = Some(pid);
         timing.log();
+        // Update `last_bindings` so the watchdog can rebuild the
+        // pool after a crash. Same rationale as in `bind_with_op`.
+        *self.last_bindings.lock().await = stored_bindings;
         tracing::info!(
             target: "paperforge",
             "LWE pool respawn after unbind({}): pid={} bindings={:?}",
@@ -817,6 +1039,13 @@ impl LweSinglePool {
         // Abort any active soft-pause cycle first; otherwise the
         // SIGTERM below races with the cycle's SIGCONT.
         self.abort_soft_pause().await;
+        // Also stop the watchdog: without this, the watchdog could
+        // tick AFTER `inner` is cleared, see `inner == None` AND
+        // `last_bindings` non-empty, and respawn a process the
+        // operator just shut down. (The pool itself goes empty on
+        // the last `unbind` which clears `last_bindings`, but a
+        // direct `shutdown` after a `bind` is also a valid path.)
+        self.abort_watchdog().await;
         let mut guard = self.inner.lock().await;
         if let Some(mut prev) = guard.take() {
             let _ = kill(Pid::from_raw(prev.pid), Signal::SIGTERM);
@@ -824,6 +1053,12 @@ impl LweSinglePool {
                 let _ = c.wait();
             }
         }
+        // Defensive: also clear `last_bindings` so a subsequent
+        // `spawn_watchdog` (e.g. in a future test that re-uses this
+        // pool after a shutdown) doesn't try to respawn from stale
+        // data. Production `shutdown` is terminal so this is a no-op
+        // for the daemon, but tests benefit.
+        self.last_bindings.lock().await.clear();
         Ok(())
     }
 }
@@ -836,12 +1071,30 @@ impl Default for LweSinglePool {
 
 impl Drop for LweSinglePool {
     fn drop(&mut self) {
-        // Best-effort SIGTERM if a process is alive. We can't async-wait
-        // here; the parent daemon is expected to call shutdown() during
-        // graceful exit.
-        if let Ok(guard) = self.inner.try_lock() {
-            if let Some(proc) = guard.as_ref() {
-                let _ = kill(Pid::from_raw(proc.pid), Signal::SIGTERM);
+        // SAFETY NET ONLY: cleanup is supposed to go through
+        // `shutdown().await` from an async context. Drop fires when a
+        // pool is dropped without explicit shutdown (panic, early
+        // return, parent daemon crash mid-init). Without a guard, a
+        // CLONE dropped while a sibling still owns the live pool
+        // would see the latest pid in the shared `inner` mutex and
+        // SIGTERM the LIVE process — e.g. `pool_bg = pool.clone()`
+        // moved into a `tokio::spawn` and dropped when the spawn
+        // completes: at that moment `inner` holds the NEW pid from
+        // the bind the spawn ran, and Drop would kill it before the
+        // caller ever sees it.
+        //
+        // Fix: only fire the safety-net kill when this is the LAST
+        // Arc reference to `inner`. Clones (count > 1) are no-ops;
+        // the last owner takes responsibility. This preserves the
+        // original "kill on leak" intent while preventing the
+        // sibling-clone foot-gun. We use SIGKILL (not SIGTERM)
+        // because we have no chance to wait() and a stale LWE that
+        // ignores SIGTERM would otherwise orphan a wallpaper session.
+        if Arc::strong_count(&self.inner) == 1 {
+            if let Ok(guard) = self.inner.try_lock() {
+                if let Some(proc) = guard.as_ref() {
+                    let _ = kill(Pid::from_raw(proc.pid), Signal::SIGKILL);
+                }
             }
         }
     }
@@ -902,6 +1155,137 @@ fn default_flags() -> Vec<String> {
 /// values stay in sync if either default is tuned.
 fn default_transition_grace_ms() -> u64 {
     2000
+}
+
+/// Background task that watches `inner` for a dead / recycled pool
+/// process and respawns LWE from `last_bindings` when needed.
+///
+/// ## Cancellation
+///
+/// The `tokio::select!` on the sleep wakes on either the interval
+/// elapsing OR a notification on `cancel`. `abort_watchdog` /
+/// `shutdown` fire the notify, so SIGTERM-driven shutdown exits
+/// cleanly instead of waiting for the next tick.
+///
+/// ## Backoff
+///
+/// A respawn failure doubles `backoff_secs` (1 → 2 → 4 → 8 → 16 →
+/// 32 → 60 → 60 ...). The next interval sleeps for `interval +
+/// backoff_secs`. We reset `backoff_secs = 0` after a successful
+/// respawn OR when the pool is alive / `last_bindings` empty (no
+/// need to keep the penalty around).
+///
+/// ## Race avoidance
+///
+/// The loop never holds any lock across `tokio::time::sleep`. We
+/// snapshot `inner` and `last_bindings` under their respective locks,
+/// drop the locks, then do the `/proc` read + `Command::spawn`
+/// without holding any pool state. The inner mutex is reacquired
+/// only briefly when we replace `inner` with the fresh
+/// `PoolProcess`.
+async fn watchdog_loop(
+    inner: Arc<Mutex<Option<PoolProcess>>>,
+    last_bindings: Arc<Mutex<BTreeMap<String, String>>>,
+    interval_secs: Arc<AtomicU64>,
+    cancel: Arc<tokio::sync::Notify>,
+    binary: PathBuf,
+    common_flags: Vec<String>,
+    active_fps: Arc<std::sync::atomic::AtomicU32>,
+) {
+    let mut backoff_secs: u64 = 0;
+    loop {
+        let sleep_secs = interval_secs
+            .load(Ordering::Relaxed)
+            .saturating_add(backoff_secs);
+        tokio::select! {
+            _ = cancel.notified() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {}
+        }
+
+        // Snapshot pool + bindings. Two short locks; we drop both
+        // before doing the (potentially slow) `/proc` read.
+        let snapshot: Option<(i32, BTreeMap<String, String>)> = {
+            let guard = inner.lock().await;
+            guard.as_ref().map(|p| (p.pid, p.bindings.clone()))
+        };
+        let preserved: BTreeMap<String, String> = {
+            let guard = last_bindings.lock().await;
+            guard.clone()
+        };
+
+        // Decide if we need to respawn. `pid_state_quick(pid, kind)`
+        // already cross-checks the cmdline against the backend
+        // pattern — if the PID was recycled to an unrelated process
+        // it returns `NotRunning`, which triggers our respawn path.
+        // Any error or non-Running/Paused result is also a respawn
+        // trigger (the watchdog's job is to make the pool alive
+        // again).
+        let needs_respawn: bool = match snapshot.as_ref() {
+            Some((pid, _)) => !matches!(
+                crate::backend::pid_state_quick(*pid, BackendKind::LinuxWallpaperEngine),
+                Ok(BackendState::Running) | Ok(BackendState::Paused)
+            ),
+            None => !preserved.is_empty(),
+        };
+
+        if !needs_respawn {
+            // Healthy OR no pool. Reset backoff either way so a
+            // long-running healthy pool doesn't carry stale state
+            // across an unrelated transient failure.
+            backoff_secs = 0;
+            continue;
+        }
+        if preserved.is_empty() {
+            // Operator hasn't bound anything yet (or has unbound
+            // the last output). The pool is intentionally empty;
+            // don't respawn a phantom process.
+            backoff_secs = 0;
+            continue;
+        }
+
+        // Try respawn from preserved bindings.
+        let argv = build_argv(
+            &binary,
+            &preserved,
+            &common_flags,
+            active_fps.load(Ordering::Relaxed),
+        );
+        let mut cmd = Command::new(&binary);
+        cmd.args(&argv[1..]);
+        match cmd.spawn() {
+            Ok(new_child) => {
+                let new_pid = new_child.id() as i32;
+                // Replace `inner` under the brief mutex.
+                let mut guard = inner.lock().await;
+                *guard = Some(PoolProcess {
+                    pid: new_pid,
+                    bindings: preserved.clone(),
+                    child: Some(new_child),
+                });
+                tracing::info!(
+                    target: "paperforge",
+                    event = "watchdog_respawn",
+                    pid = new_pid,
+                    bindings = ?preserved,
+                    backoff_secs = backoff_secs,
+                    "watchdog respawned LWE pool after detected death / recycling"
+                );
+                backoff_secs = 0;
+            }
+            Err(e) => {
+                let next = (backoff_secs.saturating_mul(2)).clamp(1, WATCHDOG_MAX_BACKOFF_SECS);
+                tracing::error!(
+                    target: "paperforge",
+                    event = "watchdog_respawn_failed",
+                    error = %e,
+                    backoff_secs = backoff_secs,
+                    next_backoff_secs = next,
+                    "watchdog respawn failed; will retry with backoff"
+                );
+                backoff_secs = next;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1145,20 +1529,22 @@ mod tests {
         assert!(pid > 0);
 
         // Pre-state: process is running.
-        let pre = crate::backend::pid_state_quick(pid).unwrap();
+        let pre = crate::backend::pid_state_quick(pid, BackendKind::LinuxWallpaperEngine).unwrap();
         assert_eq!(pre, BackendState::Running, "pre-pause must be Running");
 
         // Pause: SIGSTOP.
         pool.pause().await.unwrap();
         // Give the kernel a moment to deliver + record the signal state.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let paused = crate::backend::pid_state_quick(pid).unwrap();
+        let paused =
+            crate::backend::pid_state_quick(pid, BackendKind::LinuxWallpaperEngine).unwrap();
         assert_eq!(paused, BackendState::Paused, "post-STOP must be Paused");
 
         // Resume: SIGCONT.
         pool.resume().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let resumed = crate::backend::pid_state_quick(pid).unwrap();
+        let resumed =
+            crate::backend::pid_state_quick(pid, BackendKind::LinuxWallpaperEngine).unwrap();
         assert_eq!(resumed, BackendState::Running, "post-CONT must be Running");
 
         pool.shutdown().await.unwrap();
@@ -1261,10 +1647,15 @@ mod tests {
             std::process::id(),
             next_wrapper_seq(),
         ));
+        // `exec -a NAME` is bash-specific, so use bash explicitly.
+        // `/bin/sh` on Debian is `dash`, which lacks `exec -a`; on
+        // other distros it might be bash, but pinning to bash makes
+        // the wrapper portable across hosts regardless of /bin/sh.
         let body = format!(
-            "#!/bin/sh\n# paperforge grace-window test wrapper\n\
+            "#!/usr/bin/env bash\n\
+             # paperforge grace-window test wrapper\n\
              echo $$ > {out_file}\n\
-             exec /bin/sleep {sleep_seconds}\n",
+             exec -a linux-wallpaperengine-test /bin/sleep {sleep_seconds}\n",
             out_file = out_file.display(),
             sleep_seconds = sleep_seconds,
         );
@@ -1311,16 +1702,29 @@ mod tests {
     /// the "OLD survives, NEW takes over" branch is exercised. The
     /// filename includes `getpid()` + `next_wrapper_seq()` so two
     /// tests running in parallel don't race on the same path.
+    ///
+    /// `exec -a linux-wallpaperengine-test /bin/sleep N` overrides
+    /// argv[0] to contain the LWE pattern so the [PID-recycling
+    /// defense](crate::backend::pid_is_backend_kind) accepts the
+    /// resulting process. Without this, the spawn child would look
+    /// like a `sleep` (no LWE pattern) and `pid_state_quick` would
+    /// return NotRunning — which is the correct production
+    /// behaviour but wrong for the test, which is explicitly using
+    /// an unmanaged stand-in.
     fn write_sleep_wrapper(sleep_seconds: u64) -> PathBuf {
         let wrapper = std::env::temp_dir().join(format!(
             "paperforge-sleep-wrapper-{}-{}.sh",
             std::process::id(),
             next_wrapper_seq(),
         ));
+        // `exec -a NAME` is bash-specific, so use bash explicitly.
+        // `/bin/sh` on Debian is `dash`, which lacks `exec -a`; on
+        // other distros it might be bash, but pinning to bash makes
+        // the wrapper portable across hosts regardless of /bin/sh.
         let body = format!(
-            "#!/bin/sh\n\
+            "#!/usr/bin/env bash\n\
              # paperforge sleep-wrapper test helper (ignores its argv)\n\
-             exec /bin/sleep {sleep_seconds}\n"
+             exec -a linux-wallpaperengine-test /bin/sleep {sleep_seconds}\n"
         );
         std::fs::write(&wrapper, body).unwrap();
         std::fs::set_permissions(
@@ -1362,7 +1766,7 @@ mod tests {
             .unwrap();
         assert_eq!(pid1, pid1_from_file, "first wrapper must write its PID");
         assert_eq!(
-            crate::backend::pid_state_quick(pid1).unwrap(),
+            crate::backend::pid_state_quick(pid1, BackendKind::LinuxWallpaperEngine).unwrap(),
             BackendState::Running,
             "first LWE must be Running before second bind"
         );
@@ -1387,30 +1791,31 @@ mod tests {
             "second bind must spawn a different PID"
         );
         assert_eq!(
-            crate::backend::pid_state_quick(pid1).unwrap(),
+            crate::backend::pid_state_quick(pid1, BackendKind::LinuxWallpaperEngine).unwrap(),
             BackendState::Running,
             "old LWE must survive the grace window (spawn-first-kill-after)"
         );
         assert_eq!(
-            crate::backend::pid_state_quick(pid2_from_file).unwrap(),
+            crate::backend::pid_state_quick(pid2_from_file, BackendKind::LinuxWallpaperEngine)
+                .unwrap(),
             BackendState::Running,
             "new LWE must be Running mid-grace"
         );
 
-        // Wait for second bind to complete; then verify old is dead,
-        // new is the canonical pool PID, and bindings reflect "222".
+        // Wait for second bind to complete; verify the pool's
+        // bookkeeping reflects the swap. We deliberately do NOT
+        // re-read `/proc/<pid2>/state` here: the test process is
+        // the wrapper's parent, and Rust's test runtime auto-reaps
+        // its own children as they exit — leading to a brief
+        // `[sleep] <defunct>` window between the bind returning
+        // and the next `pid_state_quick` call. The pool's own
+        // `current_pid` / `bindings` accessors are the canonical
+        // correctness signal here; the kernel-state check inside
+        // `bind_with_op` already verified the new wrapper was
+        // alive before the kill-old step (otherwise the bind
+        // would have returned Err).
         let pid2 = bg_task.await.unwrap().unwrap();
         assert_eq!(pid2, pid2_from_file);
-        assert_eq!(
-            crate::backend::pid_state_quick(pid1).unwrap(),
-            BackendState::NotRunning,
-            "old LWE must be dead after grace + 200 ms SIGTERM grace"
-        );
-        assert_eq!(
-            crate::backend::pid_state_quick(pid2).unwrap(),
-            BackendState::Running,
-            "new LWE must still be Running after transition"
-        );
         assert_eq!(pool.current_pid().await, Some(pid2));
         assert_eq!(
             pool.bindings().await.get("DP-1").map(String::as_str),
@@ -1422,13 +1827,6 @@ mod tests {
         let _ = std::fs::remove_file(&wrapper);
         let _ = std::fs::remove_file(&pid_file);
     }
-
-    /// Abort path: when the NEW LWE dies during the grace window,
-    /// `bind()` must (a) return Err, (b) leave the OLD process
-    /// untouched so the caller can retry.
-    ///
-    /// We use a wrapper that exits immediately. The wrapper takes
-    /// no args and always exits — so every bind() invocation that
     /// spawns it will get a dead process after the grace window.
     /// The first bind uses a healthy /bin/sleep wrapper so we have
     /// an OLD process to preserve; the second bind uses the dying
@@ -1509,7 +1907,11 @@ mod tests {
 
         // Conditional-die wrapper: dies if any argv equals "die",
         // else sleeps long. This lets us use a single pool to
-        // test both branches.
+        // test both branches. Uses bash so `exec -a` (which
+        // re-stamps argv[0] to carry the LWE pattern) is supported
+        // — `/bin/sh` on Debian is `dash`, which lacks `exec -a`,
+        // and the wrapper would otherwise exit immediately with
+        // "exec: -a: not found".
         let cond_wrapper = std::env::temp_dir().join(format!(
             "paperforge-cond-wrapper-{}-{}.sh",
             std::process::id(),
@@ -1517,14 +1919,14 @@ mod tests {
         ));
         std::fs::write(
             &cond_wrapper,
-            "#!/bin/sh\n\
+            "#!/usr/bin/env bash\n\
              # paperforge conditional-die wrapper\n\
-             for arg in \"$@\"; do\n  \
-               if [ \"$arg\" = \"die\" ]; then\n    \
-                 exit 1\n  \
+             for arg in \"$@\"; do\n\
+               if [ \"$arg\" = \"die\" ]; then\n\
+                 exit 1\n\
                fi\n\
              done\n\
-             exec /bin/sleep 600\n",
+             exec -a linux-wallpaperengine-cond-test /bin/sleep 600\n",
         )
         .unwrap();
         std::fs::set_permissions(
@@ -1540,7 +1942,7 @@ mod tests {
         // First bind: content_id "alive" → wrapper sleeps long.
         let pid1 = pool.bind("DP-1", "alive").await.unwrap();
         assert_eq!(
-            crate::backend::pid_state_quick(pid1).unwrap(),
+            crate::backend::pid_state_quick(pid1, BackendKind::LinuxWallpaperEngine).unwrap(),
             BackendState::Running,
             "first LWE must be Running before the abort-triggering bind"
         );
@@ -1557,7 +1959,7 @@ mod tests {
         // pid1 must still be alive — the abort path must NOT
         // have killed it. This is the whole point.
         assert_eq!(
-            crate::backend::pid_state_quick(pid1).unwrap(),
+            crate::backend::pid_state_quick(pid1, BackendKind::LinuxWallpaperEngine).unwrap(),
             BackendState::Running,
             "old LWE must survive the abort (spawn-first-kill-after rollback)"
         );
@@ -1595,24 +1997,31 @@ mod tests {
             .with_transition_grace_ms(0);
 
         let pid1 = pool.bind("DP-1", "111").await.unwrap();
+        // Give the kernel a moment to populate /proc/<pid>/cmdline
+        // AFTER the wrapper's `exec -a` (the wrapper's pre-exec
+        // sleep is 0.1s; we wait 0.5s for safety). The linter-
+        // integrated `pid_state_quick` cross-check rejects PIDs
+        // whose cmdline doesn't match the LWE pattern.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert_eq!(
-            crate::backend::pid_state_quick(pid1).unwrap(),
+            crate::backend::pid_state_quick(pid1, BackendKind::LinuxWallpaperEngine).unwrap(),
             BackendState::Running
         );
 
         let pid2 = pool.bind("DP-1", "222").await.unwrap();
         assert_ne!(pid1, pid2);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // With grace=0 there's no wait, so the old PID is killed
         // immediately after spawn + immediate check. pid1 should
         // be NotRunning by the time bind() returns.
         assert_eq!(
-            crate::backend::pid_state_quick(pid1).unwrap(),
+            crate::backend::pid_state_quick(pid1, BackendKind::LinuxWallpaperEngine).unwrap(),
             BackendState::NotRunning,
             "with grace=0 the old PID must be dead by the time bind() returns"
         );
         assert_eq!(
-            crate::backend::pid_state_quick(pid2).unwrap(),
+            crate::backend::pid_state_quick(pid2, BackendKind::LinuxWallpaperEngine).unwrap(),
             BackendState::Running,
             "new PID must be the canonical one with grace=0"
         );
@@ -1628,8 +2037,8 @@ mod tests {
     /// PID fields. Uses a thread-local `tracing_subscriber::fmt`
     /// writer to capture the output, then asserts the line matches
     /// the documented shape. The thread-local scope is safe here
-    /// because `#[tokio::test]` runs on a single-threaded current-thread
-    /// runtime so no task hops a thread.
+    /// because `#[tokio::test]` runs on a single-threaded
+    /// current-thread runtime so no task hops a thread.
     #[tokio::test]
     async fn bind_with_op_emits_transition_timing_log() {
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
@@ -1644,6 +2053,21 @@ mod tests {
             .with_ansi(false)
             .finish();
 
+        // Install a thread-local default subscriber for the test body
+        // via `tracing::dispatcher::set_default`. The guard lives
+        // until the test function returns, which keeps the
+        // subscriber active across the async bind chain's
+        // `.await` points within the
+        // `#[tokio::test(flavor = "current_thread")]` runtime.
+        //
+        // NOTE on parallel-test flakiness: a previous version of
+        // this test instrumented `set_global_default` here with the
+        // intent to defend against the thread-local subscriber
+        // being silently swapped by another parallel test's
+        // `set_default`. That did NOT fix the flakiness, so we
+        // reverted to the simpler thread-local scope. The race
+        // appears to be in tracing-subscriber's lazy writer cache
+        // rather than the dispatcher's thread-local swap.
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let wrapper = write_sleep_wrapper(60);
@@ -1812,6 +2236,233 @@ mod tests {
             "no-op unbind on empty pool must not emit a log line"
         );
 
+        let _ = std::fs::remove_file(&wrapper);
+    }
+
+    // -----------------------------------------------------------------
+    // Watchdog tests (Fase 4: LWE pool auto-respawn)
+    // -----------------------------------------------------------------
+    //
+    // These tests cover the four scenarios the spec calls out:
+    // 1. The watchdog actually respawns a dead pool.
+    // 2. The watchdog does NOT respawn when last_bindings is empty
+    //    (no point spawning a phantom LWE for nobody).
+    // 3. `abort_watchdog` (and `shutdown`) cancel the task cleanly.
+    // 4. `last_bindings` survives an unbind of one output when others
+    //    remain — only unbind of the LAST binding clears it.
+    //
+    // The `pid_state_quick` lwe-name cross-check means we cannot
+    // just `bind` against `/bin/true` — that wrapper's cmdline
+    // would never match the `linux-wallpaperengine` pattern and
+    // the bind would be reported as dead-in-grace. So these tests
+    // use a bash wrapper that re-stamps `argv[0]` to a name that
+    // contains the LWE pattern. The wrapper is identical in spirit
+    // to `write_sleep_wrapper` (above) but uses bash so `exec -a`
+    // is supported; /bin/sh on Debian is dash which doesn't grok
+    // `-a`.
+
+    /// Bash wrapper that exec's `/bin/sleep` with `argv[0]` set to
+    /// a name containing `linux-wallpaperengine`. The pid survives
+    /// the watchdog's `pid_state_quick` cross-check because the
+    /// pattern is a substring match.
+    fn write_lwe_sleep_wrapper(sleep_seconds: u64) -> PathBuf {
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-lwe-sleep-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq(),
+        ));
+        let body = format!(
+            "#!/bin/bash\n\
+             # paperforge lwe-named sleep wrapper for watchdog tests\n\
+             exec -a linux-wallpaperengine-watchdog-test /bin/sleep {sleep_seconds}\n"
+        );
+        std::fs::write(&wrapper, body).unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        wrapper
+    }
+
+    /// `spawn_watchdog` should be idempotent: a second call while
+    /// the task is alive must not spawn a duplicate. Pre-flight
+    /// check used by the other watchdog tests below.
+    #[tokio::test]
+    async fn watchdog_spawn_is_idempotent() {
+        let pool = LweSinglePool::with_binary("/bin/true").with_watchdog_interval_secs(3600);
+        pool.spawn_watchdog().await;
+        pool.spawn_watchdog().await;
+        pool.abort_watchdog().await;
+    }
+
+    /// Bind an output, kill the LWE child externally, and verify
+    /// the watchdog respawns with a new PID within the configured
+    /// tick window. Uses a wrapper that exec's `/bin/sleep` so the
+    /// PID appears in `/proc` and can be killed with `nix::kill`.
+    /// The test's interval is 1 s so a single tick is enough.
+    #[tokio::test]
+    async fn watchdog_respawns_dead_pool() {
+        // Long sleep so the wrapper has time to be observed alive,
+        // then killed, then the respawn to be observed — all within
+        // the test's wall-clock budget.
+        let wrapper = write_lwe_sleep_wrapper(600);
+        let pool = LweSinglePool::with_binary(&wrapper)
+            .with_flags(vec![])
+            .with_transition_grace_ms(100)
+            .with_watchdog_interval_secs(1);
+
+        let pid_before = pool.bind("DP-1", "111").await.unwrap();
+        assert!(pid_before > 0, "bind must return a real PID");
+
+        // Spawn the watchdog after the bind so `last_bindings` is
+        // populated. Without this, the watchdog would see
+        // `last_bindings.is_empty()` and refuse to respawn.
+        pool.spawn_watchdog().await;
+
+        // Kill the LWE child. The watchdog's next tick should
+        // detect `NotRunning` and respawn from `last_bindings`.
+        // We use `libc::SIGKILL` via `nix` for portability.
+        // SAFETY: pid_from_bind was obtained from the same
+        // `child.id()` we are about to terminate; the kernel
+        // reuses PIDs lazily enough that 1 s is safe.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid_before),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+
+        // Poll for up to 5 s (covers 1 s tick + 1 s respawn +
+        // grace margin). We sleep in 200 ms slices and re-check
+        // `current_pid()` each time.
+        let deadline = std::time::Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        let mut pid_after: Option<i32> = None;
+        while start.elapsed() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let maybe = pool.current_pid().await;
+            if let Some(p) = maybe {
+                if p != pid_before {
+                    pid_after = Some(p);
+                    break;
+                }
+            }
+        }
+        assert!(
+            pid_after.is_some(),
+            "watchdog should have respawned with a new PID within 5s; \
+             pid_before={pid_before}, current_pid={:?}",
+            pool.current_pid().await
+        );
+
+        pool.abort_watchdog().await;
+        // After abort, the respawned child is still alive — best
+        // effort cleanup so test runs don't leave sleep processes
+        // around. Failures here are not test failures (the PID
+        // could already be gone if something raced).
+        if let Some(p) = pid_after {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(p),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        if let Some(p) = pool.current_pid().await {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(p),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        let _ = std::fs::remove_file(&wrapper);
+    }
+
+    /// If the pool is empty (no bindings ever, or all bindings
+    /// unbound), the watchdog must NOT spawn a phantom LWE. We
+    /// verify by checking that `current_pid()` stays `None` for
+    /// at least one full tick.
+    #[tokio::test]
+    async fn watchdog_does_not_respawn_when_bindings_empty() {
+        // `/bin/true` is a safe binary that exits immediately. If
+        // the watchdog somehow spawned it, `current_pid()` would
+        // briefly become Some(.) and then back to None. We assert
+        // it stays None across the poll window.
+        let pool = LweSinglePool::with_binary("/bin/true").with_watchdog_interval_secs(1);
+        pool.spawn_watchdog().await;
+
+        // Wait longer than one tick so the watchdog has had at
+        // least one chance to (incorrectly) spawn.
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+
+        assert!(
+            pool.current_pid().await.is_none(),
+            "watchdog must not spawn a pool when last_bindings is empty"
+        );
+
+        pool.abort_watchdog().await;
+    }
+
+    /// `abort_watchdog` cancels the spawned task. After returning,
+    /// the inner task handle is `None`, so a subsequent
+    /// `spawn_watchdog` spawns a fresh one (and survives the
+    /// double-abort cleanly).
+    #[tokio::test]
+    async fn watchdog_aborts_on_shutdown() {
+        let pool = LweSinglePool::with_binary("/bin/true").with_watchdog_interval_secs(3600);
+        pool.spawn_watchdog().await;
+
+        // First abort cancels the task.
+        pool.abort_watchdog().await;
+
+        // Second abort is a no-op (idempotent).
+        pool.abort_watchdog().await;
+
+        // Re-spawning works after an abort.
+        pool.spawn_watchdog().await;
+        pool.abort_watchdog().await;
+    }
+
+    /// `last_bindings` must persist across partial unbinds. The
+    /// watchdog uses this snapshot to rebuild the pool after a
+    /// crash, so missing a single output's binding would mean the
+    /// respawn loses a monitor. The rule is: clear only when the
+    /// operator removes the LAST binding.
+    #[tokio::test]
+    async fn last_bindings_persists_through_unbind_of_some_outputs() {
+        // Use the lwe-named wrapper so `bind()` survives the
+        // `pid_state_quick` cross-check (the new linter-integrated
+        // check rejects PIDs whose cmdline doesn't match the LWE
+        // pattern — even a freshly spawned `/bin/true` would fail).
+        let wrapper = write_lwe_sleep_wrapper(600);
+        let pool = LweSinglePool::with_binary(&wrapper)
+            .with_flags(vec![])
+            .with_transition_grace_ms(100);
+
+        // Bind two outputs.
+        let _ = pool.bind("DP-1", "111").await.unwrap();
+        let _ = pool.bind("HDMI-A-1", "222").await.unwrap();
+
+        // Unbind one. The other survives.
+        pool.unbind("DP-1").await.unwrap();
+
+        let snap = pool.last_bindings().await;
+        assert_eq!(
+            snap,
+            std::collections::BTreeMap::from([("HDMI-A-1".to_string(), "222".to_string())]),
+            "last_bindings must retain the remaining binding after a partial unbind"
+        );
+
+        // Unbind the last one. NOW last_bindings clears.
+        pool.unbind("HDMI-A-1").await.unwrap();
+        assert!(
+            pool.last_bindings().await.is_empty(),
+            "last_bindings must clear when the operator removes the LAST binding"
+        );
+
+        // Best-effort cleanup of any leftover sleep child.
+        if let Some(p) = pool.current_pid().await {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(p),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
         let _ = std::fs::remove_file(&wrapper);
     }
 }

@@ -593,7 +593,7 @@ impl LweBackend {
         let mut pids_sorted: Vec<i32> = pids.values().copied().collect();
         pids_sorted.sort_unstable();
         let canonical_pid = pids_sorted[0];
-        match pid_state_quick(canonical_pid) {
+        match pid_state_quick(canonical_pid, BackendKind::LinuxWallpaperEngine) {
             Ok(BackendState::Running) | Ok(BackendState::Paused) => {
                 PoolHealth::Alive(canonical_pid)
             }
@@ -822,7 +822,7 @@ impl LweBackend {
             {
                 if existing_scene == scene
                     && matches!(
-                        pid_state_quick(existing_pid),
+                        pid_state_quick(existing_pid, BackendKind::LinuxWallpaperEngine),
                         Ok(BackendState::Running) | Ok(BackendState::Paused)
                     )
                 {
@@ -947,7 +947,7 @@ impl LweBackend {
             // Skip dead pids so SIGSTOP doesn't fail noisily on
             // zombies that the reaper hasn't swept yet.
             if !matches!(
-                pid_state_quick(pid),
+                pid_state_quick(pid, BackendKind::LinuxWallpaperEngine),
                 Ok(BackendState::Running) | Ok(BackendState::Paused)
             ) {
                 continue;
@@ -994,7 +994,7 @@ impl LweBackend {
                 .copied()
                 .filter(|pid| {
                     matches!(
-                        pid_state_quick(*pid),
+                        pid_state_quick(*pid, BackendKind::LinuxWallpaperEngine),
                         Ok(BackendState::Running) | Ok(BackendState::Paused)
                     )
                 })
@@ -1144,7 +1144,7 @@ impl LweBackend {
             // Skip dead pids so SIGCONT on a defunct process doesn't
             // get logged as an error by the kernel.
             if matches!(
-                pid_state_quick(pid),
+                pid_state_quick(pid, BackendKind::LinuxWallpaperEngine),
                 Ok(BackendState::Running) | Ok(BackendState::Paused)
             ) && nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid),
@@ -1265,7 +1265,7 @@ impl LweBackend {
             let pids = self.per_output_pids.lock().await;
             match pids.get(output) {
                 Some(existing) => matches!(
-                    pid_state_quick(*existing),
+                    pid_state_quick(*existing, BackendKind::LinuxWallpaperEngine),
                     Ok(BackendState::Running) | Ok(BackendState::Paused)
                 ),
                 None => false,
@@ -1385,7 +1385,7 @@ impl LweBackend {
         // non-mut to silence the warn without changing behaviour.
         let _scenes = self.per_output_scenes.lock().await;
         for (output, pid) in candidates {
-            match pid_state_quick(pid) {
+            match pid_state_quick(pid, BackendKind::LinuxWallpaperEngine) {
                 Ok(BackendState::NotRunning) => {
                     tracing::info!(
                         target: "paperforge",
@@ -1683,20 +1683,62 @@ impl WallpaperBackend for LweBackend {
         // `per_output_pids` map, but LWE children survive in /proc
         // (reparented to init after our exit). Read the kernel-
         // reported state directly via /proc/<pid>/status. If the
-        // pid is gone, /proc reports ENOENT → NotRunning.
+        // pid is gone, /proc reports ENOENT → NotRunning. The
+        // `pid_state_quick` call also cross-checks the cmdline
+        // against `LinuxWallpaperEngine`'s pattern so a recycled
+        // PID (kernel handed the same PID to a `bash` / `sleep`)
+        // is reported as NotRunning, not Running.
         let owned = self.pool.current_pid().await;
         if owned == Some(pid) {
-            return pid_state_quick(pid);
+            return pid_state_quick(pid, BackendKind::LinuxWallpaperEngine);
         }
         // Per-output + stateless CLI: skip the ownership gate and
         // trust /proc. This matches the v0.1 design where each LWE
         // child survives independently of any parent state.
-        pid_state_quick(pid)
+        pid_state_quick(pid, BackendKind::LinuxWallpaperEngine)
     }
 
     fn supports(&self, entry: &crate::WallpaperEntry) -> bool {
         entry.kind.lwe_compatible()
     }
+}
+
+/// Read `/proc/<pid>/cmdline` and check whether its argv contains
+/// `BackendKind::process_pattern()` for `kind`.
+///
+/// Returns:
+/// - `true` if the cmdline contains the pattern (this PID IS an
+///   instance of `kind`).
+/// - `false` if the PID exists but the cmdline doesn't match (PID
+///   was recycled to a different process — the most insidious case:
+///   `pid_state_quick` would otherwise return Running on a
+///   totally unrelated process).
+/// - `false` if `/proc/<pid>/cmdline` doesn't exist (PID gone).
+///
+/// This is the PID-recycling defense. Combined with
+/// [`pid_state_quick`], it lets call sites distinguish "alive AND is
+/// `kind`" from "alive BUT is something else". The original LWE
+/// can die and the kernel can recycle its PID to a `bash` / `sleep`
+/// / whatever — a kernel-state-only check would mistake that for
+/// "LWE is alive" and skip the respawn.
+///
+/// Public (not `pub(crate)`) because the upcoming watchdog will
+/// call it directly and we want it reachable from integration
+/// tests in other crates.
+pub fn pid_is_backend_kind(pid: i32, kind: BackendKind) -> bool {
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    let Ok(cmdline) = std::fs::read(&cmdline_path) else {
+        return false;
+    };
+    let pattern = kind.process_pattern();
+    cmdline
+        .split(|b| *b == 0)
+        .filter(|arg| !arg.is_empty())
+        .any(|arg| {
+            std::str::from_utf8(arg)
+                .map(|s| s.contains(pattern))
+                .unwrap_or(false)
+        })
 }
 
 /// Read the kernel-reported state of a PID via `/proc/<pid>/status`.
@@ -1706,7 +1748,14 @@ impl WallpaperBackend for LweBackend {
 ///   typical after the caller sent SIGSTOP via the nix syscall.
 /// - `BackendState::Running` if the kernel reports any of `R (running)`,
 ///   `S (sleeping)`, `D (disk sleep)`, `I (idle)`. We treat all of
-///   these as "alive, not paused".
+///   these as "alive, not paused". Before returning Running we
+///   cross-check against [`pid_is_backend_kind`]: if the PID was
+///   recycled to a different process (e.g. an LWE died and the
+///   kernel handed its PID to a `bash`), the cmdline won't match
+///   `kind.process_pattern()` and we report NotRunning instead.
+///   Without this check, `bind()`'s fast-path would happily return
+///   `Ok(pid)` against a recycled PID and the wallpapers would
+///   stay dead even though the pool "thinks" LWE is alive.
 /// - `BackendState::NotRunning` if `/proc/<pid>/status` doesn't exist
 ///   (process exited, or never existed) OR the kernel reports
 ///   `Z (zombie)`. A zombie has finished executing — its task_struct
@@ -1724,13 +1773,14 @@ impl WallpaperBackend for LweBackend {
 /// This is a synchronous read because `/proc` is a kernel pseudofs:
 /// no I/O wait, no network, no async needed. Callers wrap in
 /// `spawn_blocking` if they're holding an async runtime.
-pub(crate) fn pid_state_quick(pid: i32) -> Result<BackendState> {
+pub(crate) fn pid_state_quick(pid: i32, kind: BackendKind) -> Result<BackendState> {
     let status_path = format!("/proc/{pid}/status");
     let content = match std::fs::read_to_string(&status_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BackendState::NotRunning),
         Err(e) => return Err(e.into()),
     };
+    let mut kernel_state: Option<BackendState> = None;
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("State:") {
             // State line looks like: "State:\tT (stopped)"
@@ -1738,11 +1788,15 @@ pub(crate) fn pid_state_quick(pid: i32) -> Result<BackendState> {
             //                       or   "State:\tS (sleeping)"
             //                       or   "State:\tZ (zombie)"
             if rest.contains('T') {
+                // SIGSTOP'd LWE still has the correct cmdline — the
+                // kernel never recycles a PID that's currently
+                // stopped. Skip the cross-check to save one syscall.
                 return Ok(BackendState::Paused);
             }
             if rest.contains('R') || rest.contains('S') || rest.contains('D') || rest.contains('I')
             {
-                return Ok(BackendState::Running);
+                kernel_state = Some(BackendState::Running);
+                break;
             }
             // Unknown state letter, or Z (zombie) — fall through to
             // NotRunning. The wrapper script case (exits 1 within the
@@ -1752,7 +1806,27 @@ pub(crate) fn pid_state_quick(pid: i32) -> Result<BackendState> {
             return Ok(BackendState::NotRunning);
         }
     }
-    Ok(BackendState::NotRunning)
+    // After the loop: kernel reported Running OR the `State:` line
+    // was absent (very rare; treat as Running-shaped to be safe).
+    // Cross-check the cmdline against `kind` to defend against PID
+    // recycling — the original process died and the kernel handed
+    // the same PID to a `bash` / `sleep` / whatever. The kernel
+    // state alone would call that "Running", which is true but
+    // misleading for our purposes.
+    match kernel_state {
+        Some(BackendState::Running) => {
+            if pid_is_backend_kind(pid, kind) {
+                Ok(BackendState::Running)
+            } else {
+                tracing::debug!(
+                    target: "paperforge",
+                    "pid_state_quick: pid={pid} kind={kind:?} reports Running but cmdline does not match (recycled PID); reporting NotRunning",
+                );
+                Ok(BackendState::NotRunning)
+            }
+        }
+        _ => Ok(BackendState::NotRunning),
+    }
 }
 
 // `BackendKind::process_basename` was renamed to `process_pattern` in
@@ -2268,6 +2342,18 @@ async fn send_mpv_ipc(socket: &std::path::Path, command: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Monotonic counter used to uniquify wrapper script paths in
+    /// parallel test invocations. Using only `std::process::id()` in
+    /// the path collides when two tests in the same binary write the
+    /// same filename concurrently — the second `Command::spawn()`
+    /// returns ETXTBSY ("Text file busy") because the kernel still
+    /// has the file open for exec from the first test's spawn.
+    fn next_wrapper_seq() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// First call to `should_emit` for a given key returns true and
     /// records the timestamp. Subsequent identical calls within the
     /// cooldown window return false. Different keys are
@@ -2444,9 +2530,27 @@ mod tests {
     async fn lwe_backend_set_via_pool_uses_single_process() {
         // /bin/sleep needs to swallow the LWE-style argv the pool
         // emits, so wrap it in a shell that ignores its argv and
-        // just sleeps long enough for all the binds.
-        let wrapper = std::env::temp_dir().join("paperforge-pool-single-binary.sh");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        // just sleeps long enough for all the binds. The wrapper
+        // also re-stamps argv[0] via `exec -a` so the resulting
+        // cmdline contains the `linux-wallpaperengine` pattern and
+        // `pid_state_quick`'s recycling defense accepts the
+        // process. Uses bash because /bin/sh on Debian is dash
+        // which lacks `exec -a`.
+        // Unique per-run path so parallel tests don't race on the
+        // same inode (kernel returns ETXTBSY "Text file busy" when
+        // a second test re-writes the wrapper while the previous
+        // spawn is still exec'ing it).
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-pool-single-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq()
+        ));
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-pool-single /bin/sleep 60\n",
+        )
+        .unwrap();
         std::fs::set_permissions(
             &wrapper,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -2517,8 +2621,21 @@ mod tests {
     /// guarantee the pool promises in its docstring.
     #[tokio::test]
     async fn lwe_backend_set_idempotent_when_unchanged() {
-        let wrapper = std::env::temp_dir().join("paperforge-pool-idempotent-binary.sh");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-pool-idempotent-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq()
+        ));
+        // bash + `exec -a` so the resulting cmdline carries the
+        // LWE pattern and the pid_state_quick recycling defense
+        // accepts the process. /bin/sh on Debian is dash which
+        // doesn't grok `exec -a`.
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-pool-idempotent /bin/sleep 60\n",
+        )
+        .unwrap();
         std::fs::set_permissions(
             &wrapper,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -2568,8 +2685,17 @@ mod tests {
     async fn set_populates_per_output_pids_for_all_pool_outputs() {
         // Wrapper that swallows the LWE-style argv and just sleeps —
         // matches the pattern in `lwe_backend_set_via_pool_uses_single_process`.
+        // bash + `exec -a` so the resulting cmdline carries the LWE
+        // pattern and the pid_state_quick recycling defense accepts
+        // the process. /bin/sh on Debian is dash which doesn't grok
+        // `exec -a`.
         let wrapper = std::env::temp_dir().join("paperforge-sync-pid-map-binary.sh");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-sync-pid-map /bin/sleep 60\n",
+        )
+        .unwrap();
         std::fs::set_permissions(
             &wrapper,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -2848,8 +2974,10 @@ mod tests {
         assert!(pids.is_empty());
     }
 
-    /// Real-process SIGSTOP/SIGCONT end-to-end: spawn `sleep`,
-    /// freeze, inspect `/proc/<pid>/status`, thaw, re-inspect.
+    /// Real-process SIGSTOP/SIGCONT end-to-end: spawn a wrapper whose
+    /// argv contains `linux-wallpaperengine` (so the
+    /// `pid_state_quick` cmdline cross-check passes), freeze it,
+    /// inspect `/proc/<pid>/status`, thaw, re-inspect.
     ///
     /// This is the closest thing to "smoke test" the signal code
     /// without a real LWE instance. It uses the real
@@ -2858,23 +2986,51 @@ mod tests {
     /// Uses `pid_state_quick` directly because `LweBackend::state`
     /// gates on pool ownership (returns NotRunning for foreign pids),
     /// which is correct production behavior but wrong for this smoke
-    /// test — the test deliberately creates an unmanaged sleep.
+    /// test — the test deliberately creates an unmanaged pseudo-LWE.
+    ///
+    /// The wrapper uses `exec -a` to set argv[0] to a name containing
+    /// the LWE pattern, then sleeps for 60s. `pid_is_backend_kind`
+    /// matches on `argv[0]` (and any other argv slot), so the
+    /// kernel-state transition check that follows passes the
+    /// recycling defense.
     #[test]
     fn real_sigstop_sigcont_round_trip() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("60")
+        // Wrapper script: exec sleep with a fake argv[0] so the
+        // cmdline contains "linux-wallpaperengine" and our
+        // recycling defense doesn't mistake it for a recycled PID.
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-sigstop-smoke-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq()
+        ));
+        // `exec -a NAME sleep 60` runs /usr/bin/sleep with argv[0]
+        // overridden to NAME. The /proc/<pid>/cmdline then reads
+        // "linux-wallpaperengine-sigstop-smoke\0sleep\060\0".
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-sigstop-smoke /usr/bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let mut child = std::process::Command::new(&wrapper)
             .spawn()
-            .expect("spawn sleep");
+            .expect("spawn wrapper");
         let pid = child.id() as i32;
 
         // Give the scheduler a moment so /proc reflects the new PID.
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        let state_running = pid_state_quick(pid).unwrap();
+        let state_running = pid_state_quick(pid, BackendKind::LinuxWallpaperEngine).unwrap();
         assert_eq!(
             state_running,
             BackendState::Running,
-            "sleep should start running"
+            "wrapper should start running"
         );
 
         nix::sys::signal::kill(
@@ -2885,11 +3041,11 @@ mod tests {
 
         // Yield to scheduler so the kernel processes the signal.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let state_paused = pid_state_quick(pid).unwrap();
+        let state_paused = pid_state_quick(pid, BackendKind::LinuxWallpaperEngine).unwrap();
         assert_eq!(
             state_paused,
             BackendState::Paused,
-            "sleep should report paused after SIGSTOP"
+            "wrapper should report paused after SIGSTOP"
         );
 
         nix::sys::signal::kill(
@@ -2899,15 +3055,16 @@ mod tests {
         .expect("SIGCONT");
 
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let state_resumed = pid_state_quick(pid).unwrap();
+        let state_resumed = pid_state_quick(pid, BackendKind::LinuxWallpaperEngine).unwrap();
         assert_eq!(
             state_resumed,
             BackendState::Running,
-            "sleep should report running after SIGCONT"
+            "wrapper should report running after SIGCONT"
         );
 
         child.kill().expect("cleanup kill");
         let _ = child.wait();
+        let _ = std::fs::remove_file(&wrapper);
     }
 
     #[test]
@@ -2918,6 +3075,187 @@ mod tests {
         // not exist on a normal box.
         let s = rt.block_on(backend.state(0)).unwrap();
         assert_eq!(s, BackendState::NotRunning);
+    }
+
+    // ---- PID-recycling defense tests ----
+    //
+    // These tests cover the bug where the kernel reuses a deceased
+    // LWE's PID for an unrelated process (a `bash`, a `sleep`, etc.).
+    // The kernel-side state (R/S/D/I) on the recycled PID is still
+    // "Running" — only the cmdline reveals the recycling. Tests
+    // against the REAL /proc because the cmdline read path is
+    // intentionally hard-coded to `/proc` (production invariant: the
+    // procfs root is fixed by the kernel).
+
+    /// `pid_is_backend_kind` returns true for a process whose argv
+    /// contains the LWE pattern. We spawn a wrapper that uses
+    /// `exec -a` to override argv[0] so the cmdline contains the
+    /// pattern even though the underlying binary is `/bin/sleep`.
+    #[test]
+    fn pid_is_backend_kind_matches_lwe_cmdline() {
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-pid-kind-match-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq()
+        ));
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-pid-kind /usr/bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let mut child = std::process::Command::new(&wrapper)
+            .spawn()
+            .expect("spawn wrapper");
+        let pid = child.id() as i32;
+
+        // Give the scheduler a moment so /proc reflects the new PID.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        assert!(
+            pid_is_backend_kind(pid, BackendKind::LinuxWallpaperEngine),
+            "PID {pid} should be recognized as LWE (wrapper argv[0] contains the pattern)"
+        );
+
+        child.kill().expect("cleanup kill");
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&wrapper);
+    }
+
+    /// `pid_is_backend_kind` returns false for an unrelated process
+    /// (a plain `/bin/sleep` whose argv has no LWE pattern). This is
+    /// the case the kernel-state-only check would have misclassified
+    /// as "LWE is alive" — the recycling bug.
+    #[test]
+    fn pid_is_backend_kind_rejects_non_lwe_process() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        assert!(
+            !pid_is_backend_kind(pid, BackendKind::LinuxWallpaperEngine),
+            "PID {pid} (plain /bin/sleep) must NOT be misclassified as LWE"
+        );
+
+        child.kill().expect("cleanup kill");
+        let _ = child.wait();
+    }
+
+    /// `pid_is_backend_kind` returns false for a PID that doesn't
+    /// exist on the system. The kernel returns ENOENT for
+    /// `/proc/<pid>/cmdline` and we map that to `false`.
+    #[test]
+    fn pid_is_backend_kind_returns_false_for_dead_pid() {
+        // Spawn a real process, capture its PID, kill it, then wait
+        // long enough for the kernel to reap it so /proc/<pid> goes
+        // away. (If we used an arbitrary large PID the test would
+        // be flaky on a busy system — using a real PID we just
+        // reaped guarantees the directory is gone by the time we
+        // probe.)
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("10")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+        child.kill().expect("cleanup kill");
+        let _ = child.wait();
+        // Yield so the reaper can release the procfs entry.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        assert!(
+            !pid_is_backend_kind(pid, BackendKind::LinuxWallpaperEngine),
+            "reaped PID {pid} must return false (no /proc/<pid>/cmdline)"
+        );
+    }
+
+    /// End-to-end: `pid_state_quick` correctly classifies a recycled
+    /// PID as NotRunning. We can't reliably reproduce kernel-side
+    /// PID recycling in a unit test (the kernel picks the next
+    /// available PID, which depends on the host's PID namespace
+    /// churn), so we simulate the recycling case by checking the
+    /// behavior that matters: a PID whose cmdline does NOT match the
+    /// LWE pattern must report NotRunning even though the kernel
+    /// sees the process as Running.
+    ///
+    /// This is the exact bug the fix solves: a `/bin/sleep` that the
+    /// kernel handed the same numeric slot to would otherwise be
+    /// misclassified as LWE.
+    #[test]
+    fn pid_state_quick_treats_non_lwe_running_pid_as_not_running() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // The kernel sees this as Running (R/S). But the cmdline
+        // is `/bin/sleep\060\0` — no LWE pattern. The cross-check
+        // must produce NotRunning.
+        let state = pid_state_quick(pid, BackendKind::LinuxWallpaperEngine).unwrap();
+        assert_eq!(
+            state,
+            BackendState::NotRunning,
+            "non-LWE PID must be classified as NotRunning to defeat PID recycling"
+        );
+
+        // Sanity check: the underlying helper agrees it's not LWE.
+        assert!(!pid_is_backend_kind(pid, BackendKind::LinuxWallpaperEngine));
+
+        child.kill().expect("cleanup kill");
+        let _ = child.wait();
+    }
+
+    /// `pid_state_quick` still returns Running for a process whose
+    /// cmdline contains the LWE pattern. The cmdline cross-check
+    /// must not false-positive on legitimate LWE processes.
+    #[test]
+    fn pid_state_quick_returns_running_for_lwe_pattern_cmdline() {
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-pid-st-quick-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq()
+        ));
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-st-quick /usr/bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let mut child = std::process::Command::new(&wrapper)
+            .spawn()
+            .expect("spawn wrapper");
+        let pid = child.id() as i32;
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let state = pid_state_quick(pid, BackendKind::LinuxWallpaperEngine).unwrap();
+        assert_eq!(
+            state,
+            BackendState::Running,
+            "wrapper with LWE-pattern argv[0] must classify as Running"
+        );
+
+        child.kill().expect("cleanup kill");
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&wrapper);
     }
 
     // ---- SwwwBackend tests ----
@@ -3222,13 +3560,35 @@ mod tests {
     /// them. We use a long-running `sleep` as the live process.
     #[tokio::test]
     async fn prune_dead_pids_leaves_alive_pids_untouched() {
-        let backend = LweBackend::with_binary("/bin/sleep");
+        // Wrapper bash + exec -a so the spawned child has the LWE
+        // pattern in argv[0] and the cmdline recycling defense
+        // accepts it. /bin/sh on Debian is dash which lacks `exec -a`.
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-prune-test-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq()
+        ));
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-prune-test /bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let backend = LweBackend::with_binary(&wrapper);
         // Spawn a real child so /proc/<pid>/status is valid.
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
+        let mut child = std::process::Command::new(&wrapper).spawn().unwrap();
         let live_pid = child.id() as i32;
+
+        // Give the scheduler a moment so /proc/<pid>/cmdline reflects
+        // the post-exec argv[0] (the wrapper's `exec -a` only lands
+        // after the kernel schedules the new process).
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
         {
             let mut pids = backend.per_output_pids.lock().await;
@@ -3252,6 +3612,7 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_file(&wrapper);
     }
 
     /// `last_known_scenes` is the canonical "which scene was this
@@ -3333,15 +3694,38 @@ mod tests {
     /// alive — no respawn, no log noise (other than the prune pass).
     #[tokio::test]
     async fn reconcile_outputs_noop_when_all_alive() {
-        let backend = LweBackend::with_binary("/bin/sleep");
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
+        // bash + exec -a wrapper so the spawned child carries the
+        // LWE pattern in argv[0] and the cmdline recycling defense
+        // accepts it. /bin/sh on Debian is dash which lacks `exec -a`.
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-reconcile-noop-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq()
+        ));
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-reconcile-noop /bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let backend = LweBackend::with_binary(&wrapper);
+        let mut child = std::process::Command::new(&wrapper).spawn().unwrap();
         let live_pid = child.id() as i32;
 
+        // Give the scheduler a moment so /proc/<pid>/cmdline reflects
+        // the post-exec argv[0] (the wrapper's `exec -a` only lands
+        // after the kernel schedules the new process).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
         {
-            let mut pids = backend.per_output_pids.lock().await;
+            let pids_arc = backend.per_output_pids_test_accessor();
+            let mut pids = pids_arc.lock().await;
             pids.insert("DP-1".to_string(), live_pid);
         }
         {
@@ -3364,6 +3748,7 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_file(&wrapper);
     }
 
     /// `kill_per_output` SIGTERMs the recorded pid and removes it
@@ -3499,11 +3884,33 @@ mod tests {
         let scene = std::env::temp_dir().join("paperforge-bind-external-clobber.scene");
         std::fs::write(&scene, b"fake scene").unwrap();
 
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
+        // Use a bash wrapper that exec's /bin/sleep with argv[0]
+        // set to a name containing the LWE pattern. The linter-
+        // integrated `pid_state_quick` cross-check rejects PIDs
+        // whose cmdline doesn't match the LWE pattern, so a plain
+        // `/bin/sleep` would be reported as dead-in-grace.
+        let wrapper = std::env::temp_dir().join(format!(
+            "paperforge-bind-ext-clobber-{}-{}.sh",
+            std::process::id(),
+            next_wrapper_seq()
+        ));
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             exec -a linux-wallpaperengine-bind-ext-clobber /bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let mut child = std::process::Command::new(&wrapper).spawn().unwrap();
         let live_pid = child.id() as i32;
+
+        // Give the scheduler a moment so /proc reflects the new PID.
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
         let first = backend.bind_external_pid("DP-1", &scene, live_pid).await;
         assert!(first, "first adopt must succeed");
@@ -3526,6 +3933,7 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_file(&wrapper);
     }
 
     /// When the recorded pid is dead, `bind_external_pid` must
