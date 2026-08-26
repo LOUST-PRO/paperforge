@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/paperforge-core",
     "crates/paperforge-cli",
-    "crates/paperforge-tui", "crates/paperforge-gui",
+    "crates/paperforge-tui", "crates/paperforge-gui", "crates/paperforge-gpu",
 ]
 
 [workspace.package]
