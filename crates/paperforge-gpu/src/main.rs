@@ -8,9 +8,9 @@
 //!
 //! Run with: `cargo run -p paperforge-gpu` (requires a Wayland session).
 //!
-//! Outcome (Fase 0 / Task #82): if this prints "Hello, World!" + a button
+//! Outcome: if this prints "Hello, World!" + a button
 //! in a Niri window, the GPUI stack works end-to-end and we can proceed to
-//! Fase 7 (atomic PRs migrating Sheet / Sidebar / DataTable / DockArea /
+//! the migration PRs (Sheet / Sidebar / DataTable / DockArea /
 //! TrayIcon). If it crashes or fails to open a window, the spike blocked and
 //! we re-evaluate.
 //!
@@ -63,7 +63,7 @@ impl Render for Example {
                 outputs,
                 running,
                 /* connected */ true,
-                |name, _window, _cx| println!("[Fase 7 Sprint 2] open picker for {name}"),
+                |name, _window, _cx| println!("[paperforge-gpu] open picker for {name}"),
             ))
             .child(
                 Button::new("ok")

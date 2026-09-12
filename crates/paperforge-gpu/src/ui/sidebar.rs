@@ -1,6 +1,6 @@
 //! Sidebar — outputs list with state badges + per-row Set button.
 //!
-//! Fase 7 Sprint 1: GPUI Component port of `paperforge-gui/src/ui/sidebar.rs`.
+//! GPUI Component port of `paperforge-gui/src/ui/sidebar.rs`.
 //!
 //! Visual parity with the Dioxus version:
 //!
@@ -14,7 +14,7 @@
 //! ```
 //!
 //! The **Set** button calls `on_open_picker(name)` so the parent view can
-//! open the Picker modal (Fase 7 Sprint 2). The button is disabled when
+//! open the Picker modal. The button is disabled when
 //! `!connected` (the IPC client is unhealthy) so the operator can't open
 //! a picker against a stale compositor state.
 //!
