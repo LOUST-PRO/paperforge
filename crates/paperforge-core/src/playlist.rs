@@ -478,11 +478,7 @@ mod tests {
             Orientation::Unknown,
         ] {
             assert!(
-                orientation_compatible(
-                    MonitorOrientation::Any,
-                    scene,
-                    OrientationFallback::Skip,
-                ),
+                orientation_compatible(MonitorOrientation::Any, scene, OrientationFallback::Skip,),
                 "Any monitor should accept {scene:?} regardless of fallback"
             );
         }

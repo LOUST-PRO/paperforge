@@ -24,6 +24,8 @@ async fn save_playlist_overwrites_and_round_trips() {
         outputs: vec!["DP-1".into()],
         wallpapers: vec![PathBuf::from("/tmp/wp1")],
         fill: paperforge_core::playlist::FillMode::Fill,
+        monitor_orientation: paperforge_core::playlist::MonitorOrientation::Landscape,
+        orientation_fallback: paperforge_core::playlist::OrientationFallback::Allow,
     };
 
     playlists::save_playlist(tmp.path().to_path_buf(), pl.clone())
@@ -74,6 +76,8 @@ async fn save_playlist_creates_store_directory_if_missing() {
         outputs: vec!["eDP-1".into()],
         wallpapers: vec![PathBuf::from("/tmp/wp1")],
         fill: paperforge_core::playlist::FillMode::Fill,
+        monitor_orientation: paperforge_core::playlist::MonitorOrientation::Landscape,
+        orientation_fallback: paperforge_core::playlist::OrientationFallback::Allow,
     };
     playlists::save_playlist(nested.clone(), pl.clone())
         .await

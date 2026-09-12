@@ -145,10 +145,7 @@ pub fn detect(dir: &Path) -> Result<DetectionResult, crate::error::Error> {
 
     // Dispatch by `type` field (default "scene" if absent — same
     // convention as `inventory.rs`).
-    let ty = pj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("scene");
+    let ty = pj.get("type").and_then(|v| v.as_str()).unwrap_or("scene");
     match ty {
         "video" => detect_video(dir),
         "image" | "png" | "jpeg" | "jpg" => detect_image(dir),
@@ -269,9 +266,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Extract an integer value following a quoted JSON key. Looks for
@@ -285,9 +280,7 @@ fn extract_u32_field(window: &[u8], key: &[u8]) -> Option<u32> {
         v.push(b'"');
         v
     };
-    let Some(rel) = find_subslice(window, &needle) else {
-        return None;
-    };
+    let rel = find_subslice(window, &needle)?;
     let after = &window[rel + needle.len()..];
     // Skip optional whitespace + ':' + optional whitespace.
     let mut i = 0;
@@ -412,12 +405,11 @@ fn detect_video_file(path: &Path) -> Result<DetectionResult, crate::error::Error
 /// image file (png/jpg/jpeg) and parses its header.
 fn detect_image(dir: &Path) -> Result<DetectionResult, crate::error::Error> {
     use crate::error::Error;
-    let image_path = find_first_with_ext(dir, &["png", "jpg", "jpeg"]).ok_or_else(|| {
-        Error::Orientation {
+    let image_path =
+        find_first_with_ext(dir, &["png", "jpg", "jpeg"]).ok_or_else(|| Error::Orientation {
             path: dir.display().to_string(),
             reason: "image workshop but no media file found".into(),
-        }
-    })?;
+        })?;
     let ext = image_path
         .extension()
         .and_then(|e| e.to_str())
@@ -466,9 +458,9 @@ fn detect_png_header(path: &Path) -> Result<DetectionResult, crate::error::Error
 /// Parse JPEG SOF0/SOF2 marker for width/height. JPEG layout:
 /// - Bytes 0..2: 0xFF 0xD8 (SOI marker)
 /// - Then segments: 0xFF <marker> <length BE 2B> <payload>
-/// SOF0 (0xFFC0) and SOF2 (0xFFC2) carry the actual image
-/// dimensions. The length is followed by precision(1), height(2 BE),
-/// width(2 BE), components(1), ...
+/// - SOF0 (0xFFC0) and SOF2 (0xFFC2) carry the actual image
+///   dimensions. The length is followed by precision(1), height(2 BE),
+///   width(2 BE), components(1), ...
 fn detect_jpeg_header(path: &Path) -> Result<DetectionResult, crate::error::Error> {
     use crate::error::Error;
 
@@ -551,8 +543,14 @@ mod tests {
 
     #[test]
     fn orientation_from_dimensions_classifies_well_known_cases() {
-        assert_eq!(Orientation::from_dimensions(1920, 1080), Orientation::Landscape);
-        assert_eq!(Orientation::from_dimensions(1080, 1920), Orientation::Portrait);
+        assert_eq!(
+            Orientation::from_dimensions(1920, 1080),
+            Orientation::Landscape
+        );
+        assert_eq!(
+            Orientation::from_dimensions(1080, 1920),
+            Orientation::Portrait
+        );
         assert_eq!(Orientation::from_dimensions(512, 512), Orientation::Square);
         assert_eq!(Orientation::from_dimensions(0, 0), Orientation::Unknown);
         // Equal-ish degenerate: 0x1 vs 0x1 → Square (not Unknown).
@@ -680,15 +678,15 @@ mod tests {
         bytes.extend_from_slice(b"JFIF\x00");
         bytes.extend_from_slice(&[1, 1, 0, 0, 1, 0, 1, 0, 0]);
         // SOF0: 0xFF 0xC0 length=11 precision=8 height=1080 width=1920 ncomponents=3.
-// length INCLUDES itself: 2 length bytes + 1 precision + 2 height + 2 width + 1 ncomp
-// + 2*3 component descriptor bytes = 11.
+        // length INCLUDES itself: 2 length bytes + 1 precision + 2 height + 2 width + 1 ncomp
+        // + 2*3 component descriptor bytes = 11.
         bytes.extend_from_slice(&[0xFF, 0xC0]);
         bytes.extend_from_slice(&11u16.to_be_bytes());
         bytes.push(8); // precision
         bytes.extend_from_slice(&1080u16.to_be_bytes());
         bytes.extend_from_slice(&1920u16.to_be_bytes());
         bytes.push(1); // ncomponents (grayscale SOF0)
-        // 1 component descriptor triple (id, sampling, qtable).
+                       // 1 component descriptor triple (id, sampling, qtable).
         bytes.extend_from_slice(&[1, 0x11, 0]);
         // SOS marker (0xFF 0xDA) — minimal 3-byte header for scanner to skip.
         bytes.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x03, 0x01, 0x00]);
