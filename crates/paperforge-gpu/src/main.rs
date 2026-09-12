@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 
 use gpui::*;
-use gpui_component::{Root, button::Button, button::ButtonVariants};
+use gpui_component::{button::Button, button::ButtonVariants, Root};
 
 use paperforge_core::backend::BackendState;
 use paperforge_core::hotplug::Output;
@@ -42,9 +42,15 @@ impl Render for Example {
         // real consumers (Task #8 IPC + hotplug source) wire these
         // from observed state in a follow-up commit.
         let outputs = vec![
-            Output { name: "HDMI-A-1".into() },
-            Output { name: "DP-1".into() },
-            Output { name: "eDP-1".into() },
+            Output {
+                name: "HDMI-A-1".into(),
+            },
+            Output {
+                name: "DP-1".into(),
+            },
+            Output {
+                name: "eDP-1".into(),
+            },
         ];
         let mut running = HashMap::new();
         running.insert("HDMI-A-1".into(), BackendState::Running);
