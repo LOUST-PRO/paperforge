@@ -329,18 +329,16 @@ fn build_monitor_submenu(
     let monitor_name = mon.name.clone();
     let rotate_bin = rotate_bin.to_path_buf();
 
-    vec![
-        StandardItem {
-            label: label_next,
-            activate: Box::new(move |_tray: &mut PaperforgeTray| {
-                // Clone inside the Fn closure so it can be called multiple times.
-                let bin = rotate_bin.clone();
-                spawn_rotate(bin, Some(monitor_name.clone()));
-            }),
-            ..Default::default()
-        }
-        .into(),
-    ]
+    vec![StandardItem {
+        label: label_next,
+        activate: Box::new(move |_tray: &mut PaperforgeTray| {
+            // Clone inside the Fn closure so it can be called multiple times.
+            let bin = rotate_bin.clone();
+            spawn_rotate(bin, Some(monitor_name.clone()));
+        }),
+        ..Default::default()
+    }
+    .into()]
 }
 
 // ─── main ──────────────────────────────────────────────────────────────────
