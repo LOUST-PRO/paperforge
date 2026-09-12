@@ -57,6 +57,7 @@ pub mod lwe_orphan_cleanup;
 pub mod lwe_probe;
 pub mod lwe_spawn;
 pub mod metrics;
+pub mod orientation;
 pub mod paths;
 pub mod playlist;
 pub mod pool;

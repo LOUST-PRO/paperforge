@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Portrait auto-skip heuristic**: orientation-aware skip in the
+  per-playlist rotation loop. Wallpapers whose physical orientation
+  (portrait vs landscape) contradicts the monitor's orientation are
+  skipped automatically, so a 9:16 Workshop scene never lands on a
+  16:9 monitor again. Detection works on `scene.pkg`
+  (`orthogonalprojection` block for Workshop scenes), `ffprobe`
+  shell-out with 5s timeout for video workshops, and inline PNG
+  IHDR / JPEG SOF0 header parsing for image workshops. Web workshops
+  (`index.html`) return `Unknown` and pass through by default.
+- `paperforge orientation <PATH>` CLI subcommand with `--json`
+  output (`paperforge-core::orientation::detect`).
+- New `monitor_orientation` and `orientation_fallback` fields on
+  the playlist JSON schema, both optional with safe defaults
+  (`landscape` + `allow`). Existing playlists pick up portrait
+  filtering automatically — no opt-in required.
+- `paperforge-core::orientation::orientation_compatible(monitor,
+  scene, fallback)` pure decision function with a truth table
+  covering 12 monitor/scene/fallback combinations (rustdoc).
+- `crates/paperforge-core/tests/orientation-skip-smoke.sh` — 12
+  integration assertions covering synthetic + live Steam-library
+  workshops (portrait 1080x1920, 1080x2400, 2395x3500; landscape
+  1920x1080; square 1080x1080), CLI `--json` shape, and bash-helper
+  cache hit.
 - `crates/paperforge-cli/tests/cli.rs` — 6 integration tests using
   `CARGO_BIN_EXE_paperforge` (no extra deps).
 - Real SIGSTOP/SIGCONT round-trip test using a `sleep` child + `/proc/<pid>/status`
@@ -16,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Config` tests: extra_sources roundtrip, backend construction,
   source_roots inclusion.
 - `AudioCommand` serialization test (kebab-case lowercase).
+
+### Performance
+- Operator bash helper `paperforge-orientation-detect.sh` caches
+  results in `$XDG_CONFIG_HOME/paperforge/orientation-cache.json`
+  keyed by workshop ID + scene.pkg mtime. Cache hit cost is a
+  single `jq` lookup (~ms); cache miss runs the CLI parser
+  (~50–300ms fork+exec).
 
 ### Changed
 - `LweBackend::list_pids` now walks `/proc/<pid>/cmdline` directly
