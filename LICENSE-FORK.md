@@ -1,6 +1,6 @@
-# Lou-maintained Hardening Addendum
+# Hardening Addendum
 
-This is a Lou-maintained fork. The upstream LICENSE applies; this
+This is a community-maintained fork. The upstream LICENSE applies; this
 addendum documents the hardening policy applied on top.
 
 ## Hardening scope

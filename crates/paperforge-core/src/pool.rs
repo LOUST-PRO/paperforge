@@ -44,7 +44,7 @@
 //! - **Con**: Lose per-process isolation. If LWE crashes, all monitors
 //!   go down. Mitigation: a watchdog can respawn the pool (future work).
 //!
-//! ## Per-monitor pause (Fase 2)
+//! ## Per-monitor pause (planned)
 //!
 //! `pause()` here is GLOBAL — one process, one signal target. Per-output
 //! pause lives in LWE's native fullscreen detection:

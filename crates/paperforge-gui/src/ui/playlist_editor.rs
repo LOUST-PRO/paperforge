@@ -16,8 +16,9 @@
 //!
 //! The Dioxus 0.8-alpha drag-drop story on Linux is shaky (Dioxus
 //! issue #3961 — events don't fire on WebKitGTK for some
-//! drag-target combinations). Per the Fase 6C plan, click-to-add
-//! is the **contract**; drag-drop is the **enhancement**. PR 7/A-2
+//! drag-target combinations). The editor design follows a two-phase
+//! delivery: click-to-add is the **contract**; drag-drop is the
+//! **enhancement**. PR 7/A-2
 //! ships the click-to-add UX with full save support. PR 7/B layers
 //! `ondragstart` / `ondragover` / `ondrop` on top of the same
 //! `editor_draft` state, with `DragPayload` as the typed payload.

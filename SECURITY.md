@@ -14,7 +14,7 @@ a private issue if email not configured).
 
 Response time: 7 days for initial acknowledgement, 30 days for triage.
 
-## Security Hardening (LZT additions)
+## Security Hardening
 
 - Sanitization grep gate on public-facing changes
 - No telemetry or auto-publish

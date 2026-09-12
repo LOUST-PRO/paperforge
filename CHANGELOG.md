@@ -35,12 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] — 2026-07-28
 
 ### Added
-- Initial release of `paperforge` (Fase 6A).
+- Initial release of `paperforge`.
 - Workspace with 3 crates:
   - `paperforge-core` — lib (inventory, paths, backend, audio,
     playlist, config, error)
   - `paperforge-cli` — `paperforge` binary with 8 subcommands
-  - `paperforge-tui` — placeholder for Fase 6B
+  - `paperforge-tui` — placeholder, eventual TUI crate
 - `WallpaperBackend` trait + `LweBackend` impl (POSIX signals:
   SIGSTOP/SIGCONT for pause/resume, SIGUSR1/SIGUSR2 for audio).
 - `LweAudioController` (toggle/mute/unmute via SIGUSR1/SIGUSR2/SIGCONT).

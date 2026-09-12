@@ -27,7 +27,7 @@
 //!
 //! Dioxus 0.8-alpha supports `<img src="data:image/png;base64,...">`
 //! in the WebView. The PNG bytes from the cache are base64-encoded
-//! inline. Phase 2 (Fase 6C.2) may switch to a `dioxus-desktop`
+//! inline. Phase 2 may switch to a `dioxus-desktop`
 //! custom protocol scheme if larger inventories make the inline
 //! payload too heavy — until then, `data:` URLs are the simplest
 //! path.
@@ -97,7 +97,7 @@ pub fn PreviewPane(entry: Option<WallpaperEntry>, cache_dir: PathBuf) -> Element
                         div { "No preview available" }
                         div {
                             style: "font-size: 0.75rem; margin-top: 0.4rem; color: #6e7681;",
-                            "Workshop scenes ship a preview.jpg; loose videos get ffmpeg first-frame in Fase 6C.2."
+                            "Workshop scenes ship a preview.jpg; loose videos get ffmpeg first-frame in PR 8.3."
                         }
                     }
                 },

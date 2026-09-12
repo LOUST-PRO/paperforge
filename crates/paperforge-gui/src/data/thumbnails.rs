@@ -1,5 +1,5 @@
 //! Thumbnail subsystem — preview.jpg / image / ffmpeg-first-frame
-//! decoding + PNG cache (PR 8.1 + Fase 6C.2).
+//! decoding + PNG cache (PR 8.1).
 //!
 //! ## What this module does
 //!
@@ -16,7 +16,7 @@
 //! - `LooseImage` → decode the image itself (jpg / png / webp / gif
 //!   via the `image` 0.25 codec set).
 //! - `LooseVideo` → shell out to `ffmpeg` for a single PNG frame
-//!   (Fase 6C.2, see [`crate::data::ffmpeg`]), then run that PNG
+//!   (see [`crate::data::ffmpeg`]), then run that PNG
 //!   through the same resize/encode pipeline as the static-image
 //!   path. If ffmpeg isn't on PATH or the extraction fails, we
 //!   surface `Failed` (not `None`) so the UI can show a warning
@@ -42,7 +42,7 @@
 //! inside `tokio::task::spawn_blocking`. The `image` crate is
 //! blocking-by-design (no internal async) and the PNG encoder is
 //! synchronous, so it would otherwise stall the Dioxus runtime on
-//! large inventories. The ffmpeg subprocess (Fase 6C.2) is spawned
+//! large inventories. The ffmpeg subprocess is spawned
 //! via `tokio::process::Command` and timed out via
 //! `tokio::time::timeout`.
 //!
@@ -50,7 +50,7 @@
 //!
 //! PR 8.1 ships the surface (helpers + cache + tests). PR 8.2
 //! consumes it from `ui/picker.rs` (per-tile thumbnail) and
-//! `ui/preview.rs` (single large preview pane). Fase 6C.2 adds
+//! `ui/preview.rs` (single large preview pane). PR 8.3 adds
 //! the ffmpeg path for `LooseVideo`.
 
 #![allow(dead_code)] // PR 8.2 will consume every item below.
@@ -527,7 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_thumbnail_loose_video_path_dispatches_by_ffmpeg_availability() {
-        // Fase 6C.2 split: a LooseVideo entry no longer unconditionally
+        // PR 8.3 split: a LooseVideo entry no longer unconditionally
         // returns None. The behavior depends on whether `ffmpeg` is
         // installed on the host:
         //   - ffmpeg on PATH  → call extract_first_frame(path)

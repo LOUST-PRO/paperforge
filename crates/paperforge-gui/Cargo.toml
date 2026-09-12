@@ -23,7 +23,7 @@ library, lazy-load video previews and visual playlist editor.
 dioxus = { version = "=0.8.0-alpha.0", features = ["desktop"] }
 dioxus-desktop = "=0.8.0-alpha.0"
 
-# Internal: reuso del core lib MIT (Fase 6A)
+# Internal: reuso del core lib MIT (paperforge-core)
 paperforge-core = { path = "../paperforge-core", version = "0.1.0" }
 
 # Async runtime + logging (reutilizados del workspace, per paperforge-core)
@@ -49,8 +49,8 @@ dirs = { workspace = true }
 image = "0.25"
 
 # base64 encode for data URLs (`<img src="data:image/png;base64,...">`).
-# Phase 1 of Fase 6C.1 — Phase 2 may switch to a `dioxus-desktop` custom
-# protocol scheme to avoid inline base64 bloat for larger inventories.
+# Phase 1 of thumbnail data URLs — Phase 2 may switch to a `dioxus-desktop`
+# custom protocol scheme to avoid inline base64 bloat for larger inventories.
 base64 = "0.22"
 
 # SHA-256 for thumbnail cache key (PR 8.1). Reused from workspace so

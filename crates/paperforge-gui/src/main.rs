@@ -1,4 +1,4 @@
-//! paperforge-gui — Fase 6C
+//! paperforge-gui
 //!
 //! Dioxus 0.8-alpha desktop GUI for paperforge.
 //!

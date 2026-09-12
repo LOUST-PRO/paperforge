@@ -800,7 +800,7 @@ pub fn Root() -> Element {
                 }
                 span {
                     style: "color: #8b949e; font-size: 0.875rem;",
-                    "Fase 6C.0 · Dioxus 0.8.0-alpha.0"
+                    "Dioxus 0.8.0-alpha.0"
                 }
                 span {
                     style: "margin-left: auto; display: inline-flex; align-items: center; gap: 0.4rem; color: #8b949e; font-size: 0.8125rem;",

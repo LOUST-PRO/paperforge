@@ -1,6 +1,6 @@
 //! ffmpeg subprocess wrapper for thumbnail generation.
 //!
-//! Phase 2 (Fase 6C.2) replaces the Phase 1 "no preview" fallback
+//! Phase 2 replaces the Phase 1 "no preview" fallback
 //! for `LooseVideo` entries. We shell out to `ffmpeg` for a single
 //! PNG frame, then pipe through the existing `image`-based
 //! resize/encode pipeline in [`crate::data::thumbnails::load_thumbnail`].

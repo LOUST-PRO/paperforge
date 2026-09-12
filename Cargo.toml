@@ -63,7 +63,7 @@ tempfile = "3"
 # File mtime setter (used by self-update backup pruning tests)
 filetime = "0.2"
 
-# D-Bus IPC service (Fase 6D — zbus-based daemon control)
+# D-Bus IPC service (zbus-based daemon control)
 zbus = { version = "4", default-features = false, features = ["tokio"] }
 
 # Stream combinators (used by ipc/client.rs MessageStream iteration)
