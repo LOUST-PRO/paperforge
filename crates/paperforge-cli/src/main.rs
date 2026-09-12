@@ -169,6 +169,23 @@ enum Cmd {
         #[arg(long)]
         config: bool,
     },
+    /// Detect the physical orientation of a workshop directory.
+    /// Parses `scene.pkg` for the `orthogonalprojection` block
+    /// (Workshop scenes), shell-outs to `ffprobe` with a 5s
+    /// timeout for video workshops, or parses the PNG/JPEG header
+    /// for image workshops. Web workshops return `Unknown`.
+    ///
+    /// Used by `paperforge-rotate.sh` to skip portrait wallpapers
+    /// on horizontal monitors (and vice-versa). Default output is
+    /// a one-liner `<width>x<height> -> <orientation> (<source>)`;
+    /// pass `--json` for the full machine-readable result.
+    Orientation {
+        /// Path to a workshop directory or loose media file.
+        path: String,
+        /// Emit a JSON object instead of the human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -717,6 +734,18 @@ async fn main() -> anyhow::Result<()> {
             // clap conflicts_with_all makes that already impossible.
             let _ = tick;
             run_governor(mode, &cfg).await?;
+        }
+        Cmd::Orientation { path, json } => {
+            let p = std::path::PathBuf::from(&path);
+            let result = paperforge_core::orientation::detect(&p)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{}x{} -> {:?} ({:?})",
+                    result.width, result.height, result.orientation, result.source
+                );
+            }
         }
     }
     Ok(())

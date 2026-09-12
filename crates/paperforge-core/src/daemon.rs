@@ -1486,7 +1486,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_apply_known_playlist_fans_out() {
-        use crate::playlist::{FillMode, Playlist};
+        use crate::playlist::{FillMode, MonitorOrientation, OrientationFallback, Playlist};
         let backend = Arc::new(FakeBackend::new(BackendKind::LinuxWallpaperEngine));
         let (_tmp, daemon, _rx) = fresh_daemon(&backend);
         let pl = Playlist {
@@ -1495,6 +1495,8 @@ mod tests {
             outputs: vec!["DP-1".to_string(), "eDP-1".to_string()],
             wallpapers: vec![PathBuf::from("/scenes/a"), PathBuf::from("/scenes/b")],
             fill: FillMode::Fill,
+            monitor_orientation: MonitorOrientation::Landscape,
+            orientation_fallback: OrientationFallback::Allow,
         };
         daemon.playlists.write().await.save(&pl).unwrap();
         daemon

@@ -96,4 +96,20 @@ pub enum Error {
         /// `/usr/bin/linux-wallpaperengine`, and each `$PATH` directory.
         paths_tried: Vec<PathBuf>,
     },
+
+    /// Orientation parser failed to extract dimensions from a workshop
+    /// directory (e.g. `scene.pkg` has the `orthogonalprojection` block
+    /// but is missing one of `width`/`height`). Distinguished from a
+    /// benign "Unknown" outcome (web workshop, parse-failed) which the
+    /// parser returns as `Ok(DetectionResult::unknown(...))`. This
+    /// variant is reserved for true structural errors that callers
+    /// should surface rather than swallow via fallback policy.
+    #[error("orientation detection failed for {path}: {reason}")]
+    Orientation {
+        /// Path of the workshop dir / scene.pkg / media file we tried.
+        path: String,
+        /// Why detection failed (missing field, unsupported extension,
+        /// IO error, JSON parse error).
+        reason: String,
+    },
 }
