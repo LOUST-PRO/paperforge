@@ -1,0 +1,55 @@
+[package]
+name = "paperforge-tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+keywords = ["tray", "sni", "status-notifier", "wallpaper", "wayland", "linux"]
+categories = ["command-line-utilities", "gui"]
+publish.workspace = true
+documentation = "https://docs.rs/paperforge-tray"
+description = """
+StatusNotifierItem tray icon for paperforge. Sits in the Wayland status
+notifier (dankbar, KDE plasma, GNOME Shell extension) and exposes a
+right-click menu with per-monitor controls (next wallpaper in playlist)
+plus global actions (rotate all, open TUI, quit). Shells out to the
+canonical `paperforge-rotate.sh` orchestrator so the bypass-the-rotten-pool
+invariant stays in one place.
+"""
+
+[dependencies]
+# Same core as the TUI / CLI — we only read playlists + state, no LWE control.
+paperforge-core = { path = "../paperforge-core", version = "0.1.0" }
+
+# Workspace-wide
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+
+# StatusNotifierItem protocol via zbus (default tokio feature).
+ksni = "0.3"
+
+# Async runtime (D-Bus loop runs on tokio; menu callbacks spawn quick
+# subprocesses via tokio::process).
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "sync", "time"] }
+
+# CLI argument parsing
+clap = { workspace = true }
+
+# nix for getuid() — already in workspace deps via paperforge-cli/gui.
+nix = { workspace = true }
+
+[[bin]]
+name = "paperforge-tray"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"

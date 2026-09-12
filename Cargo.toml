@@ -4,6 +4,7 @@ members = [
     "crates/paperforge-core",
     "crates/paperforge-cli",
     "crates/paperforge-tui", "crates/paperforge-gui", "crates/paperforge-gpu",
+    "crates/paperforge-tray",
 ]
 
 [workspace.package]
