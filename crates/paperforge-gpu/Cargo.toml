@@ -1,0 +1,35 @@
+[package]
+name = "paperforge-gpu"
+description = "GPUI Niri spike — validates GPUI 0.2.2 + gpui-component 0.5.1 compile and boot a window on Wayland. Phase 0 of the paperforge Dioxus → GPUI migration."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# GPUI 0.2.2 with default features (font-kit, wayland, x11, windows-manifest).
+# Wayland is the default feature set — Niri is a Wayland compositor, so this
+# is what we need for the spike. `gpui_platform` is a separate crate only
+# available via git@zed-industries/zed — we intentionally use the published
+# `gpui` crate directly so the spike compiles without cloning the entire
+# Zed repo.
+gpui = "0.2.2"
+
+# gpui-component v0.5.1 from crates.io. The upstream repo (longbridge/gpui-component)
+# tracks 0.5.2 in path mode, but 0.5.1 on crates.io is API-compatible for
+# hello-world. If the spike needs something newer, we'll pin to a specific
+# minor + watch release notes via SPARQL.
+gpui-component = "0.5.1"
+
+# Shared types (BackendState, Output) consumed by the migrated UI
+# primitives. Path-dep rather than workspace-dep because we want a
+# direct, sibling reference for `cargo check -p paperforge-gpu` to
+# rebuild the GPUI layer without dragging the whole workspace.
+paperforge-core = { path = "../paperforge-core" }
