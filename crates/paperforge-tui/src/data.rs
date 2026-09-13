@@ -108,6 +108,8 @@ async fn fetch_playlists(store_root: PathBuf) -> Result<Vec<PlaylistSummary>> {
                 outputs: Vec::new(),
                 wallpapers: Vec::new(),
                 fill: paperforge_core::playlist::FillMode::Fill,
+                monitor_orientation: paperforge_core::playlist::MonitorOrientation::Landscape,
+                orientation_fallback: paperforge_core::playlist::OrientationFallback::Allow,
             });
             out.push(PlaylistSummary {
                 name: pl.name,

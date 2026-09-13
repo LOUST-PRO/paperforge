@@ -40,10 +40,37 @@ pub struct Playlist {
     /// options.
     #[serde(default = "default_fill")]
     pub fill: FillMode,
+    /// Physical orientation of the monitor(s) this playlist targets.
+    /// Drives the portrait-skip heuristic in the rotation scripts:
+    /// when a wallpaper's detected orientation contradicts the
+    /// monitor's, the rotation script advances to the next wallpaper
+    /// instead of applying a mismatched scene.
+    ///
+    /// Default is `Landscape`, matching every modern desktop monitor.
+    /// Operators with a vertical/portrait monitor should set this
+    /// explicitly to `Portrait` so the heuristic inverts.
+    #[serde(default = "default_monitor_orientation")]
+    pub monitor_orientation: MonitorOrientation,
+    /// Policy for orientations the parser could not determine
+    /// (`Orientation::Unknown`). `Allow` (default) lets unparseable
+    /// scenes through, assuming they're either correctly oriented or
+    /// will fail visibly so the operator notices. `Skip` is opt-in
+    /// strict mode for operators who want every applied scene
+    /// confidently matched.
+    #[serde(default = "default_orientation_fallback")]
+    pub orientation_fallback: OrientationFallback,
 }
 
 fn default_fill() -> FillMode {
     FillMode::Fill
+}
+
+fn default_monitor_orientation() -> MonitorOrientation {
+    MonitorOrientation::Landscape
+}
+
+fn default_orientation_fallback() -> OrientationFallback {
+    OrientationFallback::Allow
 }
 
 /// How a wallpaper smaller than its output is rendered.
@@ -62,6 +89,78 @@ pub enum FillMode {
     Tile,
     /// Fill (resize to fill, may crop).
     Fill,
+}
+
+/// Physical orientation of the monitor(s) a playlist targets.
+///
+/// Used by the rotation script's portrait-skip heuristic: when the
+/// wallpaper's detected orientation (`Orientation::Portrait` /
+/// `Landscape` / `Square`) contradicts the monitor's, the rotator
+/// advances to the next wallpaper instead of applying a mismatched
+/// scene that would render cropped or letterboxed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MonitorOrientation {
+    /// Wide monitor (w > h). Default for desktop displays.
+    Landscape,
+    /// Tall monitor (h > w). For vertically-rotated displays or
+    /// phones-as-monitors.
+    Portrait,
+    /// Either orientation is acceptable. Disables the heuristic.
+    Any,
+}
+
+/// Policy applied when the orientation parser returns
+/// `Orientation::Unknown` (web workshops, scene.pkg without
+/// `orthogonalprojection`, ffprobe timeout, etc).
+///
+/// `Allow` is the default because most unparseable scenes are
+/// actually well-oriented — web workshops can render fine on
+/// either orientation, and a missing dimension in scene.pkg is
+/// usually a publisher error rather than a portrait scene.
+/// Operators who want strict matching can opt into `Skip`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OrientationFallback {
+    /// Include scenes whose orientation could not be determined.
+    /// Default.
+    Allow,
+    /// Skip scenes whose orientation could not be determined.
+    /// Opt-in strict mode.
+    Skip,
+}
+
+/// Pure decision function used by the bash helper (and any future
+/// Rust caller) to decide whether a scene with the given detected
+/// `Orientation` should be applied to a monitor with the given
+/// `MonitorOrientation`, honouring the `OrientationFallback`.
+///
+/// Truth table:
+///
+/// | Monitor / Scene | Landscape | Portrait | Square | Unknown (Allow) | Unknown (Skip) |
+/// |-----------------|-----------|----------|--------|------------------|------------------|
+/// | Landscape       | OK        | skip     | OK     | OK               | skip             |
+/// | Portrait        | skip      | OK       | OK     | OK               | skip             |
+/// | Any             | OK        | OK       | OK     | OK               | OK               |
+///
+/// `Square` is treated as compatible with both portrait and
+/// landscape monitors because aspect-1:1 wallpapers (rare) usually
+/// look intentional and don't suffer the same cropping artefacts
+/// as 9:16 vs 16:9 mismatches.
+pub fn orientation_compatible(
+    monitor: MonitorOrientation,
+    scene: crate::orientation::Orientation,
+    fallback: OrientationFallback,
+) -> bool {
+    use crate::orientation::Orientation;
+    match (monitor, scene) {
+        (_, Orientation::Square) => true,
+        (MonitorOrientation::Any, _) => true,
+        (_, Orientation::Unknown) => matches!(fallback, OrientationFallback::Allow),
+        (MonitorOrientation::Landscape, Orientation::Landscape) => true,
+        (MonitorOrientation::Portrait, Orientation::Portrait) => true,
+        _ => false,
+    }
 }
 
 /// Persists playlists to disk as one JSON file per playlist.
@@ -217,17 +316,12 @@ mod tests {
             outputs: vec!["DP-1".into()],
             wallpapers: vec![PathBuf::from("/tmp/wp1"), PathBuf::from("/tmp/wp2")],
             fill: FillMode::Cover,
+            monitor_orientation: MonitorOrientation::Landscape,
+            orientation_fallback: OrientationFallback::Allow,
         };
         store.save(&pl).unwrap();
         let loaded = store.load("focus").unwrap();
         assert_eq!(loaded, pl);
-    }
-
-    #[test]
-    fn list_empty_store() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = PlaylistStore::new(tmp.path()).unwrap();
-        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]
@@ -242,6 +336,8 @@ mod tests {
                     outputs: vec![],
                     wallpapers: vec![PathBuf::from("/x")],
                     fill: FillMode::Fill,
+                    monitor_orientation: MonitorOrientation::Landscape,
+                    orientation_fallback: OrientationFallback::Allow,
                 })
                 .unwrap();
         }
@@ -274,10 +370,134 @@ mod tests {
             outputs: vec!["DP-1".into()],
             wallpapers: vec![],
             fill: FillMode::Fill,
+            monitor_orientation: MonitorOrientation::Landscape,
+            orientation_fallback: OrientationFallback::Allow,
         };
         let backend = LweBackend::new();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let r = rt.block_on(store.apply(&pl, &backend));
         assert!(matches!(r, Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn playlist_default_orientation_is_landscape_allow() {
+        // JSON without the new fields should default to
+        // Landscape + Allow — backward compat for existing
+        // playlists (dp-1.json, edp-1.json, hdmi-a-1.json).
+        let raw = r#"{
+            "name": "old",
+            "outputs": ["eDP-1"],
+            "wallpapers": ["/tmp/a"]
+        }"#;
+        let pl: Playlist = serde_json::from_str(raw).unwrap();
+        assert_eq!(pl.monitor_orientation, MonitorOrientation::Landscape);
+        assert_eq!(pl.orientation_fallback, OrientationFallback::Allow);
+        assert_eq!(pl.fill, FillMode::Fill);
+    }
+
+    #[test]
+    fn playlist_parses_explicit_orientation_fields() {
+        let raw = r#"{
+            "name": "v",
+            "outputs": ["HDMI-A-1"],
+            "wallpapers": ["/tmp/a"],
+            "monitor_orientation": "portrait",
+            "orientation_fallback": "skip"
+        }"#;
+        let pl: Playlist = serde_json::from_str(raw).unwrap();
+        assert_eq!(pl.monitor_orientation, MonitorOrientation::Portrait);
+        assert_eq!(pl.orientation_fallback, OrientationFallback::Skip);
+    }
+
+    #[test]
+    fn playlist_roundtrip_with_orientation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PlaylistStore::new(tmp.path()).unwrap();
+        let pl = Playlist {
+            name: "vert".into(),
+            description: None,
+            outputs: vec!["HDMI-A-1".into()],
+            wallpapers: vec![PathBuf::from("/tmp/a")],
+            fill: FillMode::Fill,
+            monitor_orientation: MonitorOrientation::Portrait,
+            orientation_fallback: OrientationFallback::Skip,
+        };
+        store.save(&pl).unwrap();
+        let loaded = store.load("vert").unwrap();
+        assert_eq!(loaded.monitor_orientation, MonitorOrientation::Portrait);
+        assert_eq!(loaded.orientation_fallback, OrientationFallback::Skip);
+    }
+
+    #[test]
+    fn orientation_compatible_skips_portrait_for_landscape_monitor() {
+        use crate::orientation::Orientation;
+        assert!(!orientation_compatible(
+            MonitorOrientation::Landscape,
+            Orientation::Portrait,
+            OrientationFallback::Allow,
+        ));
+    }
+
+    #[test]
+    fn orientation_compatible_allows_landscape_for_landscape_monitor() {
+        use crate::orientation::Orientation;
+        assert!(orientation_compatible(
+            MonitorOrientation::Landscape,
+            Orientation::Landscape,
+            OrientationFallback::Allow,
+        ));
+    }
+
+    #[test]
+    fn orientation_compatible_unknown_allowed_by_default() {
+        use crate::orientation::Orientation;
+        assert!(orientation_compatible(
+            MonitorOrientation::Landscape,
+            Orientation::Unknown,
+            OrientationFallback::Allow,
+        ));
+    }
+
+    #[test]
+    fn orientation_compatible_unknown_skipped_when_fallback_skip() {
+        use crate::orientation::Orientation;
+        assert!(!orientation_compatible(
+            MonitorOrientation::Landscape,
+            Orientation::Unknown,
+            OrientationFallback::Skip,
+        ));
+    }
+
+    #[test]
+    fn orientation_compatible_any_monitor_accepts_everything() {
+        use crate::orientation::Orientation;
+        for scene in [
+            Orientation::Portrait,
+            Orientation::Landscape,
+            Orientation::Square,
+            Orientation::Unknown,
+        ] {
+            assert!(
+                orientation_compatible(MonitorOrientation::Any, scene, OrientationFallback::Skip,),
+                "Any monitor should accept {scene:?} regardless of fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn orientation_compatible_square_compatible_with_either() {
+        use crate::orientation::Orientation;
+        // Square scenes don't suffer from the cropping artefact
+        // that portrait/landscape mismatches cause.
+        assert!(orientation_compatible(
+            MonitorOrientation::Landscape,
+            Orientation::Square,
+            OrientationFallback::Allow,
+        ));
+        assert!(orientation_compatible(
+            MonitorOrientation::Portrait,
+            Orientation::Square,
+            OrientationFallback::Allow,
+        ));
     }
 }

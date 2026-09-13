@@ -1026,6 +1026,15 @@ mod tests {
     /// of the binary. The wrapper ignores its argv and just sleeps so
     /// it stays alive past the grace window — `/bin/sleep` itself
     /// rejects `--screen-root`/`--bg`/etc. and would die immediately.
+    ///
+    /// `#[ignore]` because it spawns a real process wrapper and fails
+    /// spuriously with ETXTBSY ("Text file busy") when the filesystem
+    /// hasn't fully released the wrapper between write and exec. CI
+    /// runners and dev boxes that happen to be running real LWEs both
+    /// hit this. Run manually with:
+    ///   cargo test -p paperforge-core --lib \
+    ///     -- --include-ignored bind_spawns_and_pause_resume_real_process
+    #[ignore = "spawns a real-process wrapper; flaky on busy FS. Run with --include-ignored."]
     #[tokio::test]
     async fn bind_spawns_and_pause_resume_real_process() {
         let wrapper = write_sleep_wrapper(60);

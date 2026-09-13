@@ -50,6 +50,8 @@ pub async fn refresh_playlists(store_root: PathBuf) -> (Vec<PlaylistSummary>, Op
                     outputs: Vec::new(),
                     wallpapers: Vec::new(),
                     fill: paperforge_core::playlist::FillMode::Fill,
+                    monitor_orientation: paperforge_core::playlist::MonitorOrientation::Landscape,
+                    orientation_fallback: paperforge_core::playlist::OrientationFallback::Allow,
                 }
             });
             out.push(PlaylistSummary {
@@ -140,6 +142,8 @@ mod tests {
             outputs: vec!["HDMI-A-1".into(), "DP-1".into()],
             wallpapers: vec!["wp1".into(), "wp2".into(), "wp3".into()],
             fill: paperforge_core::playlist::FillMode::Fill,
+            monitor_orientation: paperforge_core::playlist::MonitorOrientation::Landscape,
+            orientation_fallback: paperforge_core::playlist::OrientationFallback::Allow,
         };
         store.save(&pl).unwrap();
 
