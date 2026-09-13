@@ -27,10 +27,10 @@
 use std::collections::HashMap;
 
 use gpui::{
-    App as GpuiApp, Hsla, IntoElement, ParentElement, SharedString, Styled as _, Window, div, px,
-    rgb,
+    div, px, rgb, App as GpuiApp, Hsla, IntoElement, ParentElement, SharedString, Styled as _,
+    Window,
 };
-use gpui_component::{Disableable, Sizable, button::Button, button::ButtonVariants};
+use gpui_component::{button::Button, button::ButtonVariants, Disableable, Sizable};
 
 use paperforge_core::backend::BackendState;
 use paperforge_core::hotplug::Output;
@@ -98,9 +98,7 @@ fn empty_state() -> impl IntoElement {
     div()
         .text_sm()
         .text_color(rgb(0x8b949e))
-        .child(
-            "No outputs detected — start sway / Hyprland, or check $XDG_CURRENT_DESKTOP.",
-        )
+        .child("No outputs detected — start sway / Hyprland, or check $XDG_CURRENT_DESKTOP.")
 }
 
 fn output_list<C>(
@@ -112,16 +110,25 @@ fn output_list<C>(
 where
     C: Fn(&str, &mut Window, &mut GpuiApp) + Clone + 'static,
 {
-    div().flex().flex_col().gap_1().children(outputs.into_iter().map(|o| {
-        let state = running
-            .get(&o.name)
-            .copied()
-            .unwrap_or(BackendState::NotRunning);
-        output_row(o.name, state, connected, on_open_picker.clone())
-    }))
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .children(outputs.into_iter().map(|o| {
+            let state = running
+                .get(&o.name)
+                .copied()
+                .unwrap_or(BackendState::NotRunning);
+            output_row(o.name, state, connected, on_open_picker.clone())
+        }))
 }
 
-fn output_row<C>(name: String, state: BackendState, connected: bool, on_open_picker: C) -> impl IntoElement
+fn output_row<C>(
+    name: String,
+    state: BackendState,
+    connected: bool,
+    on_open_picker: C,
+) -> impl IntoElement
 where
     C: Fn(&str, &mut Window, &mut GpuiApp) + Clone + 'static,
 {
@@ -143,12 +150,7 @@ where
         .gap_2()
         .py_1()
         .child(state_dot(dot))
-        .child(
-            div()
-                .flex_1()
-                .font_family("monospace")
-                .child(visible_name),
-        )
+        .child(div().flex_1().font_family("monospace").child(visible_name))
         .child(div().text_xs().text_color(rgb(0x8b949e)).child(label))
         .child(
             Button::new(row_id)
@@ -161,11 +163,7 @@ where
 }
 
 fn state_dot(color: Hsla) -> impl IntoElement {
-    div()
-        .w(px(10.))
-        .h(px(10.))
-        .rounded_full()
-        .bg(color)
+    div().w(px(10.)).h(px(10.)).rounded_full().bg(color)
 }
 
 /// Short label for the state badge. Mirrors
