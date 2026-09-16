@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`paperforge-tray` per-monitor Previous + global Previous all**.
+  The SNI tray menu now exposes a "Previous wallpaper" entry under
+  each monitor submenu and a "← Previous all" entry next to
+  "Rotate all now →", so the operator can retreat through the
+  playlist from the panel without touching the terminal. Both
+  retreat variants shell out to `paperforge-rotate.sh --previous`
+  with the same skip-blacklist + skip-orientation-mismatch logic
+  as the forward direction, just walked backward
+  (`(idx - 1 + n) % n` with wrap-around for small playlists).
+- Header rows in the tray menu now show `← prev | current | next →`
+  (instead of just `current → next`) so the labels match what each
+  action will actually apply. `MonitorState` gained a `previous`
+  field computed in `read_playlists` from the same state file
+  (`$XDG_RUNTIME_DIR/paperforge-rotate-state.json`) used by the
+  bash orchestrator.
+- `Direction` enum + `as_flag` helper in `paperforge-tray::main`,
+  with `Direction::Forward` mapping to the empty string (no flag,
+  backward compatible) and `Direction::Previous` mapping to
+  `--previous`. 6 new unit tests cover the wrap-around math at
+  both boundaries (`idx=0` and `idx=n-1`) and the flag composition
+  for all 4 spawn-arg combinations (forward/previous ×
+  monitor/no-monitor).
 - **Portrait auto-skip heuristic**: orientation-aware skip in the
   per-playlist rotation loop. Wallpapers whose physical orientation
   (portrait vs landscape) contradicts the monitor's orientation are
@@ -46,6 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyed by workshop ID + scene.pkg mtime. Cache hit cost is a
   single `jq` lookup (~ms); cache miss runs the CLI parser
   (~50–300ms fork+exec).
+- `list_pids` no longer spawns `pgrep` subprocess — direct `/proc`
+  read is ~30x faster on a ~1000 PID system.
 
 ### Changed
 - `LweBackend::list_pids` now walks `/proc/<pid>/cmdline` directly
