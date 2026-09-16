@@ -21,30 +21,63 @@ directly. All wallpaper side-effects go through the same script that the
 
 ## Menu shape
 
-```
-┌─ paperforge · 3 monitor(s) ─────────────────┐
-│  DP-1: 3240721055 → 2992660460                │
-│  eDP-1: 2643615970 → 2549203773               │
-│  HDMI-A-1: 2913305556 → 2749671515            │
-│ ─────────────────────────────────────────────  │
-│ DP-1 (10)                                       │
-│   Next wallpaper  (→ 2992660460)               │
-│ eDP-1 (10)                                      │
-│   Next wallpaper  (→ 2549203773)               │
-│ HDMI-A-1 (10)                                   │
-│   Next wallpaper  (→ 2749671515)               │
-│ ─────────────────────────────────────────────  │
-│ Rotate all now                                  │
-│ Open TUI                                        │
-│ ─────────────────────────────────────────────  │
-│ Quit                                            │
-└────────────────────────────────────────────────┘
+```text
+┌─ paperforge · 3 monitor(s) ────────────────────────┐
+│  DP-1:    ← 3422465318 | 3240721055 | 2992660460 →  │
+│  eDP-1:   ← 2549203773 | 2643615970 | 2789970990 →  │
+│  HDMI-A-1:← 3307894201 | 2913305556 | 2749671515 →  │
+│ ──────────────────────────────────────────────────── │
+│ DP-1 (10)                                              │
+│   Next wallpaper     (→ 2992660460)                    │
+│   Previous wallpaper (← 3422465318)                    │
+│ eDP-1 (10)                                             │
+│   Next wallpaper     (→ 2789970990)                    │
+│   Previous wallpaper (← 2549203773)                    │
+│ HDMI-A-1 (10)                                          │
+│   Next wallpaper     (→ 2749671515)                    │
+│   Previous wallpaper (← 3307894201)                    │
+│ ──────────────────────────────────────────────────── │
+│ Rotate all now →                                       │
+│ ← Previous all                                         │
+│ Open TUI                                               │
+│ Open GUI                                               │
+│ ──────────────────────────────────────────────────── │
+│ Quit                                                   │
+└───────────────────────────────────────────────────────┘
 ```
 
-Future versions will add "Random from playlist" and "Renew playlist" actions
-under each per-monitor submenu — those require extending
-`paperforge-rotate.sh` with `--random <monitor>` and
-`--renew <monitor>` flags first.
+The header rows are read-only labels (`enabled = false`) showing
+`previous | current | next` for each playlist. The current index is
+read from `$XDG_RUNTIME_DIR/paperforge-rotate-state.json`; the
+next and previous indices are computed with wrap-around modulo so
+the labels stay correct at the playlist boundaries.
+
+Every action shells out to `paperforge-rotate.sh` with `--previous`
+appended for the retreat variants:
+
+| Action | Command |
+|---|---|
+| Per-monitor Next | `paperforge-rotate.sh <playlist>` |
+| Per-monitor Previous | `paperforge-rotate.sh --previous <playlist>` |
+| Rotate all now | `paperforge-rotate.sh` |
+| Previous all | `paperforge-rotate.sh --previous` |
+| Open TUI | `paperforge-tui` |
+| Open GUI | `paperforge-gui` |
+| Quit | `process::exit(0)` |
+
+The skip logic (blacklisted workshops, orientation mismatch) is
+honored by `paperforge-rotate.sh` for both directions, so
+"Previous wallpaper" on a monitor with N scenes may skip past
+several and land on the closest still-applicable scene in the
+backward direction.
+
+The Open TUI / Open GUI entries fire-and-forget spawn their
+respective binaries with detached stdin/stdout/stderr so a slow
+window boot (Wayland surface allocation, font load for the GPUI
+GUI) does not block the ksni D-Bus loop. If the binary is missing,
+the spawn fails silently and the user sees "command not found" in
+their terminal — there is no tray-side dialog because SNI does not
+support modal notifications.
 
 ## Install
 
@@ -52,9 +85,17 @@ under each per-monitor submenu — those require extending
 # From crates.io
 cargo install paperforge-tray --locked
 
-# Or from the workspace root (development)
-cargo build --release -p paperforge-tray
-install -m 0755 target/release/paperforge-tray ~/.local/bin/
+# From the source workspace (development). The `--path` and `--bin`
+# flags are required because paperforge is a multi-crate workspace;
+# without them cargo fails with "no package found" at the repo root.
+cargo install --path crates/paperforge-tray --bin paperforge-tray --locked
+
+# Or from a Git tag (when releasing from a tag rather than crates.io)
+cargo install --git https://github.com/LOUST-PRO/paperforge \
+  --tag v0.1.1 \
+  --path crates/paperforge-tray \
+  --bin paperforge-tray \
+  --locked
 ```
 
 Then either launch it directly (`paperforge-tray &`) or enable the
