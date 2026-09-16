@@ -11,6 +11,7 @@
 // - "Rotate all now"      → `paperforge-rotate.sh`     (advance all + spawn)
 // - "Previous all"        → `paperforge-rotate.sh --previous`
 // - "Open TUI"            → `paperforge-tui`           (read-only debugger)
+// - "Open GUI"            → `paperforge-gui`           (GPUI Wayland window)
 // - Per-monitor submenus (one per playlist in `$PLAYLIST_DIR`):
 //   - "Next wallpaper"     → `paperforge-rotate.sh <monitor>`
 //   - "Previous wallpaper" → `paperforge-rotate.sh --previous <monitor>`
@@ -233,6 +234,25 @@ fn spawn_tui() {
     });
 }
 
+fn spawn_gui() {
+    // paperforge-gui is in the same workspace; assume it's on $PATH.
+    // Same fire-and-forget + detach pattern as spawn_tui so a slow
+    // GPUI window boot (Wayland surface allocation, font load) doesn't
+    // block the ksni D-Bus loop. If the binary is missing the user
+    // sees "command not found" in stderr — we log it as an error so
+    // `journalctl --user -u paperforge-tray.service` surfaces it.
+    tokio::spawn(async move {
+        let mut cmd = tokio::process::Command::new("paperforge-gui");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match cmd.spawn() {
+            Ok(_) => info!(target: "paperforge-tray", "paperforge-gui launched"),
+            Err(e) => error!(target: "paperforge-tray", "gui spawn failed: {e}"),
+        }
+    });
+}
+
 // ─── Tray impl ──────────────────────────────────────────────────────────────
 
 struct PaperforgeTray {
@@ -350,6 +370,16 @@ impl ksni::Tray for PaperforgeTray {
                 label: "Open TUI".into(),
                 activate: Box::new(|_tray: &mut Self| {
                     spawn_tui();
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Open GUI".into(),
+                activate: Box::new(|_tray: &mut Self| {
+                    spawn_gui();
                 }),
                 ..Default::default()
             }

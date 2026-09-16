@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the same skip-blacklist + skip-orientation-mismatch logic
   as the forward direction, just walked backward
   (`(idx - 1 + n) % n` with wrap-around for small playlists).
+- **`paperforge-tray` Open GUI menu entry**. The SNI tray now
+  exposes an "Open GUI" item next to "Open TUI" that spawns the
+  `paperforge-gui` GPUI Wayland window on activation. Spawn is
+  fire-and-forget with detached stdin/stdout/stderr so a slow
+  window boot (Wayland surface allocation, font load) does not
+  block the ksni D-Bus loop; if `paperforge-gui` is not on
+  `$PATH`, the activation logs an error to
+  `journalctl --user -u paperforge-tray.service` and falls through
+  silently (SNI does not support modal notifications).
 - Header rows in the tray menu now show `← prev | current | next →`
   (instead of just `current → next`) so the labels match what each
   action will actually apply. `MonitorState` gained a `previous`

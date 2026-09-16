@@ -40,6 +40,7 @@ directly. All wallpaper side-effects go through the same script that the
 │ Rotate all now →                                       │
 │ ← Previous all                                         │
 │ Open TUI                                               │
+│ Open GUI                                               │
 │ ──────────────────────────────────────────────────── │
 │ Quit                                                   │
 └───────────────────────────────────────────────────────┘
@@ -61,6 +62,7 @@ appended for the retreat variants:
 | Rotate all now | `paperforge-rotate.sh` |
 | Previous all | `paperforge-rotate.sh --previous` |
 | Open TUI | `paperforge-tui` |
+| Open GUI | `paperforge-gui` |
 | Quit | `process::exit(0)` |
 
 The skip logic (blacklisted workshops, orientation mismatch) is
@@ -68,6 +70,14 @@ honored by `paperforge-rotate.sh` for both directions, so
 "Previous wallpaper" on a monitor with N scenes may skip past
 several and land on the closest still-applicable scene in the
 backward direction.
+
+The Open TUI / Open GUI entries fire-and-forget spawn their
+respective binaries with detached stdin/stdout/stderr so a slow
+window boot (Wayland surface allocation, font load for the GPUI
+GUI) does not block the ksni D-Bus loop. If the binary is missing,
+the spawn fails silently and the user sees "command not found" in
+their terminal — there is no tray-side dialog because SNI does not
+support modal notifications.
 
 ## Install
 
